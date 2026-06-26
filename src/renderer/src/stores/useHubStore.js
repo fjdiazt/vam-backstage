@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { toast } from '@/components/Toast'
+import { sanitizeHubState } from '@/lib/view-state'
 import { useInstalledStore } from './useInstalledStore'
 
 let fetchSeq = 0
@@ -41,6 +42,7 @@ export const useHubStore = create((set, get) => ({
   detailResource: null,
   detailData: null,
   detailLoading: false,
+  pendingDetailResourceId: null,
   // Resource id whose detail followDetail is fetching in the background; dedupes
   // concurrent follows and lets stale responses be discarded after a newer
   // follow/open supersedes them.
@@ -70,6 +72,55 @@ export const useHubStore = create((set, get) => ({
     void window.api.settings.set('hub_card_width', String(cardWidth))
   },
   setPage: (page) => set({ page }),
+
+  getPersistedState: () => {
+    const s = get()
+    return {
+      search: s.search,
+      selectedType: s.selectedType,
+      paidFilter: s.paidFilter,
+      authorSearch: s.authorSearch,
+      selectedHubTags: s.selectedHubTags,
+      sort: s.sort,
+      license: s.license,
+      hideInstalled: s.hideInstalled,
+      detailResourceId: s.detailData?.resource_id ?? s.detailResource?.resource_id ?? s.pendingDetailResourceId ?? null,
+    }
+  },
+
+  applyPersistedState: (raw) => {
+    const saved = sanitizeHubState(raw)
+    set({
+      search: saved.search,
+      selectedType: saved.selectedType,
+      paidFilter: saved.paidFilter,
+      authorSearch: saved.authorSearch,
+      selectedHubTags: saved.selectedHubTags,
+      sort: saved.sort,
+      license: saved.license,
+      hideInstalled: saved.hideInstalled,
+      pendingDetailResourceId: saved.detailResourceId,
+    })
+  },
+
+  openDetailById: async (resourceId) => {
+    const rid = String(resourceId || '')
+    if (!rid) return
+    const known = get().resources.find((r) => String(r.resource_id) === rid)
+    if (known) {
+      await get().openDetail(known)
+      return
+    }
+    set({ detailResource: { resource_id: rid }, detailData: null, detailLoading: true, followingDetailId: null })
+    try {
+      const detail = await window.api.hub.detail(rid)
+      syncInstalledFromDetail(detail)
+      set({ detailResource: detail, detailData: detail, detailLoading: false, pendingDetailResourceId: null })
+    } catch (err) {
+      toast(`Failed to restore hub detail: ${err.message}`)
+      set({ detailResource: null, detailData: null, detailLoading: false, pendingDetailResourceId: null })
+    }
+  },
 
   fetchFilters: async (force) => {
     if (!force && get().filterOptions) return
@@ -150,7 +201,13 @@ export const useHubStore = create((set, get) => ({
   },
 
   openDetail: async (resource) => {
-    set({ detailResource: resource, detailData: null, detailLoading: true, followingDetailId: null })
+    set({
+      detailResource: resource,
+      detailData: null,
+      detailLoading: true,
+      followingDetailId: null,
+      pendingDetailResourceId: null,
+    })
     try {
       const detail = await window.api.hub.detail(resource.resource_id)
       syncInstalledFromDetail(detail)
@@ -180,7 +237,7 @@ export const useHubStore = create((set, get) => ({
   followDetail: async (resource) => {
     const rid = String(resource.resource_id)
     if (String(get().detailData?.resource_id) === rid || get().followingDetailId === rid) return
-    set({ followingDetailId: rid })
+    set({ followingDetailId: rid, pendingDetailResourceId: null })
     try {
       const detail = await window.api.hub.detail(resource.resource_id)
       if (get().followingDetailId !== rid) return
@@ -204,7 +261,8 @@ export const useHubStore = create((set, get) => ({
     }
   },
 
-  closeDetail: () => set({ detailResource: null, detailData: null, followingDetailId: null }),
+  closeDetail: () =>
+    set({ detailResource: null, detailData: null, followingDetailId: null, pendingDetailResourceId: null }),
 
   refreshDetail: async () => {
     const { detailResource } = get()
@@ -239,6 +297,7 @@ export const useHubStore = create((set, get) => ({
       sort: nextSort,
       license: 'Any',
       hideInstalled: false,
+      pendingDetailResourceId: null,
       page: 1,
     })
     if (nextSort) void window.api.settings.set('hub_last_sort', nextSort)
