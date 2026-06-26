@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  sanitizeView,
   sanitizeLastView,
   sanitizeHubState,
   sanitizeLibraryState,
@@ -9,11 +10,16 @@ import {
 } from './view-state'
 
 describe('view-state sanitizers', () => {
+  it('accepts settings for active navigation', () => {
+    expect(sanitizeView('settings')).toBe('settings')
+    expect(sanitizeView('downloads')).toBe('library')
+  })
+
   it('accepts known app views only', () => {
     expect(sanitizeLastView('hub')).toBe('hub')
     expect(sanitizeLastView('library')).toBe('library')
     expect(sanitizeLastView('content')).toBe('content')
-    expect(sanitizeLastView('settings')).toBe('settings')
+    expect(sanitizeLastView('settings')).toBe('hub')
     expect(sanitizeLastView('downloads')).toBe('library')
     expect(sanitizeLastView(null)).toBe('library')
   })
@@ -31,6 +37,9 @@ describe('view-state sanitizers', () => {
         license: 'CC BY',
         hideInstalled: true,
         detailResourceId: 123,
+        browseMode: 'paged',
+        page: 7,
+        perPage: 60,
       }),
     ).toEqual({
       search: 'alice',
@@ -42,6 +51,14 @@ describe('view-state sanitizers', () => {
       license: 'CC BY',
       hideInstalled: true,
       detailResourceId: '123',
+      browseMode: 'paged',
+      page: 7,
+      perPage: 60,
+    })
+    expect(sanitizeHubState({ browseMode: 'bad', page: -3, perPage: 42 })).toMatchObject({
+      browseMode: 'infinite',
+      page: 1,
+      perPage: 30,
     })
   })
 

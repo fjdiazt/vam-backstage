@@ -1,9 +1,11 @@
 import { create } from 'zustand'
 import { toast } from '@/components/Toast'
-import { sanitizeHubState } from '@/lib/view-state'
+import { HUB_PER_PAGE_OPTIONS, sanitizeHubState } from '@/lib/view-state'
 import { useInstalledStore } from './useInstalledStore'
 
 let fetchSeq = 0
+const HUB_SHOW_INFINITE_PAGER_KEY = 'hub_show_infinite_pager'
+const HUB_REMEMBER_INFINITE_PAGE_KEY = 'hub_remember_infinite_page'
 
 function syncInstalledFromResources(resources) {
   useInstalledStore.getState().applyBatch(
@@ -26,6 +28,12 @@ export const useHubStore = create((set, get) => ({
   totalFound: 0,
   totalPages: 0,
   page: 1,
+  startPage: 1,
+  restorePage: 1,
+  showInfinitePagerControls: true,
+  trackInfiniteRestorePage: true,
+  perPage: HUB_PER_PAGE_OPTIONS[0],
+  browseMode: 'infinite',
   loading: false,
   error: null,
 
@@ -72,6 +80,38 @@ export const useHubStore = create((set, get) => ({
     void window.api.settings.set('hub_card_width', String(cardWidth))
   },
   setPage: (page) => set({ page }),
+  setBrowseMode: (browseMode) => set({ browseMode: browseMode === 'paged' ? 'paged' : 'infinite' }),
+  setPerPage: (perPage) => {
+    const nextPerPage = HUB_PER_PAGE_OPTIONS.includes(Number(perPage)) ? Number(perPage) : HUB_PER_PAGE_OPTIONS[0]
+    const state = get()
+    if (nextPerPage === state.perPage) return
+    const basePage = state.browseMode === 'infinite' ? state.restorePage : state.page
+    const nextPage = Math.floor(((basePage - 1) * state.perPage) / nextPerPage) + 1
+    set({ perPage: nextPerPage, page: nextPage, startPage: nextPage, restorePage: nextPage })
+    void get().fetchResources(true, { page: nextPage })
+  },
+  goToPage: (page) => get().fetchResources(true, { page }),
+  startInfiniteAtPage: (page) => {
+    const max = Math.max(get().totalPages || 1, 1)
+    const nextPage = Math.min(Math.max(1, Number(page) || 1), max)
+    set({ startPage: nextPage, restorePage: nextPage })
+    return get().fetchResources(true, { page: nextPage })
+  },
+  setInfiniteRestorePage: (page) => {
+    const state = get()
+    if (!state.trackInfiniteRestorePage) return
+    const max = Math.max(state.totalPages || 1, 1)
+    const restorePage = Math.min(Math.max(1, Number(page) || 1), max)
+    if (restorePage !== state.restorePage) set({ restorePage })
+  },
+  setShowInfinitePagerControls: (showInfinitePagerControls) => {
+    set({ showInfinitePagerControls })
+    void window.api.settings.set(HUB_SHOW_INFINITE_PAGER_KEY, showInfinitePagerControls ? '1' : '0')
+  },
+  setTrackInfiniteRestorePage: (trackInfiniteRestorePage) => {
+    set({ trackInfiniteRestorePage })
+    void window.api.settings.set(HUB_REMEMBER_INFINITE_PAGE_KEY, trackInfiniteRestorePage ? '1' : '0')
+  },
 
   getPersistedState: () => {
     const s = get()
@@ -84,6 +124,9 @@ export const useHubStore = create((set, get) => ({
       sort: s.sort,
       license: s.license,
       hideInstalled: s.hideInstalled,
+      browseMode: s.browseMode,
+      page: s.browseMode === 'infinite' ? s.restorePage : s.page,
+      perPage: s.perPage,
       detailResourceId: s.detailData?.resource_id ?? s.detailResource?.resource_id ?? s.pendingDetailResourceId ?? null,
     }
   },
@@ -99,6 +142,11 @@ export const useHubStore = create((set, get) => ({
       sort: saved.sort,
       license: saved.license,
       hideInstalled: saved.hideInstalled,
+      browseMode: saved.browseMode,
+      page: saved.page,
+      startPage: saved.page,
+      restorePage: saved.page,
+      perPage: saved.perPage,
       pendingDetailResourceId: saved.detailResourceId,
     })
   },
@@ -127,29 +175,36 @@ export const useHubStore = create((set, get) => ({
     if (!get().resources.length) set({ loading: true })
     try {
       const options = await window.api.hub.filters()
-      set({ filterOptions: options })
       const list = options.sort || []
       let nextSort = get().sort
       if (!nextSort && list.length) nextSort = list[0]
       else if (nextSort && !list.includes(nextSort)) nextSort = list[0] || ''
-      set({ sort: nextSort })
+      set({ filterOptions: options, sort: nextSort })
       if (nextSort) void window.api.settings.set('hub_last_sort', nextSort)
     } catch (err) {
       console.error('Failed to fetch hub filters:', err)
     }
   },
 
-  /** Restore Hub UI preferences from disk (sort + gallery card size/mode) */
+  /** Restore Hub UI preferences from disk (sort, gallery card size/mode, page controls/memory) */
   hydrateHubFilterPreferences: async () => {
     try {
-      const [last, mode, widthStr] = await Promise.all([
+      const [last, mode, widthStr, showInfinitePager, rememberInfinitePage] = await Promise.all([
         window.api.settings.get('hub_last_sort'),
         window.api.settings.get('hub_card_mode'),
         window.api.settings.get('hub_card_width'),
+        window.api.settings.get(HUB_SHOW_INFINITE_PAGER_KEY),
+        window.api.settings.get(HUB_REMEMBER_INFINITE_PAGE_KEY),
       ])
       const patch = {}
       if (last) patch.sort = last
       if (mode === 'minimal' || mode === 'medium') patch.cardMode = mode
+      if (showInfinitePager === '0' || showInfinitePager === '1') {
+        patch.showInfinitePagerControls = showInfinitePager === '1'
+      }
+      if (rememberInfinitePage === '0' || rememberInfinitePage === '1') {
+        patch.trackInfiniteRestorePage = rememberInfinitePage === '1'
+      }
       const w = parseInt(String(widthStr ?? ''), 10)
       if (!Number.isNaN(w) && w >= 100 && w <= 500) patch.cardWidth = w
       if (Object.keys(patch).length) set(patch)
@@ -159,16 +214,23 @@ export const useHubStore = create((set, get) => ({
   fetchResources: async (resetPage, opts) => {
     const seq = ++fetchSeq
     const state = get()
-    const page = resetPage ? 1 : state.page
-    if (resetPage && state.page !== 1) set({ page: 1 })
-    set({ loading: true, error: null, ...(resetPage ? { resources: [] } : {}) })
+    const requestedPage = Math.max(1, Number(opts?.page ?? (resetPage ? 1 : state.page)) || 1)
+    const append = opts?.append === true
+    if (state.page !== requestedPage) set({ page: requestedPage })
+    if (
+      !append &&
+      state.browseMode === 'infinite' &&
+      (state.startPage !== requestedPage || state.restorePage !== requestedPage)
+    )
+      set({ startPage: requestedPage, restorePage: requestedPage })
+    set({ loading: true, error: null, ...(append ? {} : { resources: [] }) })
     try {
       if (opts?.forceRefresh) {
         await window.api.hub.invalidateCaches()
         await get().fetchFilters(true)
       }
       const q = get()
-      const params = { page, perpage: 30 }
+      const params = { page: requestedPage, perpage: q.perPage }
       if (q.sort) params.sort = q.sort
       if (q.search) params.search = q.search
       if (q.selectedType !== 'All') params.type = q.selectedType
@@ -183,21 +245,21 @@ export const useHubStore = create((set, get) => ({
       const incoming = result.resources || []
       syncInstalledFromResources(incoming)
       set({
-        resources: resetPage ? incoming : [...q.resources, ...incoming],
+        resources: append ? [...get().resources, ...incoming] : incoming,
         totalFound: result.totalFound || 0,
         totalPages: result.totalPages || 0,
         loading: false,
       })
     } catch (err) {
       if (seq !== fetchSeq) return
-      set({ error: err.message, loading: false, ...(resetPage ? { resources: [] } : {}) })
+      set({ error: err.message, loading: false, ...(append ? {} : { resources: [] }) })
     }
   },
 
   fetchNextPage: () => {
     const { page, totalPages, loading } = get()
     if (loading || page >= totalPages) return
-    set({ page: page + 1, loading: true })
+    void get().fetchResources(false, { page: page + 1, append: true })
   },
 
   openDetail: async (resource) => {
@@ -299,6 +361,8 @@ export const useHubStore = create((set, get) => ({
       hideInstalled: false,
       pendingDetailResourceId: null,
       page: 1,
+      startPage: 1,
+      restorePage: 1,
     })
     if (nextSort) void window.api.settings.set('hub_last_sort', nextSort)
   },

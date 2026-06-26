@@ -3,8 +3,10 @@ export const LAST_VIEW_KEY = 'ui:last_view'
 export const HUB_STATE_KEY = 'ui:hub_state'
 export const LIBRARY_STATE_KEY = 'ui:library_state'
 export const CONTENT_STATE_KEY = 'ui:content_state'
+export const HUB_PER_PAGE_OPTIONS = [30, 60, 90, 120]
 
 const VALID_VIEWS = new Set(['hub', 'library', 'content', 'settings'])
+const VALID_HUB_BROWSE_MODE = new Set(['infinite', 'paged'])
 const VALID_PAID = new Set(['all', 'free', 'paid'])
 const VALID_LIBRARY_STATUS = new Set(['direct', 'deps', 'missing', 'orphans', 'disabled', 'all', 'updates'])
 const VALID_ENABLED = new Set(['all', 'enabled', 'disabled', 'offloaded'])
@@ -17,9 +19,22 @@ const b = (value) => value === true
 const strings = (value) => (Array.isArray(value) ? value.filter((x) => typeof x === 'string') : [])
 const ints = (value) => (Array.isArray(value) ? value.filter((x) => Number.isInteger(x)) : [])
 const id = (value) => (typeof value === 'string' || typeof value === 'number' ? String(value) : null)
+const page = (value) => {
+  const n = Number(value)
+  return Number.isInteger(n) && n >= 1 ? n : 1
+}
+const hubPerPage = (value) => {
+  const n = Number(value)
+  return HUB_PER_PAGE_OPTIONS.includes(n) ? n : HUB_PER_PAGE_OPTIONS[0]
+}
+
+export function sanitizeView(value) {
+  return VALID_VIEWS.has(value) ? value : 'library'
+}
 
 export function sanitizeLastView(value) {
-  return VALID_VIEWS.has(value) ? value : 'library'
+  const view = sanitizeView(value)
+  return view === 'settings' ? 'hub' : view
 }
 
 export function sanitizeHubState(raw) {
@@ -34,6 +49,9 @@ export function sanitizeHubState(raw) {
     license: s(r.license, 'Any') || 'Any',
     hideInstalled: b(r.hideInstalled),
     detailResourceId: id(r.detailResourceId),
+    browseMode: VALID_HUB_BROWSE_MODE.has(r.browseMode) ? r.browseMode : 'infinite',
+    page: page(r.page),
+    perPage: hubPerPage(r.perPage),
   }
 }
 
