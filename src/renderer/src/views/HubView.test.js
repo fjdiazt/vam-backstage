@@ -90,4 +90,10 @@ describe('HubView infinite page tracking', () => {
     expect(shouldRenderHubPageSummary('infinite', true)).toBe(true)
     expect(shouldRenderHubPageSummary('paged', false)).toBe(true)
   })
+
+  it('wires infinite scrolling to start on the last page', () => {
+    expect(hubView).toContain('onClick={() => goInfiniteStartPage(maxHubPage)}')
+    expect(hubView).toContain('title="Start on last page"')
+    expect(hubView).toContain('aria-label="Start on last page"')
+  })
 })
