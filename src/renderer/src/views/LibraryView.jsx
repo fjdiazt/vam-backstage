@@ -89,6 +89,12 @@ import {
   isNonCommercialUseAllowed,
 } from '@/lib/licenses'
 import { resolveLibraryRestoreIndex, shouldIgnoreTransientTop, shouldRestoreOnActivate } from '@/lib/view-scroll-anchor'
+import {
+  getAppCommandPageDirection,
+  getMousePageDirection,
+  scrollMousePage,
+  shouldIgnoreMousePageTarget,
+} from '@/lib/mouse-page-nav'
 import { haystacksMatchAllTerms, searchAndTerms } from '@shared/search-text.js'
 import { isPackageActive } from '@shared/storage-state-predicates.js'
 import { LicenseTag } from '@/components/LicenseTag'
@@ -202,6 +208,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     fetchMissingDeps,
     refreshUpdateCheck,
     selectPackage,
+    clearSelection,
     consumePendingRestoreFilename,
     setScrollAnchorFilename,
     bulkSelectedFilenames,
@@ -872,6 +879,44 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     getId: (p) => p.filename,
   })
 
+  const pageNavRootRef = useRef(null)
+  const handlePageDirection = useCallback(
+    (direction, target, root) => {
+      if (direction < 0 && selectedDetail && !bulkActive) {
+        clearSelection()
+        return
+      }
+
+      if (target && shouldIgnoreMousePageTarget(target)) return
+      scrollMousePage(target || root, root, direction)
+    },
+    [bulkActive, clearSelection, selectedDetail],
+  )
+
+  const handleMousePageButton = useCallback(
+    (e) => {
+      const direction = getMousePageDirection(e.button)
+      if (!direction) return
+      e.preventDefault()
+      e.stopPropagation()
+      handlePageDirection(direction, e.target, e.currentTarget)
+    },
+    [handlePageDirection],
+  )
+
+  const handleAppCommand = useCallback(
+    (command) => {
+      const direction = getAppCommandPageDirection(command)
+      if (direction) handlePageDirection(direction, pageNavRootRef.current, pageNavRootRef.current)
+    },
+    [handlePageDirection],
+  )
+
+  useEffect(() => {
+    if (!active) return undefined
+    return window.api.on('app-command', handleAppCommand)
+  }, [active, handleAppCommand])
+
   useEffect(() => {
     if (!active) return
     function onKeyDown(e) {
@@ -908,7 +953,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
   }, [bulkSelectedFilenames, filtered.length])
 
   return (
-    <div className="h-full flex">
+    <div ref={pageNavRootRef} className="h-full flex" onMouseUp={handleMousePageButton}>
       <FilterPanel search={search} onSearchChange={setSearch} sections={sections} />
 
       <div className="flex-1 flex flex-col min-w-0">

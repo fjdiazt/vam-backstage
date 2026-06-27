@@ -60,6 +60,7 @@ import { Tag } from '@/components/ui/tag'
 import { ThumbnailSizeSlider } from '@/components/ThumbnailSizeSlider'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { HUB_PER_PAGE_OPTIONS } from '@/lib/view-state'
+import { getAppCommandPageDirection, getMousePageDirection, shouldIgnoreMousePageTarget } from '@/lib/mouse-page-nav'
 
 /** Hub text search: avoid a network request on every keystroke */
 const HUB_SEARCH_DEBOUNCE_MS = 320
@@ -423,6 +424,56 @@ export default function HubView({ onNavigate, active = true }) {
     const sorted = [...pages].filter((p) => p >= 1 && p <= maxHubPage).sort((a, b) => a - b)
     return sorted.flatMap((p, i) => (i > 0 && p - sorted[i - 1] > 1 ? ['...', p] : [p]))
   }, [maxHubPage, page])
+
+  const goPageDirection = useCallback(
+    (direction) => {
+      const currentPage = browseMode === 'infinite' ? restorePage : page
+      if (direction < 0 && currentPage <= 1) return
+      const canRecheckTail = !!resolvedTotalPages && !tailResolving
+      if (direction > 0 && currentPage >= maxHubPage && !canRecheckTail) return
+
+      const nextPage = currentPage + direction
+      if (browseMode === 'infinite') goInfiniteStartPage(nextPage)
+      else goPagedPage(nextPage)
+    },
+    [browseMode, goInfiniteStartPage, goPagedPage, maxHubPage, page, resolvedTotalPages, restorePage, tailResolving],
+  )
+
+  const handlePageDirection = useCallback(
+    (direction) => {
+      if (detailResource) {
+        if (direction < 0) closeDetail()
+        return
+      }
+      goPageDirection(direction)
+    },
+    [closeDetail, detailResource, goPageDirection],
+  )
+
+  const handleMousePageButton = useCallback(
+    (e) => {
+      const direction = getMousePageDirection(e.button)
+      if (!direction) return
+      e.preventDefault()
+      e.stopPropagation()
+      if (!detailResource && shouldIgnoreMousePageTarget(e.target)) return
+      handlePageDirection(direction)
+    },
+    [detailResource, handlePageDirection],
+  )
+
+  const handleAppCommand = useCallback(
+    (command) => {
+      const direction = getAppCommandPageDirection(command)
+      if (direction) handlePageDirection(direction)
+    },
+    [handlePageDirection],
+  )
+
+  useEffect(() => {
+    if (!active) return undefined
+    return window.api.on('app-command', handleAppCommand)
+  }, [active, handleAppCommand])
 
   const renderPageNav = (edge) => {
     if (!shouldRenderHubPageNav(edge, browseMode, maxHubPage, showInfinitePagerControls)) return null
@@ -797,7 +848,7 @@ export default function HubView({ onNavigate, active = true }) {
   )
 
   return (
-    <div className="h-full flex min-w-0 relative">
+    <div className="h-full flex min-w-0 relative" onMouseUp={handleMousePageButton}>
       <FilterPanel search={searchDraft} onSearchChange={handleSearchChange} sections={sections} />
 
       <div className="flex-1 flex flex-col min-w-0 min-h-0">
@@ -988,6 +1039,7 @@ function HubDetail({ resource, onBack, onNavigate, onInstall, onFilterAuthor }) 
   const [canGoBack, setCanGoBack] = useState(false)
   const [canGoForward, setCanGoForward] = useState(false)
   const [urlCopied, setUrlCopied] = useState(false)
+  const [webviewBackCaptureReady, setWebviewBackCaptureReady] = useState(false)
 
   const resourceId = detail?.resource_id || resource.resource_id
   const threadId = detail?.discussion_thread_id
@@ -1048,10 +1100,22 @@ function HubDetail({ resource, onBack, onNavigate, onInstall, onFilterAuthor }) 
     (key) => {
       setBrowserTab(key)
       const url = tabUrls[key] || tabUrls.overview
+      setWebviewBackCaptureReady(false)
       setNavUrl(url)
       setDisplayUrl(url)
     },
     [tabUrls],
+  )
+
+  const handleLoadingWebviewMousePageButton = useCallback(
+    (e) => {
+      const direction = getMousePageDirection(e.button)
+      if (direction >= 0) return
+      e.preventDefault()
+      e.stopPropagation()
+      onBack()
+    },
+    [onBack],
   )
 
   // When navigation swaps the displayed resource, reset the panel's tab highlight
@@ -1112,7 +1176,22 @@ function HubDetail({ resource, onBack, onNavigate, onInstall, onFilterAuthor }) 
         window.__hubNavPatched = true
         var hubOrigin = location.origin
         var EXT_TAG = '__VAM_OPEN_EXT__:'
+        var MOUSE_PAGE_BACK_TAG = '__VAM_MOUSE_PAGE_BACK__:'
         var openExternal = function(url) { console.warn(EXT_TAG + url) }
+        var lastMousePageBackAt = 0
+
+        var sendMousePageBack = function(e) {
+          if (e.button !== 3) return
+          e.preventDefault()
+          e.stopImmediatePropagation()
+          var now = Date.now()
+          if (now - lastMousePageBackAt < 250) return
+          lastMousePageBackAt = now
+          console.warn(MOUSE_PAGE_BACK_TAG)
+        }
+        document.addEventListener('mousedown', sendMousePageBack, true)
+        document.addEventListener('mouseup', sendMousePageBack, true)
+        document.addEventListener('auxclick', sendMousePageBack, true)
 
         // Capture phase — external links: claim the click before XenForo's link-confirm handler.
         document.addEventListener('click', function(e) {
@@ -1166,31 +1245,47 @@ function HubDetail({ resource, onBack, onNavigate, onInstall, onFilterAuthor }) 
           return _open(url)
         }
       })()`,
-      ).catch(() => {})
+      )
+        .then(() => {
+          setWebviewBackCaptureReady(true)
+        })
+        .catch(() => {
+          setWebviewBackCaptureReady(true)
+        })
     }
 
     const EXT_TAG = '__VAM_OPEN_EXT__:'
+    const MOUSE_PAGE_BACK_TAG = '__VAM_MOUSE_PAGE_BACK__:'
     const onConsoleMessage = (e) => {
       if (typeof e.message !== 'string') return
+      if (e.message.includes(MOUSE_PAGE_BACK_TAG)) {
+        onBack()
+        return
+      }
       const i = e.message.indexOf(EXT_TAG)
       if (i < 0) return
       const url = e.message.slice(i + EXT_TAG.length).trim()
       if (url) void window.api.shell.openExternal(url)
     }
 
+    const onDidStartLoading = () => {
+      setWebviewBackCaptureReady(false)
+    }
     wv.addEventListener('did-navigate', syncNav)
     wv.addEventListener('did-navigate-in-page', syncNav)
     wv.addEventListener('did-fail-load', ignoreAbort)
+    wv.addEventListener('did-start-loading', onDidStartLoading)
     wv.addEventListener('dom-ready', injectLinkHandler)
     wv.addEventListener('console-message', onConsoleMessage)
     return () => {
       wv.removeEventListener('did-navigate', syncNav)
       wv.removeEventListener('did-navigate-in-page', syncNav)
       wv.removeEventListener('did-fail-load', ignoreAbort)
+      wv.removeEventListener('did-start-loading', onDidStartLoading)
       wv.removeEventListener('dom-ready', injectLinkHandler)
       wv.removeEventListener('console-message', onConsoleMessage)
     }
-  }, [resourceId, tabUrls, tabs])
+  }, [onBack, resourceId, tabUrls, tabs])
 
   const goBack = useCallback(() => webviewRef.current?.goBack(), [])
   const goForward = useCallback(() => webviewRef.current?.goForward(), [])
@@ -1768,7 +1863,7 @@ function HubDetail({ resource, onBack, onNavigate, onInstall, onFilterAuthor }) 
           </div>
 
           {/* Webview */}
-          <div className="flex-1 min-h-0">
+          <div className="relative flex-1 min-h-0">
             <webview
               key={browserResourceId}
               ref={webviewRef}
@@ -1778,6 +1873,9 @@ function HubDetail({ resource, onBack, onNavigate, onInstall, onFilterAuthor }) 
               className="w-full h-full"
               style={{ display: 'flex', pointerEvents: hubPanelResizeDrag ? 'none' : 'auto' }}
             />
+            {!webviewBackCaptureReady && (
+              <div className="absolute inset-0 bg-transparent" onMouseUp={handleLoadingWebviewMousePageButton} />
+            )}
           </div>
         </div>
       </div>
