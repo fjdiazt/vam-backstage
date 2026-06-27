@@ -3,7 +3,7 @@ import { readFileSync } from 'fs'
 import { resolve } from 'path'
 import {
   hubInfiniteOffsetLabel,
-  hubInfiniteOffsetTitle,
+  hubPageCountLabel,
   hubPageForVisibleResourceIndex,
   shouldFetchHubResources,
   shouldRenderHubPageNav,
@@ -64,14 +64,20 @@ describe('HubView infinite page tracking', () => {
     expect(hubPageForVisibleResourceIndex(119, 60, 1)).toBe(2)
   })
 
-  it('labels only loaded infinite offsets, not natural scrolling', () => {
+  it('keeps infinite page label neutral', () => {
     expect(hubInfiniteOffsetLabel({ startPage: 1, restorePage: 20 })).toBe('Page')
-    expect(hubInfiniteOffsetLabel({ startPage: 20, restorePage: 20 })).toBe('Earlier results hidden')
+    expect(hubInfiniteOffsetLabel({ startPage: 20, restorePage: 20 })).toBe('Page')
   })
 
-  it('explains hidden earlier results in the offset tooltip', () => {
-    expect(hubInfiniteOffsetTitle({ startPage: 1 })).toBeUndefined()
-    expect(hubInfiniteOffsetTitle({ startPage: 20 })).toBe('Earlier Hub pages are hidden until you start at page 1.')
+  it('formats reported total pages without approximation', () => {
+    expect(hubPageCountLabel(300)).toBe('300')
+    expect(hubPageCountLabel(190)).toBe('190')
+  })
+
+  it('uses compact page size wording', () => {
+    expect(hubView).toContain('Page size')
+    expect(hubView).toContain('aria-label="Hub page size"')
+    expect(hubView).not.toContain('/ page')
   })
 
   it('keeps page controls in the sticky toolbar', () => {
@@ -93,7 +99,13 @@ describe('HubView infinite page tracking', () => {
 
   it('wires infinite scrolling to start on the last page', () => {
     expect(hubView).toContain('onClick={() => goInfiniteStartPage(maxHubPage)}')
-    expect(hubView).toContain('title="Start on last page"')
-    expect(hubView).toContain('aria-label="Start on last page"')
+    expect(hubView).toContain("'Start on last page'")
+    expect(hubView).toContain("'Check for last Hub page'")
+  })
+
+  it('wires wheel-up loading for earlier infinite pages', () => {
+    expect(hubView).toContain('fetchPreviousPage')
+    expect(hubView).toContain('onWheel={handleGalleryWheel}')
+    expect(hubView).toContain('restoreHubScrollAnchor')
   })
 })
