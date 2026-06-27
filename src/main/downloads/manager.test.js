@@ -1,5 +1,7 @@
 import { PassThrough } from 'stream'
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { readFileSync } from 'fs'
+import { resolve } from 'path'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const electronMock = vi.hoisted(() => ({
   request: vi.fn(),
@@ -27,6 +29,12 @@ beforeEach(() => {
   electronMock.request.mockReset()
   electronMock.fetch.mockReset()
 })
+
+const managerSource = readFileSync(resolve(import.meta.dirname, './manager.js'), 'utf8')
+const downloadsPanelSource = readFileSync(
+  resolve(import.meta.dirname, '../../renderer/src/components/DownloadsPanel.jsx'),
+  'utf8',
+)
 
 // ── concreteDepFilename ────────────────────────────────────────────────────────
 //
@@ -128,5 +136,21 @@ describe('openDownloadStream', () => {
     expect(electronMock.fetch).not.toHaveBeenCalled()
     expect(res.ok).toBe(true)
     expect(Buffer.concat(chunks).toString()).toBe('ok')
+  })
+})
+
+describe('download pause state wiring', () => {
+  it('persists global paused state and keeps queued downloads stopped at startup', () => {
+    expect(managerSource).toContain("const DOWNLOADS_PAUSED_SETTING = 'downloads_paused'")
+    expect(managerSource).toContain("paused = getSetting(DOWNLOADS_PAUSED_SETTING) === '1'")
+    expect(managerSource).toContain("setSetting(DOWNLOADS_PAUSED_SETTING, '1')")
+    expect(managerSource).toContain("setSetting(DOWNLOADS_PAUSED_SETTING, '0')")
+    expect(managerSource).toContain('if (paused) {\n    resetActiveDownloads()')
+    expect(managerSource).toContain('function processQueue() {\n  if (paused) return')
+  })
+
+  it('keeps pause controls visible even when the queue is empty', () => {
+    expect(downloadsPanelSource).not.toContain('{hasInFlight && (')
+    expect(downloadsPanelSource).toContain("title={paused ? 'Resume downloads' : 'Pause downloads'}")
   })
 })
