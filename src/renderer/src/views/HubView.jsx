@@ -62,6 +62,7 @@ import { ThumbnailSizeSlider } from '@/components/ThumbnailSizeSlider'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { HUB_PER_PAGE_OPTIONS } from '@/lib/view-state'
 import { getAppCommandPageDirection, getMousePageDirection, shouldIgnoreMousePageTarget } from '@/lib/mouse-page-nav'
+import BackToTopButton from '@/components/BackToTopButton'
 
 /** Hub text search: avoid a network request on every keystroke */
 const HUB_SEARCH_DEBOUNCE_MS = 320
@@ -988,76 +989,79 @@ export default function HubView({ onNavigate, active = true }) {
         </div>
 
         {/* Gallery */}
-        <div ref={galleryRef} className="flex-1 overflow-y-auto p-4 relative" onWheel={handleGalleryWheel}>
-          {!wishlistMode && error && (
-            <div className="mb-4 px-4 py-3 rounded-lg bg-error/10 border border-error/20 text-error text-xs select-text cursor-text">
-              {error}
-            </div>
-          )}
-          {galleryResources.length === 0 && (galleryLoading || (!wishlistMode && !sort)) ? (
-            <div
-              className="grid gap-3 content-start"
-              style={{ gridTemplateColumns: `repeat(auto-fill,minmax(min(${cardWidth}px,100%),1fr))` }}
-            >
-              {Array.from({ length: 12 }, (_, i) => (
-                <SkeletonCard key={i} mode={cardMode} />
-              ))}
-            </div>
-          ) : (
-            <>
-              {browseMode === 'infinite' && loadingPrevious && resources.length > 0 && (
-                <div
-                  className="grid gap-3 content-start mb-3"
-                  style={{ gridTemplateColumns: `repeat(auto-fill,minmax(min(${cardWidth}px,100%),1fr))` }}
-                >
-                  {Array.from({ length: perPage }, (_, i) => (
-                    <SkeletonCard key={i} mode={cardMode} />
-                  ))}
-                </div>
-              )}
+        <div className="relative flex-1 min-h-0">
+          <div ref={galleryRef} className="h-full overflow-y-auto p-4 relative" onWheel={handleGalleryWheel}>
+            {!wishlistMode && error && (
+              <div className="mb-4 px-4 py-3 rounded-lg bg-error/10 border border-error/20 text-error text-xs select-text cursor-text">
+                {error}
+              </div>
+            )}
+            {galleryResources.length === 0 && (galleryLoading || (!wishlistMode && !sort)) ? (
               <div
                 className="grid gap-3 content-start"
                 style={{ gridTemplateColumns: `repeat(auto-fill,minmax(min(${cardWidth}px,100%),1fr))` }}
               >
-                {visibleResources.map((r, i) => (
-                  <div
-                    key={r.resource_id}
-                    data-hub-resource-id={r.resource_id}
-                    data-hub-resource-index={
-                      browseMode === 'infinite' ? (startPage - 1) * perPage + i : (page - 1) * perPage + i
-                    }
-                  >
-                    <HubCard
-                      resource={r}
-                      onClick={openDetail}
-                      onViewInLibrary={handleViewInLibrary}
-                      onInstall={handleInstall}
-                      onPromote={handlePromote}
-                      onFilterAuthor={handleFilterAuthor}
-                      onToggleWishlist={(resource) => toggleWishlist(resource)}
-                      isWishlisted={wishlistIds.has(String(r.resource_id))}
-                      mode={cardMode}
-                      hideType={selectedType !== 'All'}
-                    />
-                  </div>
+                {Array.from({ length: 12 }, (_, i) => (
+                  <SkeletonCard key={i} mode={cardMode} />
                 ))}
               </div>
-              {renderPageNav('bottom')}
-              {/* Infinite scroll sentinel */}
-              {!wishlistMode && browseMode === 'infinite' && page < totalPages && (
-                <div ref={sentinelRef} className="h-1" />
-              )}
-              {browseMode === 'infinite' && loading && !loadingPrevious && resources.length > 0 && (
-                <div className="flex items-center justify-center py-6">
-                  <Loader2 size={20} className="animate-spin text-accent-blue" />
-                  <span className="text-[11px] text-text-tertiary ml-2">Loading more…</span>
+            ) : (
+              <>
+                {browseMode === 'infinite' && loadingPrevious && resources.length > 0 && (
+                  <div
+                    className="grid gap-3 content-start mb-3"
+                    style={{ gridTemplateColumns: `repeat(auto-fill,minmax(min(${cardWidth}px,100%),1fr))` }}
+                  >
+                    {Array.from({ length: perPage }, (_, i) => (
+                      <SkeletonCard key={i} mode={cardMode} />
+                    ))}
+                  </div>
+                )}
+                <div
+                  className="grid gap-3 content-start"
+                  style={{ gridTemplateColumns: `repeat(auto-fill,minmax(min(${cardWidth}px,100%),1fr))` }}
+                >
+                  {visibleResources.map((r, i) => (
+                    <div
+                      key={r.resource_id}
+                      data-hub-resource-id={r.resource_id}
+                      data-hub-resource-index={
+                        browseMode === 'infinite' ? (startPage - 1) * perPage + i : (page - 1) * perPage + i
+                      }
+                    >
+                      <HubCard
+                        resource={r}
+                        onClick={openDetail}
+                        onViewInLibrary={handleViewInLibrary}
+                        onInstall={handleInstall}
+                        onPromote={handlePromote}
+                        onFilterAuthor={handleFilterAuthor}
+                        onToggleWishlist={(resource) => toggleWishlist(resource)}
+                        isWishlisted={wishlistIds.has(String(r.resource_id))}
+                        mode={cardMode}
+                        hideType={selectedType !== 'All'}
+                      />
+                    </div>
+                  ))}
                 </div>
-              )}
-              {!galleryLoading && (wishlistMode || sort) && filteredResources.length === 0 && page >= totalPages && (
-                <div className="text-center py-16 text-text-tertiary text-sm">No packages found</div>
-              )}
-            </>
-          )}
+                {renderPageNav('bottom')}
+                {/* Infinite scroll sentinel */}
+                {!wishlistMode && browseMode === 'infinite' && page < totalPages && (
+                  <div ref={sentinelRef} className="h-1" />
+                )}
+                {browseMode === 'infinite' && loading && !loadingPrevious && resources.length > 0 && (
+                  <div className="flex items-center justify-center py-6">
+                    <Loader2 size={20} className="animate-spin text-accent-blue" />
+                    <span className="text-[11px] text-text-tertiary ml-2">Loading more…</span>
+                  </div>
+                )}
+                {!galleryLoading && (wishlistMode || sort) && filteredResources.length === 0 && page >= totalPages && (
+                  <div className="text-center py-16 text-text-tertiary text-sm">No packages found</div>
+                )}
+              </>
+            )}
+          </div>
+          <BackToTopButton scrollRef={galleryRef} />
         </div>
       </div>
       {detailResource && (

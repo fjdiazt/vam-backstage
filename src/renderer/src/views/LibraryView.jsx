@@ -1180,6 +1180,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
             onLayout={setGridLayout}
             onFirstVisibleIndexChange={handleFirstVisibleIndexChange}
             onEmptyAreaPointerDown={bulkActive ? () => clearBulkSelection() : undefined}
+            showBackToTop
             renderItem={(pkg) => {
               const updateInfo = updateCheckResults?.[pkg.filename]
               const dimUpdateUnavailable =
@@ -1236,6 +1237,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
                 restoreIndex={restoreIdx}
                 restoreKey={restoreScrollKey}
                 onFirstVisibleIndexChange={handleFirstVisibleIndexChange}
+                showBackToTop
                 renderRow={(pkg) => {
                   const updateInfo = updateCheckResults?.[pkg.filename]
                   const dimUpdateUnavailable =
@@ -1535,6 +1537,7 @@ function MissingDepsTable({ data, loading, hubDetailsLoading, scrollResetKey, on
           rowHeight={37}
           className="flex-1"
           scrollResetKey={scrollResetKey}
+          showBackToTop
           renderRow={(item) => (
             <MissingDepRow
               key={item.ref}
