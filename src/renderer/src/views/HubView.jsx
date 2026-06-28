@@ -42,6 +42,7 @@ import {
 import { useHubStore } from '@/stores/useHubStore'
 import { useDownloadStore } from '@/stores/useDownloadStore'
 import { useInstalledStore } from '@/stores/useInstalledStore'
+import { useHubWishlistStore } from '@/stores/useHubWishlistStore'
 import { useHubInstallState } from '@/hooks/useHubInstallState'
 import { useHubInteractions } from '@/hooks/useHubInteractions'
 import { HubCard, AuthorAvatar, DepRow } from '@/components/PackageCard'
@@ -94,6 +95,11 @@ export default function HubView({ onNavigate }) {
     openDetail,
     closeDetail,
   } = useHubStore()
+  const wishlistItems = useHubWishlistStore((s) => s.items)
+  const wishlistIds = useHubWishlistStore((s) => s.ids)
+  const wishlistLoading = useHubWishlistStore((s) => s.loading)
+  const toggleWishlist = useHubWishlistStore((s) => s.toggle)
+  const wishlistMode = paidFilter === 'wishlist'
 
   const [searchDraft, setSearchDraft] = useState(search)
   const searchDraftRef = useRef(search)
@@ -155,6 +161,7 @@ export default function HubView({ onNavigate }) {
 
   useEffect(() => {
     useHubStore.getState().fetchFilters()
+    useHubWishlistStore.getState().hydrate()
   }, [])
 
   // Track gallery container width for the zoom slider
@@ -180,32 +187,66 @@ export default function HubView({ onNavigate }) {
     )
   }, [availableWidth, cardWidth])
 
+  const filteredWishlistItems = useMemo(() => {
+    if (!wishlistMode) return []
+    const q = search.trim().toLowerCase()
+    const author = authorSearch.trim().toLowerCase()
+    return wishlistItems.filter((r) => {
+      if (q && !`${r.title || ''} ${r.username || ''}`.toLowerCase().includes(q)) return false
+      if (selectedType !== 'All' && r.type !== selectedType) return false
+      if (
+        author &&
+        !String(r.username || '')
+          .toLowerCase()
+          .includes(author)
+      )
+        return false
+      if (selectedHubTags.length) {
+        const tags = Array.isArray(r.tags) ? r.tags.map((t) => String(t).toLowerCase()) : []
+        if (!selectedHubTags.every((tag) => tags.includes(String(tag).toLowerCase()))) return false
+      }
+      if (license !== 'Any' && (getHubResourceLicense(r) || r.license) !== license) return false
+      return true
+    })
+  }, [authorSearch, license, search, selectedHubTags, selectedType, wishlistItems, wishlistMode])
+  const galleryResources = wishlistMode ? filteredWishlistItems : resources
+  const galleryLoading = wishlistMode ? wishlistLoading : loading
+  const galleryTotalFound = wishlistMode ? filteredWishlistItems.length : totalFound
+  const galleryTotalPages = wishlistMode ? 1 : totalPages
+  const galleryPage = wishlistMode ? 1 : page
+
   /** While more pages exist, hide the trailing partial row so the bottom is always full rows */
   const visibleResources = useMemo(() => {
-    if (page >= totalPages) return resources
-    const fullRowCount = Math.floor(resources.length / columnCount) * columnCount
-    if (fullRowCount === 0) return resources
-    return resources.slice(0, fullRowCount)
-  }, [resources, page, totalPages, columnCount])
+    if (galleryPage >= galleryTotalPages) return galleryResources
+    const fullRowCount = Math.floor(galleryResources.length / columnCount) * columnCount
+    if (fullRowCount === 0) return galleryResources
+    return galleryResources.slice(0, fullRowCount)
+  }, [galleryResources, galleryPage, galleryTotalPages, columnCount])
 
   // Filter changes → reset to page 1 and fetch
   useEffect(() => {
+    if (wishlistMode) {
+      useHubWishlistStore.getState().hydrate()
+      return
+    }
     if (!sort) return // wait for sort options to load
     useHubStore.getState().fetchResources(true)
-  }, [search, selectedType, paidFilter, authorSearch, selectedHubTags, sort, license])
+  }, [search, selectedType, paidFilter, authorSearch, selectedHubTags, sort, license, wishlistMode])
 
   // Page changes (without filter change) → fetch same filters, new page (append mode)
   const pageRef = useRef(page)
   useEffect(() => {
+    if (wishlistMode) return
     if (pageRef.current === page) return
     pageRef.current = page
     useHubStore.getState().fetchResources()
-  }, [page])
+  }, [page, wishlistMode])
 
   // Intersection observer sentinel for infinite scroll (root = gallery scroller so rootMargin
   // prefetches below the fold; viewport root + overflow-y ancestor clips the target until late).
   const sentinelRef = useRef(null)
   useEffect(() => {
+    if (wishlistMode) return
     const root = galleryRef.current
     const el = sentinelRef.current
     if (!root || !el) return
@@ -217,13 +258,13 @@ export default function HubView({ onNavigate }) {
     )
     io.observe(el)
     return () => io.disconnect()
-  }, [fetchNextPage, resources.length])
+  }, [fetchNextPage, galleryResources.length, wishlistMode])
 
   // The observer only fires on intersection *changes*, so when the sentinel stays visible across
   // a page load (common with cached pages) nothing re-triggers it. After each page settles, probe
   // whether the sentinel is still in the prefetch zone and keep loading if so.
   useEffect(() => {
-    if (loading || page >= totalPages) return
+    if (wishlistMode || loading || page >= totalPages) return
     const root = galleryRef.current
     const el = sentinelRef.current
     if (!root || !el) return
@@ -232,13 +273,14 @@ export default function HubView({ onNavigate }) {
     if (elRect.top < rootRect.bottom + HUB_LOAD_MORE_MARGIN_BOTTOM_PX && elRect.bottom > rootRect.top) {
       fetchNextPage()
     }
-  }, [loading, page, totalPages, resources.length, fetchNextPage])
+  }, [loading, page, totalPages, galleryResources.length, fetchNextPage, wishlistMode])
 
   // When packages change (promote, download completes, uninstall), resync install status from DB.
   // The hub detail panel is refreshed at App level; here we only patch the
   // gallery's resource objects + the global installed-state store.
   useEffect(() => {
     return window.api.onPackagesUpdated(async () => {
+      void useHubWishlistStore.getState().hydrate()
       const { resources } = useHubStore.getState()
       if (resources.length === 0) return
 
@@ -341,6 +383,7 @@ export default function HubView({ onNavigate }) {
           { value: 'all', label: 'All' },
           { value: 'free', label: 'Free' },
           { value: 'paid', label: 'Paid' },
+          { value: 'wishlist', label: 'Wishlist', separatorBefore: true },
         ],
       },
       {
@@ -399,16 +442,22 @@ export default function HubView({ onNavigate }) {
         {/* Toolbar */}
         <div className="h-10 flex items-center px-4 border-b border-border shrink-0 gap-2">
           <span className="text-[11px] text-text-tertiary">
-            {loading && resources.length === 0 ? 'Searching…' : `${totalFound.toLocaleString()} packages`}
+            {galleryLoading && galleryResources.length === 0
+              ? wishlistMode
+                ? 'Loading wishlist…'
+                : 'Searching…'
+              : `${galleryTotalFound.toLocaleString()} packages`}
           </span>
           <button
             type="button"
-            onClick={() => fetchResources(true, { forceRefresh: true })}
-            disabled={loading}
+            onClick={() =>
+              wishlistMode ? useHubWishlistStore.getState().hydrate() : fetchResources(true, { forceRefresh: true })
+            }
+            disabled={galleryLoading}
             title="Refresh"
             className="p-1 rounded text-text-tertiary hover:text-text-secondary disabled:opacity-30 cursor-pointer disabled:cursor-default"
           >
-            <RefreshCw size={13} className={loading && resources.length === 0 ? 'animate-spin' : ''} />
+            <RefreshCw size={13} className={galleryLoading && galleryResources.length === 0 ? 'animate-spin' : ''} />
           </button>
           <div className="flex-1" />
           <ThumbnailSizeSlider cardWidth={cardWidth} availableWidth={availableWidth} onCardWidthChange={setCardWidth} />
@@ -434,12 +483,12 @@ export default function HubView({ onNavigate }) {
 
         {/* Gallery */}
         <div ref={galleryRef} className="flex-1 overflow-y-auto p-4 relative">
-          {error && (
+          {!wishlistMode && error && (
             <div className="mb-4 px-4 py-3 rounded-lg bg-error/10 border border-error/20 text-error text-xs select-text cursor-text">
               {error}
             </div>
           )}
-          {resources.length === 0 && (loading || !sort) ? (
+          {galleryResources.length === 0 && (galleryLoading || (!wishlistMode && !sort)) ? (
             <div
               className="grid gap-3 content-start"
               style={{ gridTemplateColumns: `repeat(auto-fill,minmax(min(${cardWidth}px,100%),1fr))` }}
@@ -463,20 +512,22 @@ export default function HubView({ onNavigate }) {
                     onInstall={handleInstall}
                     onPromote={handlePromote}
                     onFilterAuthor={handleFilterAuthor}
+                    onToggleWishlist={(resource) => toggleWishlist(resource)}
+                    isWishlisted={wishlistIds.has(String(r.resource_id))}
                     mode={cardMode}
                     hideType={selectedType !== 'All'}
                   />
                 ))}
               </div>
               {/* Infinite scroll sentinel */}
-              {page < totalPages && <div ref={sentinelRef} className="h-1" />}
-              {loading && resources.length > 0 && (
+              {!wishlistMode && page < totalPages && <div ref={sentinelRef} className="h-1" />}
+              {galleryLoading && galleryResources.length > 0 && (
                 <div className="flex items-center justify-center py-6">
                   <Loader2 size={20} className="animate-spin text-accent-blue" />
                   <span className="text-[11px] text-text-tertiary ml-2">Loading more…</span>
                 </div>
               )}
-              {!loading && sort && resources.length === 0 && (
+              {!galleryLoading && (wishlistMode || sort) && galleryResources.length === 0 && (
                 <div className="text-center py-16 text-text-tertiary text-sm">No packages found</div>
               )}
             </>

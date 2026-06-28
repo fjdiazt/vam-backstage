@@ -72,6 +72,11 @@ const api = {
     toggleFavorite: (id) => ipcRenderer.invoke('hub:toggleFavorite', id),
     toggleBookmark: (id, currentlyBookmarked) => ipcRenderer.invoke('hub:toggleBookmark', id, currentlyBookmarked),
     toggleLike: (id, currentlyLiked) => ipcRenderer.invoke('hub:toggleLike', id, currentlyLiked),
+    wishlist: {
+      list: () => ipcRenderer.invoke('hub:wishlist:list'),
+      ids: () => ipcRenderer.invoke('hub:wishlist:ids'),
+      toggle: (resource) => ipcRenderer.invoke('hub:wishlist:toggle', resource),
+    },
   },
   downloads: {
     list: () => ipcRenderer.invoke('downloads:list'),

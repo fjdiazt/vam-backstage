@@ -110,6 +110,10 @@ export const useHubStore = create((set, get) => ({
     if (resetPage && state.page !== 1) set({ page: 1 })
     set({ loading: true, error: null, ...(resetPage ? { resources: [] } : {}) })
     try {
+      if (get().paidFilter === 'wishlist') {
+        set({ resources: [], totalFound: 0, totalPages: 0, loading: false })
+        return
+      }
       if (opts?.forceRefresh) {
         await window.api.hub.invalidateCaches()
         await get().fetchFilters(true)
