@@ -1,5 +1,6 @@
 import { useRef, useState, useCallback, useEffect, useLayoutEffect } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
+import BackToTopButton from './BackToTopButton'
 
 /**
  * Virtualised grid: column count follows min track width; cells share row width
@@ -27,6 +28,7 @@ export function VirtualGrid({
   onFirstVisibleIndexChange,
   /** When bulk selection is on, clear it on pointer down outside any `[data-grid-card]` (gaps, padding, empty scroll area). */
   onEmptyAreaPointerDown,
+  showBackToTop = false,
 }) {
   const rowGap = gapY ?? gap
   const scrollRef = useRef(null)
@@ -236,38 +238,36 @@ export function VirtualGrid({
   )
 
   return (
-    <div
-      ref={scrollRef}
-      data-page-nav-scroll
-      className={`overflow-y-auto ${className}`}
-      onMouseDown={onScrollMouseDown}
-    >
-      <div style={{ height: virtualizer.getTotalSize() + padding * 2, position: 'relative' }}>
-        {virtualizer.getVirtualItems().map((vRow) => {
-          const startIdx = vRow.index * cols
-          const rowItems = items.slice(startIdx, startIdx + cols)
-          return (
-            <div
-              key={vRow.key}
-              style={{
-                position: 'absolute',
-                top: vRow.start + padding,
-                left: padding,
-                right: padding,
-                display: 'flex',
-                gap,
-              }}
-            >
-              {rowItems.map((item, colIdx) => (
-                <div key={startIdx + colIdx} style={{ width: cellWidth, flexShrink: 0, minWidth: 0 }}>
-                  {renderItem(item, startIdx + colIdx)}
-                </div>
-              ))}
-            </div>
-          )
-        })}
+    <div className={`relative min-h-0 ${className}`}>
+      <div ref={scrollRef} data-page-nav-scroll className="h-full overflow-y-auto" onMouseDown={onScrollMouseDown}>
+        <div style={{ height: virtualizer.getTotalSize() + padding * 2, position: 'relative' }}>
+          {virtualizer.getVirtualItems().map((vRow) => {
+            const startIdx = vRow.index * cols
+            const rowItems = items.slice(startIdx, startIdx + cols)
+            return (
+              <div
+                key={vRow.key}
+                style={{
+                  position: 'absolute',
+                  top: vRow.start + padding,
+                  left: padding,
+                  right: padding,
+                  display: 'flex',
+                  gap,
+                }}
+              >
+                {rowItems.map((item, colIdx) => (
+                  <div key={startIdx + colIdx} style={{ width: cellWidth, flexShrink: 0, minWidth: 0 }}>
+                    {renderItem(item, startIdx + colIdx)}
+                  </div>
+                ))}
+              </div>
+            )
+          })}
+        </div>
+        {items.length === 0 && <div className="text-center py-16 text-text-tertiary text-sm">No items found</div>}
       </div>
-      {items.length === 0 && <div className="text-center py-16 text-text-tertiary text-sm">No items found</div>}
+      {showBackToTop && <BackToTopButton scrollRef={scrollRef} />}
     </div>
   )
 }
@@ -286,6 +286,7 @@ export function VirtualList({
   restoreIndex = null,
   restoreKey = '',
   onFirstVisibleIndexChange,
+  showBackToTop = false,
 }) {
   const scrollRef = useRef(null)
   const consumedRestoreKeyRef = useRef('')
@@ -346,14 +347,17 @@ export function VirtualList({
   }, [rowHeight, emitFirstVisibleIndex])
 
   return (
-    <div ref={scrollRef} data-page-nav-scroll className={`overflow-y-auto ${className}`}>
-      <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
-        {virtualizer.getVirtualItems().map((vRow) => (
-          <div key={vRow.key} style={{ position: 'absolute', top: vRow.start, left: 0, right: 0, height: rowHeight }}>
-            {renderRow(items[vRow.index], vRow.index)}
-          </div>
-        ))}
+    <div className={`relative min-h-0 ${className}`}>
+      <div ref={scrollRef} data-page-nav-scroll className="h-full overflow-y-auto">
+        <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+          {virtualizer.getVirtualItems().map((vRow) => (
+            <div key={vRow.key} style={{ position: 'absolute', top: vRow.start, left: 0, right: 0, height: rowHeight }}>
+              {renderRow(items[vRow.index], vRow.index)}
+            </div>
+          ))}
+        </div>
       </div>
+      {showBackToTop && <BackToTopButton scrollRef={scrollRef} />}
     </div>
   )
 }

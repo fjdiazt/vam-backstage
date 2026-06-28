@@ -1197,6 +1197,7 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
             onLayout={setGridLayout}
             onFirstVisibleIndexChange={handleFirstVisibleIndexChange}
             onEmptyAreaPointerDown={bulkActive ? () => clearBulkSelection() : undefined}
+            showBackToTop
             renderItem={(item) => (
               <ContentItemContextMenu
                 key={item.id}
@@ -1253,6 +1254,7 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
                 restoreIndex={restoreIdx}
                 restoreKey={restoreScrollKey}
                 onFirstVisibleIndexChange={handleFirstVisibleIndexChange}
+                showBackToTop
                 renderRow={(item) => (
                   <ContentItemContextMenu
                     key={item.id}
