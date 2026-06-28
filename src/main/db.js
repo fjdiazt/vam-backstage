@@ -4,7 +4,7 @@ import { app } from 'electron'
 import { join } from 'path'
 import { LOCAL_PACKAGE_FILENAME } from '@shared/local-package.js'
 
-const SCHEMA_VERSION = 23
+const SCHEMA_VERSION = 24
 
 /**
  * Normalize a value to a non-negative integer string, or null. Hub resource/user
@@ -115,6 +115,7 @@ function migrate() {
     if (current < 21) applyV21()
     if (current < 22) applyV22()
     if (current < 23) applyV23()
+    if (current < 24) applyV24()
   }
 
   ensureLocalPackage()
@@ -303,6 +304,30 @@ function applyV23() {
   tx()
 }
 
+function hubWishlistSchemaSql() {
+  return `
+    CREATE TABLE IF NOT EXISTS hub_wishlist (
+      resource_id TEXT PRIMARY KEY CHECK (${intCheckSql('resource_id')}),
+      title TEXT,
+      url TEXT,
+      image_url TEXT,
+      image_blob BLOB,
+      image_mime TEXT,
+      username TEXT,
+      type TEXT,
+      category TEXT,
+      license TEXT,
+      snapshot_json TEXT,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+  `
+}
+
+function applyV24() {
+  db.exec(hubWishlistSchemaSql())
+}
+
 /**
  * Ensure the synthetic "local content" package row exists. Loose files under
  * `vamDir/Saves` and `vamDir/Custom` are stored as `contents` rows that point
@@ -411,6 +436,8 @@ function createSchema() {
       updated_at INTEGER NOT NULL DEFAULT (unixepoch())
     );
     CREATE INDEX IF NOT EXISTS idx_hub_users_username ON hub_users(username);
+
+    ${hubWishlistSchemaSql()}
 
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
@@ -751,6 +778,71 @@ export function trySetSetting(key, value) {
   } catch {
     return false
   }
+}
+
+// Hub wishlist
+export function listHubWishlist() {
+  return stmt(
+    `SELECT resource_id, title, url, image_url, image_blob, image_mime, username, type, category, license, snapshot_json, created_at, updated_at
+     FROM hub_wishlist
+     ORDER BY updated_at DESC, created_at DESC`,
+  ).all()
+}
+
+export function getHubWishlistIds() {
+  return stmt('SELECT resource_id FROM hub_wishlist')
+    .all()
+    .map((r) => r.resource_id)
+}
+
+export function isHubWishlisted(resourceId) {
+  const rid = toIntString(resourceId)
+  if (!rid) return false
+  return !!stmt('SELECT 1 FROM hub_wishlist WHERE resource_id = ?').get(rid)
+}
+
+export function upsertHubWishlist(resource, thumb = {}) {
+  const rid = toIntString(resource?.resource_id ?? resource?.resourceId)
+  if (!rid) throw new Error('Hub wishlist resource_id is required')
+  const entry = {
+    resourceId: rid,
+    title: resource.title ?? null,
+    url: resource.url ?? null,
+    imageUrl: resource.image_url ?? resource.imageUrl ?? null,
+    imageBlob: thumb.buffer ?? resource.image_blob ?? resource.imageBlob ?? null,
+    imageMime: thumb.mime ?? resource.image_mime ?? resource.imageMime ?? null,
+    username: resource.username ?? null,
+    type: resource.type ?? null,
+    category: resource.category ?? null,
+    license: resource.license ?? null,
+    snapshotJson: resource.snapshot_json ?? resource.snapshotJson ?? JSON.stringify(resource),
+  }
+  stmt(
+    `INSERT INTO hub_wishlist (
+      resource_id, title, url, image_url, image_blob, image_mime, username, type, category, license, snapshot_json
+    ) VALUES (
+      @resourceId, @title, @url, @imageUrl, @imageBlob, @imageMime, @username, @type, @category, @license, @snapshotJson
+    )
+    ON CONFLICT(resource_id) DO UPDATE SET
+      title = excluded.title,
+      url = excluded.url,
+      image_url = excluded.image_url,
+      image_blob = excluded.image_blob,
+      image_mime = excluded.image_mime,
+      username = excluded.username,
+      type = excluded.type,
+      category = excluded.category,
+      license = excluded.license,
+      snapshot_json = excluded.snapshot_json,
+      updated_at = unixepoch()`,
+  ).run(entry)
+  return stmt('SELECT * FROM hub_wishlist WHERE resource_id = ?').get(rid)
+}
+
+export function deleteHubWishlist(resourceId) {
+  const rid = toIntString(resourceId)
+  if (!rid) return 0
+  return stmt('DELETE FROM hub_wishlist WHERE resource_id = ?').run(rid).changes
 }
 
 /**

@@ -60,6 +60,7 @@ describe('view-state sanitizers', () => {
       page: 1,
       perPage: 30,
     })
+    expect(sanitizeHubState({ paidFilter: 'wishlist' })).toMatchObject({ paidFilter: 'wishlist' })
   })
 
   it('normalizes library and content restore ids', () => {

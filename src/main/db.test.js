@@ -4,12 +4,17 @@ import { mkTempVamDir, openTestDatabase } from '../../test/fixtures/index.js'
 import {
   closeDatabase,
   getDb,
+  getHubWishlistIds,
   insertDownload,
+  isHubWishlisted,
+  listHubWishlist,
   setHubResourceId,
   setHubUserId,
   toIntString,
+  upsertHubWishlist,
   upsertHubResourceDetail,
   upsertHubUser,
+  deleteHubWishlist,
 } from './db.js'
 
 // ⚠ NODE_MODULE_VERSION mismatch? Use `npm test` (Electron-as-Node).
@@ -121,8 +126,8 @@ describe('migrate v23 (hub-id cleanup)', () => {
     await openTestDatabase(tmp.dbPath)
   })
 
-  it('bumps schema_version to 23', () => {
-    expect(getDb().prepare('SELECT version FROM schema_version').get().version).toBe(23)
+  it('bumps schema_version to the current schema', () => {
+    expect(getDb().prepare('SELECT version FROM schema_version').get().version).toBe(24)
   })
 
   it('nulls non-numeric ids in packages without dropping rows', () => {
@@ -239,5 +244,49 @@ describe('hub-id writer guards', () => {
     upsertHubUser('654', 'name', { x: 1 })
     expect(db.prepare('SELECT COUNT(*) AS n FROM hub_resources').get().n).toBe(1)
     expect(db.prepare('SELECT COUNT(*) AS n FROM hub_users').get().n).toBe(1)
+  })
+})
+
+describe('hub wishlist', () => {
+  beforeEach(async () => {
+    tmp = await mkTempVamDir()
+    await openTestDatabase(tmp.dbPath)
+  })
+
+  it('creates the wishlist table in the current schema', () => {
+    const row = getDb().prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'hub_wishlist'").get()
+    expect(row.name).toBe('hub_wishlist')
+  })
+
+  it('stores metadata and thumbnail bytes by resource id', () => {
+    upsertHubWishlist(
+      {
+        resource_id: '123',
+        title: 'Paid Look',
+        url: 'https://hub.virtamate.com/resources/123/',
+        image_url: 'https://cdn.example/thumb.jpg',
+        username: 'Creator',
+        type: 'Look',
+        category: 'Paid',
+        license: 'FC',
+        snapshot_json: '{"tags":["paid"]}',
+      },
+      { buffer: Buffer.from([1, 2, 3]), mime: 'image/jpeg' },
+    )
+
+    expect(getHubWishlistIds()).toEqual(['123'])
+    expect(isHubWishlisted('123')).toBe(true)
+    const [row] = listHubWishlist()
+    expect(row).toMatchObject({
+      resource_id: '123',
+      title: 'Paid Look',
+      image_mime: 'image/jpeg',
+      category: 'Paid',
+    })
+    expect(Buffer.isBuffer(row.image_blob)).toBe(true)
+    expect([...row.image_blob]).toEqual([1, 2, 3])
+
+    expect(deleteHubWishlist('123')).toBe(1)
+    expect(isHubWishlisted('123')).toBe(false)
   })
 })

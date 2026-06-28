@@ -47,6 +47,7 @@ import {
 import { useHubStore } from '@/stores/useHubStore'
 import { useDownloadStore } from '@/stores/useDownloadStore'
 import { useInstalledStore } from '@/stores/useInstalledStore'
+import { useHubWishlistStore } from '@/stores/useHubWishlistStore'
 import { useHubInstallState } from '@/hooks/useHubInstallState'
 import { useHubInteractions } from '@/hooks/useHubInteractions'
 import { HubCard, AuthorAvatar, DepRow } from '@/components/PackageCard'
@@ -151,6 +152,11 @@ export default function HubView({ onNavigate, active = true }) {
     startInfiniteAtPage,
     setInfiniteRestorePage,
   } = useHubStore()
+  const wishlistItems = useHubWishlistStore((s) => s.items)
+  const wishlistIds = useHubWishlistStore((s) => s.ids)
+  const wishlistLoading = useHubWishlistStore((s) => s.loading)
+  const toggleWishlist = useHubWishlistStore((s) => s.toggle)
+  const wishlistMode = paidFilter === 'wishlist'
 
   const [searchDraft, setSearchDraft] = useState(search)
   const [startPageDraft, setStartPageDraft] = useState(String(restorePage))
@@ -217,6 +223,7 @@ export default function HubView({ onNavigate, active = true }) {
   useEffect(() => {
     if (!active) return
     useHubStore.getState().fetchFilters()
+    useHubWishlistStore.getState().hydrate()
   }, [active])
 
   // Track gallery container width for the zoom slider
@@ -242,20 +249,50 @@ export default function HubView({ onNavigate, active = true }) {
     )
   }, [availableWidth, cardWidth])
 
+  const filteredWishlistItems = useMemo(() => {
+    if (!wishlistMode) return []
+    const q = search.trim().toLowerCase()
+    const author = authorSearch.trim().toLowerCase()
+    return wishlistItems.filter((r) => {
+      if (q && !`${r.title || ''} ${r.username || ''}`.toLowerCase().includes(q)) return false
+      if (selectedType !== 'All' && r.type !== selectedType) return false
+      if (
+        author &&
+        !String(r.username || '')
+          .toLowerCase()
+          .includes(author)
+      )
+        return false
+      if (selectedHubTags.length) {
+        const tags = Array.isArray(r.tags) ? r.tags.map((t) => String(t).toLowerCase()) : []
+        if (!selectedHubTags.every((tag) => tags.includes(String(tag).toLowerCase()))) return false
+      }
+      if (license !== 'Any' && (getHubResourceLicense(r) || r.license) !== license) return false
+      return true
+    })
+  }, [authorSearch, license, search, selectedHubTags, selectedType, wishlistItems, wishlistMode])
+
+  const galleryResources = wishlistMode ? filteredWishlistItems : resources
+  const galleryLoading = wishlistMode ? wishlistLoading : loading
+  const galleryTotalFound = wishlistMode ? filteredWishlistItems.length : totalFound
+
   const installedByHubResourceId = useInstalledStore((s) => s.byHubResourceId)
   const filteredResources = useMemo(() => {
-    if (!hideInstalled) return resources
-    return resources.filter((r) => !(installedByHubResourceId.get(String(r.resource_id))?.installed ?? r._installed))
-  }, [resources, hideInstalled, installedByHubResourceId])
+    if (!hideInstalled) return galleryResources
+    return galleryResources.filter(
+      (r) => !(installedByHubResourceId.get(String(r.resource_id))?.installed ?? r._installed),
+    )
+  }, [galleryResources, hideInstalled, installedByHubResourceId])
 
   /** While more pages exist, hide the trailing partial row so the bottom is always full rows */
   const visibleResources = useMemo(() => {
+    if (wishlistMode) return filteredResources
     if (browseMode === 'paged') return filteredResources
     if (page >= totalPages) return filteredResources
     const fullRowCount = Math.floor(filteredResources.length / columnCount) * columnCount
     if (fullRowCount === 0) return filteredResources
     return filteredResources.slice(0, fullRowCount)
-  }, [browseMode, filteredResources, page, totalPages, columnCount])
+  }, [browseMode, filteredResources, page, totalPages, columnCount, wishlistMode])
 
   // Filter changes → reset to page 1 and fetch
   const firstFetchRef = useRef(true)
@@ -266,6 +303,12 @@ export default function HubView({ onNavigate, active = true }) {
   )
   const fetchedFilterKeyRef = useRef(null)
   useEffect(() => {
+    if (!active) return
+    if (wishlistMode) {
+      fetchedFilterKeyRef.current = hubFetchKey
+      useHubWishlistStore.getState().hydrate()
+      return
+    }
     if (
       !shouldFetchHubResources({
         active,
@@ -281,14 +324,15 @@ export default function HubView({ onNavigate, active = true }) {
     fetchedFilterKeyRef.current = hubFetchKey
     const targetPage = firstFetch ? page : 1
     useHubStore.getState().fetchResources(true, { page: targetPage })
-  }, [active, filterOptions, hubFetchKey, page, sort])
+  }, [active, filterOptions, hubFetchKey, page, sort, wishlistMode])
 
   useEffect(() => {
     if (!active) return
+    if (wishlistMode) return
     if (loading) return
     if (tailResolving || resolvedTotalPages || totalPages <= 1) return
     void resolveTailPages()
-  }, [active, loading, resolvedTotalPages, resolveTailPages, tailResolving, totalPages])
+  }, [active, loading, resolvedTotalPages, resolveTailPages, tailResolving, totalPages, wishlistMode])
 
   useEffect(() => {
     if (!active || !pendingDetailResourceId || detailResource) return
@@ -311,6 +355,7 @@ export default function HubView({ onNavigate, active = true }) {
 
   useEffect(() => {
     if (!active) return
+    if (wishlistMode) return
     if (browseMode !== 'infinite') return
     if (!trackInfiniteRestorePage) return
     const root = galleryRef.current
@@ -330,7 +375,15 @@ export default function HubView({ onNavigate, active = true }) {
       root.removeEventListener('scroll', onScroll)
       if (frame) cancelAnimationFrame(frame)
     }
-  }, [active, browseMode, resources.length, setInfiniteRestorePage, topVisiblePage, trackInfiniteRestorePage])
+  }, [
+    active,
+    browseMode,
+    resources.length,
+    setInfiniteRestorePage,
+    topVisiblePage,
+    trackInfiniteRestorePage,
+    wishlistMode,
+  ])
 
   const toggleBrowseMode = useCallback(() => {
     const store = useHubStore.getState()
@@ -397,21 +450,25 @@ export default function HubView({ onNavigate, active = true }) {
 
   const handleGalleryWheel = useCallback(
     (e) => {
+      if (wishlistMode) return
       if (browseMode !== 'infinite' || loading || startPage <= 1 || e.deltaY >= 0) return
       if (galleryRef.current?.scrollTop > 8) return
       void fetchPreviousHubPage()
     },
-    [browseMode, fetchPreviousHubPage, loading, startPage],
+    [browseMode, fetchPreviousHubPage, loading, startPage, wishlistMode],
   )
 
-  const maxHubPage = Math.max(resolvedTotalPages || totalPages || 1, 1)
+  const maxHubPage = wishlistMode ? 1 : Math.max(resolvedTotalPages || totalPages || 1, 1)
   const pageCountLabel = hubPageCountLabel(maxHubPage)
-  const rangePage = browseMode === 'infinite' ? startPage : page
-  const pageStart = resources.length ? (rangePage - 1) * perPage + 1 : 0
-  const pageEnd = resources.length ? Math.min((rangePage - 1) * perPage + resources.length, totalFound) : 0
-  const pageRange = resources.length
-    ? `Showing ${pageStart.toLocaleString()}-${pageEnd.toLocaleString()} of ${totalFound.toLocaleString()}`
-    : `Showing 0 of ${totalFound.toLocaleString()}`
+  const rangePage = wishlistMode ? 1 : browseMode === 'infinite' ? startPage : page
+  const rangeResources = wishlistMode ? filteredResources : resources
+  const pageStart = rangeResources.length ? (rangePage - 1) * perPage + 1 : 0
+  const pageEnd = rangeResources.length
+    ? Math.min((rangePage - 1) * perPage + rangeResources.length, galleryTotalFound)
+    : 0
+  const pageRange = rangeResources.length
+    ? `Showing ${pageStart.toLocaleString()}-${pageEnd.toLocaleString()} of ${galleryTotalFound.toLocaleString()}`
+    : `Showing 0 of ${galleryTotalFound.toLocaleString()}`
   const pageButtons = useMemo(() => {
     if (maxHubPage <= 7) return Array.from({ length: maxHubPage }, (_, i) => i + 1)
     const pages = new Set([1, maxHubPage, page - 1, page, page + 1])
@@ -427,6 +484,7 @@ export default function HubView({ onNavigate, active = true }) {
 
   const goPageDirection = useCallback(
     (direction) => {
+      if (wishlistMode) return
       const currentPage = browseMode === 'infinite' ? restorePage : page
       if (direction < 0 && currentPage <= 1) return
       const canRecheckTail = !!resolvedTotalPages && !tailResolving
@@ -436,7 +494,17 @@ export default function HubView({ onNavigate, active = true }) {
       if (browseMode === 'infinite') goInfiniteStartPage(nextPage)
       else goPagedPage(nextPage)
     },
-    [browseMode, goInfiniteStartPage, goPagedPage, maxHubPage, page, resolvedTotalPages, restorePage, tailResolving],
+    [
+      browseMode,
+      goInfiniteStartPage,
+      goPagedPage,
+      maxHubPage,
+      page,
+      resolvedTotalPages,
+      restorePage,
+      tailResolving,
+      wishlistMode,
+    ],
   )
 
   const handlePageDirection = useCallback(
@@ -649,6 +717,7 @@ export default function HubView({ onNavigate, active = true }) {
   const sentinelRef = useRef(null)
   useEffect(() => {
     if (!active) return
+    if (wishlistMode) return
     if (browseMode !== 'infinite') return
     const root = galleryRef.current
     const el = sentinelRef.current
@@ -661,13 +730,14 @@ export default function HubView({ onNavigate, active = true }) {
     )
     io.observe(el)
     return () => io.disconnect()
-  }, [active, browseMode, fetchNextPage, filteredResources.length])
+  }, [active, browseMode, fetchNextPage, filteredResources.length, wishlistMode])
 
   // The observer only fires on intersection *changes*, so when the sentinel stays visible across
   // a page load (common with cached pages) nothing re-triggers it. After each page settles, probe
   // whether the sentinel is still in the prefetch zone and keep loading if so.
   useEffect(() => {
     if (!active) return
+    if (wishlistMode) return
     if (browseMode !== 'infinite') return
     if (loading || page >= totalPages) return
     const root = galleryRef.current
@@ -678,13 +748,14 @@ export default function HubView({ onNavigate, active = true }) {
     if (elRect.top < rootRect.bottom + HUB_LOAD_MORE_MARGIN_BOTTOM_PX && elRect.bottom > rootRect.top) {
       fetchNextPage()
     }
-  }, [active, browseMode, loading, page, totalPages, filteredResources.length, fetchNextPage])
+  }, [active, browseMode, loading, page, totalPages, filteredResources.length, fetchNextPage, wishlistMode])
 
   // When packages change (promote, download completes, uninstall), resync install status from DB.
   // The hub detail panel is refreshed at App level; here we only patch the
   // gallery's resource objects + the global installed-state store.
   useEffect(() => {
     return window.api.onPackagesUpdated(async () => {
+      void useHubWishlistStore.getState().hydrate()
       const { resources } = useHubStore.getState()
       if (resources.length === 0) return
 
@@ -787,6 +858,7 @@ export default function HubView({ onNavigate, active = true }) {
           { value: 'all', label: 'All' },
           { value: 'free', label: 'Free' },
           { value: 'paid', label: 'Paid' },
+          { value: 'wishlist', label: 'Wishlist', separatorBefore: true },
         ],
       },
       {
@@ -856,25 +928,31 @@ export default function HubView({ onNavigate, active = true }) {
         <div className="min-h-10 grid grid-cols-[minmax(120px,1fr)_auto_minmax(120px,1fr)] items-center px-4 py-1 border-b border-border shrink-0 gap-2">
           <div className="flex min-w-0 items-center gap-2">
             <span className="text-[11px] text-text-tertiary">
-              {loading && resources.length === 0
-                ? 'Searching…'
-                : hideInstalled
+              {galleryLoading && galleryResources.length === 0
+                ? wishlistMode
+                  ? 'Loading wishlist…'
+                  : 'Searching…'
+                : hideInstalled || wishlistMode
                   ? `${filteredResources.length.toLocaleString()} shown`
-                  : `${totalFound.toLocaleString()} packages`}
+                  : `${galleryTotalFound.toLocaleString()} packages`}
             </span>
             <button
               type="button"
-              onClick={() => fetchResources(true, { forceRefresh: true, page: browseMode === 'paged' ? page : 1 })}
-              disabled={loading}
+              onClick={() =>
+                wishlistMode
+                  ? useHubWishlistStore.getState().hydrate()
+                  : fetchResources(true, { forceRefresh: true, page: browseMode === 'paged' ? page : 1 })
+              }
+              disabled={galleryLoading}
               title="Refresh"
               className="p-1 rounded text-text-tertiary hover:text-text-secondary disabled:opacity-30 cursor-pointer disabled:cursor-default"
             >
-              <RefreshCw size={13} className={loading && resources.length === 0 ? 'animate-spin' : ''} />
+              <RefreshCw size={13} className={galleryLoading && galleryResources.length === 0 ? 'animate-spin' : ''} />
             </button>
           </div>
           {renderPageNav('toolbar')}
           <div className="col-start-3 flex min-w-0 flex-wrap items-center justify-end gap-2">
-            {shouldRenderHubPageSummary(browseMode, showInfinitePagerControls) && renderPageSummary()}
+            {!wishlistMode && shouldRenderHubPageSummary(browseMode, showInfinitePagerControls) && renderPageSummary()}
             <ThumbnailSizeSlider
               cardWidth={cardWidth}
               availableWidth={availableWidth}
@@ -911,12 +989,12 @@ export default function HubView({ onNavigate, active = true }) {
 
         {/* Gallery */}
         <div ref={galleryRef} className="flex-1 overflow-y-auto p-4 relative" onWheel={handleGalleryWheel}>
-          {error && (
+          {!wishlistMode && error && (
             <div className="mb-4 px-4 py-3 rounded-lg bg-error/10 border border-error/20 text-error text-xs select-text cursor-text">
               {error}
             </div>
           )}
-          {resources.length === 0 && (loading || !sort) ? (
+          {galleryResources.length === 0 && (galleryLoading || (!wishlistMode && !sort)) ? (
             <div
               className="grid gap-3 content-start"
               style={{ gridTemplateColumns: `repeat(auto-fill,minmax(min(${cardWidth}px,100%),1fr))` }}
@@ -956,6 +1034,8 @@ export default function HubView({ onNavigate, active = true }) {
                       onInstall={handleInstall}
                       onPromote={handlePromote}
                       onFilterAuthor={handleFilterAuthor}
+                      onToggleWishlist={(resource) => toggleWishlist(resource)}
+                      isWishlisted={wishlistIds.has(String(r.resource_id))}
                       mode={cardMode}
                       hideType={selectedType !== 'All'}
                     />
@@ -964,14 +1044,16 @@ export default function HubView({ onNavigate, active = true }) {
               </div>
               {renderPageNav('bottom')}
               {/* Infinite scroll sentinel */}
-              {browseMode === 'infinite' && page < totalPages && <div ref={sentinelRef} className="h-1" />}
+              {!wishlistMode && browseMode === 'infinite' && page < totalPages && (
+                <div ref={sentinelRef} className="h-1" />
+              )}
               {browseMode === 'infinite' && loading && !loadingPrevious && resources.length > 0 && (
                 <div className="flex items-center justify-center py-6">
                   <Loader2 size={20} className="animate-spin text-accent-blue" />
                   <span className="text-[11px] text-text-tertiary ml-2">Loading more…</span>
                 </div>
               )}
-              {!loading && sort && filteredResources.length === 0 && page >= totalPages && (
+              {!galleryLoading && (wishlistMode || sort) && filteredResources.length === 0 && page >= totalPages && (
                 <div className="text-center py-16 text-text-tertiary text-sm">No packages found</div>
               )}
             </>

@@ -15,7 +15,15 @@ import {
   buildFromDb,
 } from '../store.js'
 import { resolveRef } from '../scanner/graph.js'
-import { setHubResourceId, setHubUserId, setHubDisplayName, upsertHubUser, setPackageHubMeta, transact } from '../db.js'
+import {
+  deleteHubWishlist,
+  setHubResourceId,
+  setHubUserId,
+  setHubDisplayName,
+  upsertHubUser,
+  setPackageHubMeta,
+  transact,
+} from '../db.js'
 import { cacheAvatarsFromResources } from '../avatar-cache.js'
 import { notify } from '../notify.js'
 import { scanHubDetails } from '../hub/scanner.js'
@@ -28,6 +36,7 @@ import {
   neutralResourceState,
   HubAuthError,
 } from '../hub/interactions.js'
+import { listWishlist, toggleWishlist, wishlistIds } from '../hub/wishlist.js'
 
 export function registerHubHandlers() {
   ipcMain.handle('hub:filters', async () => {
@@ -81,6 +90,12 @@ export function registerHubHandlers() {
   )
   ipcMain.handle('hub:toggleLike', (_, id, currentlyLiked) => withAuthGuard(toggleLike)(id, currentlyLiked))
 
+  ipcMain.handle('hub:wishlist:list', () => listWishlist())
+  ipcMain.handle('hub:wishlist:ids', () => wishlistIds())
+  ipcMain.handle('hub:wishlist:toggle', async (_, resource) => {
+    return await toggleWishlist(resource)
+  })
+
   ipcMain.handle('hub:search', async (_, params) => {
     const result = await searchResources(params)
 
@@ -106,6 +121,7 @@ export function registerHubHandlers() {
         for (let i = 0; i < result.resources.length; i++) {
           const resource = result.resources[i]
           const local = locals[i]
+          if (local?.is_direct) deleteHubWishlist(resource.resource_id)
           if (resource.user_id) {
             upsertHubUser(String(resource.user_id), resource.username, {
               user_id: resource.user_id,

@@ -405,6 +405,10 @@ export const useHubStore = create((set, get) => ({
     const append = opts?.append === true
     set({ loading: true, loadingPrevious: false, error: null, ...(append ? {} : { resources: [] }) })
     try {
+      if (get().paidFilter === 'wishlist') {
+        set({ resources: [], totalFound: 0, totalPages: 0, loading: false })
+        return
+      }
       if (opts?.forceRefresh) {
         await get().clearCurrentTailCache()
         await window.api.hub.invalidateCaches()

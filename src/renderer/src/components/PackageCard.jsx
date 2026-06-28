@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   Archive,
   HardDrive,
+  Heart,
   Layers,
   Eye,
   EyeOff,
@@ -137,6 +138,8 @@ export function HubCard({
   onInstall,
   onPromote,
   onFilterAuthor,
+  onToggleWishlist,
+  isWishlisted = false,
   mode = 'medium',
   hideType,
   linkAction,
@@ -343,11 +346,29 @@ export function HubCard({
             </div>
           )}
           {isPaid && (
-            <div
-              className={`absolute top-2 right-2 ${THUMB_OVERLAY_CHIP} text-white`}
-              style={{ background: HUB_CATEGORY_COLORS.Paid + 'cc' }}
-            >
-              Paid
+            <div className="absolute top-2 right-2 flex items-center gap-1">
+              {onToggleWishlist && (
+                <button
+                  type="button"
+                  title={isWishlisted ? 'Remove from wishlist' : 'Add to wishlist'}
+                  aria-label={isWishlisted ? 'Remove from wishlist' : 'Add to wishlist'}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onToggleWishlist(resource)
+                  }}
+                  className={`size-6 rounded-full bg-black/55 backdrop-blur-sm border border-white/15 inline-flex items-center justify-center cursor-pointer transition-colors ${
+                    isWishlisted ? 'text-accent-pink hover:text-accent-pink/80' : 'text-white/80 hover:text-white'
+                  }`}
+                >
+                  <Heart size={13} fill={isWishlisted ? 'currentColor' : 'none'} />
+                </button>
+              )}
+              <div
+                className={`${THUMB_OVERLAY_CHIP} text-white`}
+                style={{ background: HUB_CATEGORY_COLORS.Paid + 'cc' }}
+              >
+                Paid
+              </div>
             </div>
           )}
           {minimal && (

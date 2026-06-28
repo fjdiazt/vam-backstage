@@ -7,7 +7,7 @@ export const HUB_PER_PAGE_OPTIONS = [30, 60, 90, 120]
 
 const VALID_VIEWS = new Set(['hub', 'library', 'content', 'settings'])
 const VALID_HUB_BROWSE_MODE = new Set(['infinite', 'paged'])
-const VALID_PAID = new Set(['all', 'free', 'paid'])
+const VALID_PAID = new Set(['all', 'free', 'paid', 'wishlist'])
 const VALID_LIBRARY_STATUS = new Set(['direct', 'deps', 'missing', 'orphans', 'disabled', 'all', 'updates'])
 const VALID_ENABLED = new Set(['all', 'enabled', 'disabled', 'offloaded'])
 const VALID_PACKAGE_FILTER = new Set(['all', 'direct', 'deps', 'local'])
