@@ -312,7 +312,7 @@ export async function syncBrowserAssistTags(vamDir) {
         const existing = nextContentLabels.get(label.name)
         const currentMask = existing?.sourceMask ?? 0
         if (existing && currentMask === 0) continue
-        const nextMask = currentMask & LABEL_SOURCE_BACKSTAGE ? currentMask : currentMask | LABEL_SOURCE_BROWSERASSIST
+        const nextMask = currentMask | LABEL_SOURCE_BROWSERASSIST
         nextContentLabels.set(label.name, { id: label.id, sourceMask: nextMask })
         if (!existing || nextMask !== currentMask) {
           applyLabelToContents(label.id, [{ packageFilename: entry.packageFilename, internalPath: entry.internalPath }])
