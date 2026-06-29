@@ -4,7 +4,7 @@ import { app } from 'electron'
 import { join } from 'path'
 import { LOCAL_PACKAGE_FILENAME, LOCAL_PACKAGE_DISPLAY_NAME } from '@shared/local-package.js'
 
-export const SCHEMA_VERSION = 29
+export const SCHEMA_VERSION = 30
 
 /**
  * Normalize a value to a non-negative integer string, or null. Hub resource/user
@@ -148,6 +148,7 @@ export const MIGRATIONS = [
   [27, applyV27],
   [28, applyV28],
   [29, applyV29],
+  [30, applyV30],
 ]
 
 function migrate() {
@@ -486,6 +487,23 @@ function hubHiddenSchemaSql() {
   `
 }
 
+function labelContentSourcesSchemaSql() {
+  return `
+    CREATE TABLE IF NOT EXISTS label_content_sources (
+      label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+      package_filename TEXT NOT NULL REFERENCES packages(filename) ON DELETE CASCADE,
+      internal_path TEXT NOT NULL,
+      source_mask INTEGER NOT NULL,
+      PRIMARY KEY (label_id, package_filename, internal_path)
+    );
+    CREATE INDEX IF NOT EXISTS idx_label_content_sources_pkgpath
+      ON label_content_sources(package_filename, internal_path);
+  `
+}
+
+function applyV30() {
+  db.exec(labelContentSourcesSchemaSql())
+}
 /**
  * Ensure the synthetic "local content" package row exists. Loose files under
  * `vamDir/Saves` and `vamDir/Custom` are stored as `contents` rows that point
@@ -635,6 +653,8 @@ function createSchema() {
       PRIMARY KEY (label_id, package_filename, internal_path)
     );
     CREATE INDEX IF NOT EXISTS idx_label_contents_pkgpath ON label_contents(package_filename, internal_path);
+
+    ${labelContentSourcesSchemaSql()}
   `)
 }
 
@@ -1617,6 +1637,50 @@ export function getAllLabelPackages() {
 
 export function getAllLabelContents() {
   return stmt('SELECT label_id, package_filename, internal_path FROM label_contents').all()
+}
+
+// Label sync source bits for label_content_sources.source_mask.
+// 1 means the assignment is owned by Backstage UI.
+// 2 means the assignment was imported from BrowserAssist User tags.
+// 3 means both sides currently own the assignment.
+export const LABEL_SOURCE_BACKSTAGE = 1
+export const LABEL_SOURCE_BROWSERASSIST = 2
+export const LABEL_SOURCE_BOTH = LABEL_SOURCE_BACKSTAGE | LABEL_SOURCE_BROWSERASSIST
+
+function validLabelSourceMask(mask) {
+  const n = Number(mask)
+  return Number.isInteger(n) && n > 0 ? n : 0
+}
+
+export function setLabelContentSource(labelId, packageFilename, internalPath, sourceMask) {
+  const mask = validLabelSourceMask(sourceMask)
+  if (!mask) return 0
+  stmt(
+    `INSERT INTO label_content_sources (label_id, package_filename, internal_path, source_mask)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(label_id, package_filename, internal_path) DO UPDATE SET
+       source_mask = excluded.source_mask`,
+  ).run(labelId, packageFilename, internalPath, mask)
+  return mask
+}
+
+export function getLabelContentSource(labelId, packageFilename, internalPath) {
+  const row = stmt(
+    `SELECT source_mask FROM label_content_sources
+     WHERE label_id = ? AND package_filename = ? AND internal_path = ?`,
+  ).get(labelId, packageFilename, internalPath)
+  return row?.source_mask ?? 0
+}
+
+export function clearLabelContentSource(labelId, packageFilename, internalPath) {
+  return stmt(
+    `DELETE FROM label_content_sources
+     WHERE label_id = ? AND package_filename = ? AND internal_path = ?`,
+  ).run(labelId, packageFilename, internalPath).changes
+}
+
+export function listLabelContentSources() {
+  return stmt('SELECT label_id, package_filename, internal_path, source_mask FROM label_content_sources').all()
 }
 
 export function getLabelById(id) {
