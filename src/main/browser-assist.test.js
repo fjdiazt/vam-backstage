@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { browserAssistCategory, browserAssistUserTagNames, mergeBrowserAssistUserTags } from './browser-assist.js'
+import {
+  applyBrowserAssistPackageHidden,
+  browserAssistCategory,
+  browserAssistUserTagNames,
+  mergeBrowserAssistUserTags,
+} from './browser-assist.js'
 
 describe('BrowserAssist user tag helpers', () => {
   it('reads User category tags except managed scene tags', () => {
@@ -36,5 +41,12 @@ describe('BrowserAssist user tag helpers', () => {
       browserAssistCategory('Saves/scene/Demo.json', [{ tagName: 'scene-look', tagCategory: 'User' }], 'scene'),
     ).toBe('Looks')
     expect(browserAssistCategory('Custom/Hair/Foo.vam', [], 'hairItem')).toBe('Hairstyles')
+  })
+
+  it('applies BrowserAssist package hidden when explicit', () => {
+    expect(applyBrowserAssistPackageHidden(null, true)).toBe(true)
+    expect(applyBrowserAssistPackageHidden(false, true)).toBe(true)
+    expect(applyBrowserAssistPackageHidden(true, false)).toBe(false)
+    expect(applyBrowserAssistPackageHidden(true, null)).toBe(true)
   })
 })
