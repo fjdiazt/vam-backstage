@@ -379,7 +379,9 @@ export function registerPackageHandlers() {
     if (!vamDir) throw new Error('VaM directory not configured')
 
     await writePackageHiddenPref(vamDir, pkg.package_name, hidden)
-    setPackageHidden(filename, hidden)
+    for (const [otherFilename, otherPkg] of getPackageIndex()) {
+      if (otherPkg.package_name === pkg.package_name) setPackageHidden(otherFilename, hidden)
+    }
     buildFromDb({ skipGraph: true })
     notify('packages:updated')
     return { ok: true }

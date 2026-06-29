@@ -22,6 +22,9 @@ export function registerDevHandlers() {
         notify('labels:updated')
         notify('contents:updated')
       }
+      if ((result.packagesHiddenImported ?? 0) > 0) {
+        notify('packages:updated')
+      }
       return { ok: true, ...result }
     } catch (err) {
       return { ok: false, error: err.message }
