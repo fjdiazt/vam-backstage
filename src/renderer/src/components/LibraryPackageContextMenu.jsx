@@ -4,6 +4,7 @@ import {
   Compass,
   Download,
   Eye,
+  EyeOff,
   Power,
   FolderTree,
   Heart,
@@ -213,6 +214,13 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
       toastIfSingleToggleFailed(res)
     } catch (err) {
       toast(`Failed to toggle package: ${err.message}`)
+    }
+  }
+  const handleToggleHidden = async () => {
+    try {
+      await useLibraryStore.getState().setPackageHidden(p.filename, !p.hidden)
+    } catch (err) {
+      toast(`Failed to toggle hidden: ${err.message}`)
     }
   }
   const handlePromote = async () => {
@@ -624,6 +632,14 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
                 </>
               )}
               <ContextMenuSeparator />
+              <ContextMenuItem onSelect={() => void handleToggleHidden()}>
+                {p.hidden ? (
+                  <Eye size={12} className="shrink-0 text-text-secondary" />
+                ) : (
+                  <EyeOff size={12} className="shrink-0 text-text-secondary" />
+                )}
+                {p.hidden ? 'Unhide' : 'Hide'}
+              </ContextMenuItem>
               {showDisableDialog ? (
                 <ContextMenuItem onSelect={() => setDisableOpen(true)} disabled={!detail}>
                   <Power size={12} className="shrink-0" />
