@@ -51,6 +51,8 @@ describe('useHubStore', () => {
       selectedHubTags: [],
       sort: '',
       license: 'Any',
+      hideInstalled: false,
+      showHidden: false,
       filterOptions: null,
     })
     useInstalledStore.setState({ byHubResourceId: new Map() })
@@ -77,6 +79,19 @@ describe('useHubStore', () => {
     useHubStore.getState().applyPersistedState({ page: 2, perPage: 90 })
 
     expect(useHubStore.getState()).toMatchObject({ page: 2, startPage: 2, restorePage: 2, perPage: 90 })
+  })
+
+  it('persists and restores Hub visibility toggles', () => {
+    useHubStore.setState({ hideInstalled: true, showHidden: true })
+
+    expect(useHubStore.getState().getPersistedState()).toMatchObject({
+      hideInstalled: true,
+      showHidden: true,
+    })
+
+    useHubStore.getState().applyPersistedState({ hideInstalled: false, showHidden: true })
+
+    expect(useHubStore.getState()).toMatchObject({ hideInstalled: false, showHidden: true })
   })
 
   it('prepends the previous infinite page without changing the loaded tail page', async () => {

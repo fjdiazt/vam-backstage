@@ -77,6 +77,13 @@ const api = {
       ids: () => ipcRenderer.invoke('hub:wishlist:ids'),
       toggle: (resource) => ipcRenderer.invoke('hub:wishlist:toggle', resource),
     },
+    hidden: {
+      list: () => ipcRenderer.invoke('hub:hidden:list'),
+      ids: () => ipcRenderer.invoke('hub:hidden:ids'),
+      hide: (resource) => ipcRenderer.invoke('hub:hidden:hide', resource),
+      unhide: (resourceId) => ipcRenderer.invoke('hub:hidden:unhide', resourceId),
+      clear: () => ipcRenderer.invoke('hub:hidden:clear'),
+    },
   },
   downloads: {
     list: () => ipcRenderer.invoke('downloads:list'),

@@ -48,6 +48,7 @@ export function sanitizeHubState(raw) {
     sort: s(r.sort),
     license: s(r.license, 'Any') || 'Any',
     hideInstalled: b(r.hideInstalled),
+    showHidden: b(r.showHidden),
     detailResourceId: id(r.detailResourceId),
     browseMode: VALID_HUB_BROWSE_MODE.has(r.browseMode) ? r.browseMode : 'infinite',
     page: page(r.page),

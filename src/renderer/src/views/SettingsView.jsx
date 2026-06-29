@@ -8,6 +8,8 @@ import {
   AlertTriangle,
   Bug,
   Trash2,
+  Eye,
+  EyeOff,
   ShieldCheck,
   Compass,
   FlaskConical,
@@ -19,6 +21,7 @@ import { toast } from '@/components/Toast'
 import { useStatusStore } from '@/stores/useStatusStore'
 import { useLibraryStore } from '@/stores/useLibraryStore'
 import { useHubStore } from '@/stores/useHubStore'
+import { useHubHiddenStore } from '@/stores/useHubHiddenStore'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -67,6 +70,9 @@ export default function SettingsView() {
   const setShowHubInfinitePager = useHubStore((s) => s.setShowInfinitePagerControls)
   const rememberHubInfinitePage = useHubStore((s) => s.trackInfiniteRestorePage)
   const setRememberHubInfinitePage = useHubStore((s) => s.setTrackInfiniteRestorePage)
+  const hiddenHubItems = useHubHiddenStore((s) => s.items)
+  const restoreHiddenHubItem = useHubHiddenStore((s) => s.unhide)
+  const clearHiddenHubItems = useHubHiddenStore((s) => s.clear)
 
   const refreshLibDirs = useCallback(async () => {
     try {
@@ -86,6 +92,7 @@ export default function SettingsView() {
     window.api.dev.isDev().then(setIsDev)
     window.api.app.getVersion().then(setAppVersion)
     window.api.updater.getChannel().then((c) => setUpdateChannel(c === 'dev' ? 'dev' : 'stable'))
+    useHubHiddenStore.getState().hydrate()
     refreshLibDirs()
   }, [refreshLibDirs])
 
@@ -530,6 +537,65 @@ export default function SettingsView() {
 
         {/* Hub */}
         <Section title="Hub" description="Control Hub browsing behavior.">
+          <div className="space-y-2">
+            <div className="flex items-start gap-3">
+              <div className="flex-1 min-w-0">
+                <div className="text-xs text-text-primary font-medium flex items-center gap-1.5">
+                  <EyeOff size={13} className="text-text-tertiary" />
+                  Hidden Hub items
+                </div>
+                <div className="text-[11px] text-text-tertiary mt-0.5">
+                  {hiddenHubItems.length.toLocaleString()} hidden resource{hiddenHubItems.length === 1 ? '' : 's'}.
+                </div>
+              </div>
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={hiddenHubItems.length === 0}
+                    className="shrink-0 text-xs"
+                  >
+                    <Trash2 size={13} /> Clear
+                  </Button>
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>Clear hidden Hub items?</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      All hidden Hub resources will show in normal Hub browsing again.
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>Cancel</AlertDialogCancel>
+                    <AlertDialogAction variant="destructive" onClick={clearHiddenHubItems}>
+                      Clear list
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            </div>
+            {hiddenHubItems.length > 0 && (
+              <ul className="max-h-48 overflow-y-auto rounded-lg border border-border divide-y divide-border bg-surface/50">
+                {hiddenHubItems.map((item) => (
+                  <li key={item.resource_id} className="flex items-center gap-3 px-3 py-2">
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs text-text-secondary truncate">{item.title || 'Untitled Hub item'}</div>
+                      <div className="text-[10px] text-text-tertiary font-mono">{item.resource_id}</div>
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => restoreHiddenHubItem(item.resource_id)}
+                      className="shrink-0 text-xs"
+                    >
+                      <Eye size={13} /> Restore
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
           <label className="flex items-center gap-3 cursor-pointer">
             <div className="flex-1 min-w-0">
               <div className="text-xs text-text-primary font-medium">Show infinite-scroll page controls</div>

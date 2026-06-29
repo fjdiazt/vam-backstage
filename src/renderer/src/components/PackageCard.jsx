@@ -139,6 +139,9 @@ export function HubCard({
   onPromote,
   onFilterAuthor,
   onToggleWishlist,
+  onHide,
+  onUnhide,
+  isHidden = false,
   isWishlisted = false,
   mode = 'medium',
   hideType,
@@ -345,9 +348,24 @@ export function HubCard({
               {resource.type}
             </div>
           )}
-          {isPaid && (
+          {(onHide || isPaid) && (
             <div className="absolute top-2 right-2 flex items-center gap-1">
-              {onToggleWishlist && (
+              {(onHide || onUnhide) && (
+                <button
+                  type="button"
+                  title={isHidden ? 'Show in Hub' : 'Hide from Hub'}
+                  aria-label={isHidden ? 'Show in Hub' : 'Hide from Hub'}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    if (isHidden) onUnhide?.(resource)
+                    else onHide?.(resource)
+                  }}
+                  className="size-6 rounded-full bg-black/55 backdrop-blur-sm border border-white/15 inline-flex items-center justify-center cursor-pointer text-white/80 hover:text-white transition-colors"
+                >
+                  {isHidden ? <Eye size={13} /> : <EyeOff size={13} />}
+                </button>
+              )}
+              {isPaid && onToggleWishlist && (
                 <button
                   type="button"
                   title={isWishlisted ? 'Remove from wishlist' : 'Add to wishlist'}
@@ -363,12 +381,14 @@ export function HubCard({
                   <Heart size={13} fill={isWishlisted ? 'currentColor' : 'none'} />
                 </button>
               )}
-              <div
-                className={`${THUMB_OVERLAY_CHIP} text-white`}
-                style={{ background: HUB_CATEGORY_COLORS.Paid + 'cc' }}
-              >
-                Paid
-              </div>
+              {isPaid && (
+                <div
+                  className={`${THUMB_OVERLAY_CHIP} text-white`}
+                  style={{ background: HUB_CATEGORY_COLORS.Paid + 'cc' }}
+                >
+                  Paid
+                </div>
+              )}
             </div>
           )}
           {minimal && (
