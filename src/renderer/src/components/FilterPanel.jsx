@@ -404,6 +404,21 @@ function TagsAutocomplete({ value = [], onChange, suggestions = {}, placeholder 
  * row opens the management menu (rename / recolor / delete + enable/disable
  * all packages).
  */
+export function filterLabelMatches(labels, selectedIds, query) {
+  const selectedSet = new Set(selectedIds)
+  const q = query.trim().toLowerCase()
+  const all = labels.filter((l) => !selectedSet.has(l.id))
+  if (!q) return all
+  const prefix = []
+  const rest = []
+  for (const l of all) {
+    const lower = l.name.toLowerCase()
+    if (lower.startsWith(q)) prefix.push(l)
+    else if (lower.includes(q)) rest.push(l)
+  }
+  return [...prefix, ...rest]
+}
+
 function LabelsAutocomplete({ value = [], onChange, labels = [], placeholder = 'Filter by label…' }) {
   const [query, setQuery] = useState('')
   const [open, setOpen] = useState(false)
@@ -430,18 +445,7 @@ function LabelsAutocomplete({ value = [], onChange, labels = [], placeholder = '
   const selected = useMemo(() => value.map((id) => labelMap.get(id)).filter(Boolean), [value, labelMap])
 
   const matches = useMemo(() => {
-    const selectedSet = new Set(value)
-    const q = query.trim().toLowerCase()
-    const all = labels.filter((l) => !selectedSet.has(l.id))
-    if (!q) return all.slice(0, 30)
-    const prefix = []
-    const rest = []
-    for (const l of all) {
-      const lower = l.name.toLowerCase()
-      if (lower.startsWith(q)) prefix.push(l)
-      else if (lower.includes(q)) rest.push(l)
-    }
-    return [...prefix, ...rest].slice(0, 30)
+    return filterLabelMatches(labels, value, query)
   }, [labels, value, query])
 
   useEffect(() => setHlIndex(-1), [matches])

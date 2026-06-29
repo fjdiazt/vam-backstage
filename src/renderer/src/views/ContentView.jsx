@@ -69,6 +69,7 @@ import {
 } from '@/lib/mouse-page-nav'
 
 const SORT_OPTIONS = ['Recently installed', 'Name A-Z', 'Package', 'Type']
+export const LAZY_LABEL_LOADING = false
 const isPackageDisabled = (c) => !isPackageActive(c.package?.storageState ?? 'enabled')
 
 function matchesContentPackageStatus(c, packageStatusFilter) {
