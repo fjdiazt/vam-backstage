@@ -1,3 +1,4 @@
+import { existsSync } from 'fs'
 import { mkdir, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { describe, expect, it } from 'vitest'
@@ -41,6 +42,20 @@ describe('package-prefs', () => {
 
       await expect(writePackageHiddenPref(tmp.vamDir, 'A.Pkg', true)).rejects.toThrow()
       await expect(readFile(p, 'utf8')).resolves.toBe(original)
+    } finally {
+      await tmp.cleanup()
+    }
+  })
+
+  it('rejects non-boolean hidden prefs without creating a prefs file', async () => {
+    const tmp = await mkTempVamDir()
+    try {
+      const p = packagePrefsPath(tmp.vamDir, 'A.Pkg')
+
+      await expect(writePackageHiddenPref(tmp.vamDir, 'A.Pkg', 'false')).rejects.toThrow(
+        'Package hidden pref must be a boolean',
+      )
+      expect(existsSync(p)).toBe(false)
     } finally {
       await tmp.cleanup()
     }

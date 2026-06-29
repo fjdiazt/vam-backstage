@@ -47,8 +47,11 @@ function queuePackagePrefsWrite(path, write) {
 }
 
 async function writePackageHiddenPrefNow(path, hidden) {
+  if (typeof hidden !== 'boolean') {
+    throw new TypeError('Package hidden pref must be a boolean')
+  }
   const json = await readJsonObjectForWrite(path)
-  json.hidden = !!hidden
+  json.hidden = hidden
   await mkdir(dirname(path), { recursive: true })
   const tmp = `${path}.tmp-${randomUUID()}`
   recordOwnedPath(path)
