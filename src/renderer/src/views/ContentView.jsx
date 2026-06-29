@@ -64,6 +64,7 @@ import { packageNeedsDisableConfirmation } from '@/lib/package-disable-confirm'
 import { StorageStateChip } from '@/components/StorageStateChip'
 
 const SORT_OPTIONS = ['Recently installed', 'Name A-Z', 'Package', 'Type']
+export const LAZY_LABEL_LOADING = false
 
 /** The package whose install / type / storage state governs a content row.
  *  Extracted presets are loose (`__local__`) files owned by a real `.var`, so they

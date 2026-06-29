@@ -720,6 +720,23 @@ function labelSourceCategoriesForContent(packageFilename, internalPath) {
   return out
 }
 
+function contentLabelSummaryForPackage(items = []) {
+  const ids = new Set()
+  const categories = {}
+  for (const c of items) {
+    if (!isVisible(c.type)) continue
+    const ownIds = labelsByContent.get(c.package_filename + '\0' + c.internal_path) || []
+    for (const id of ownIds) {
+      ids.add(id)
+      const cat =
+        labelContentSources.get(`${c.package_filename}\0${c.internal_path}\0${id}`)?.baCategory || categoryOf(c.type)
+      if (!cat) continue
+      ;(categories[id] ||= []).push(cat)
+    }
+  }
+  return { ids: [...ids], categories }
+}
+
 export function getContentByPackage() {
   return contentByPackage
 }
@@ -800,6 +817,7 @@ function enrichPackageSummary(pkg) {
   const missingDeps = transitiveMissingMap.get(pkg.filename) || 0
   const pkgContents = contentByPackage.get(pkg.filename)
   const contentCount = pkgContents?.length ?? 0
+  const contentLabels = contentLabelSummaryForPackage(pkgContents)
   let favoriteContentCount = 0
   if (pkgContents) {
     for (const c of pkgContents) {
@@ -855,6 +873,8 @@ function enrichPackageSummary(pkg) {
     noLookPresetTag,
     hasExtractedAppearancePreset,
     labelIds: packageLabelIds(pkg.filename),
+    contentLabelIds: contentLabels.ids,
+    contentLabelCategories: contentLabels.categories,
   }
 }
 

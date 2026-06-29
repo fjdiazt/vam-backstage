@@ -100,6 +100,7 @@ import {
 import { packageNeedsDisableConfirmation } from '@/lib/package-disable-confirm'
 
 const SORT_OPTIONS = ['Recently installed', 'Type', 'Name', 'Size', 'Content', 'Deps', 'Morphs']
+export const LAZY_LABEL_LOADING = false
 
 function packageHubTags(p) {
   return p.hubTags
@@ -115,8 +116,30 @@ function packageMatchesSelectedTags(p, selectedTags) {
   return matchesPolarityList(selectedTags, packageHubTags(p), { normalize: true })
 }
 
-function packageMatchesSelectedLabels(p, selectedLabelIds) {
-  return matchesPolarityList(selectedLabelIds, p.labelIds || [])
+function packageLabelMatchesTypes(p, id, selectedTypes) {
+  if (selectedTypes.length === 0) return true
+  if (p.labelIds?.includes(id)) return true
+  const typeSet = new Set(selectedTypes)
+  return (p.contentLabelCategories?.[id] || []).some((category) => typeSet.has(category))
+}
+
+function packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes = []) {
+  const available = [...(p.labelIds || [])]
+  for (const id of p.contentLabelIds || []) {
+    if (packageLabelMatchesTypes(p, id, selectedTypes)) available.push(id)
+  }
+  return matchesPolarityList(selectedLabelIds, available)
+}
+
+export function labelsForPackages(labels, items, selectedLabelIds, selectedTypes = []) {
+  const available = new Set(selectedLabelIds.map((entry) => entry?.value ?? entry))
+  for (const pkg of items) {
+    for (const id of pkg.labelIds || []) available.add(id)
+    for (const id of pkg.contentLabelIds || []) {
+      if (packageLabelMatchesTypes(pkg, id, selectedTypes)) available.add(id)
+    }
+  }
+  return labels.filter((label) => available.has(label.id))
 }
 
 /** True when an update entry has been definitively marked as not directly
@@ -321,7 +344,7 @@ export default function LibraryView({ onNavigate, navContext }) {
     items = filterPackagesBySelectedTypes(items, selectedTypes)
     items = filterPackagesByEnabledStorage(items, enabledFilter)
     items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
-    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds))
+    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes))
     let direct = 0,
       dependency = 0,
       broken = 0,
@@ -343,7 +366,7 @@ export default function LibraryView({ onNavigate, navContext }) {
     items = filterPackagesBySelectedTypes(items, selectedTypes)
     items = filterPackagesByEnabledStorage(items, enabledFilter)
     items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
-    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds))
+    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes))
     let n = 0
     for (const p of items) {
       if (updateCheckResults[p.filename]) n++
@@ -363,21 +386,21 @@ export default function LibraryView({ onNavigate, navContext }) {
     let items = filterPackagesByStatus(baseFiltered, statusFilter, updateCheckResults)
     items = filterPackagesByEnabledStorage(items, enabledFilter)
     items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
-    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds))
+    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes))
     const counts = { _total: items.length }
     for (const p of items) {
       const label = libraryTypeBadgeLabel(p.type)
       counts[label] = (counts[label] || 0) + 1
     }
     return counts
-  }, [baseFiltered, statusFilter, enabledFilter, selectedTags, selectedLabelIds, updateCheckResults])
+  }, [baseFiltered, statusFilter, enabledFilter, selectedTypes, selectedTags, selectedLabelIds, updateCheckResults])
 
   /** Facet counts for Enabled filter: respects status/type/tags/labels but not enabled itself */
   const enabledFilterCounts = useMemo(() => {
     let items = filterPackagesByStatus(baseFiltered, statusFilter, updateCheckResults)
     items = filterPackagesBySelectedTypes(items, selectedTypes)
     items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
-    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds))
+    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes))
     let enabled = 0,
       disabled = 0,
       offloaded = 0
@@ -389,12 +412,29 @@ export default function LibraryView({ onNavigate, navContext }) {
     return { all: items.length, enabled, disabled, offloaded }
   }, [baseFiltered, statusFilter, selectedTypes, selectedTags, selectedLabelIds, updateCheckResults])
 
+  const visibleLabels = useMemo(() => {
+    let items = filterPackagesByStatus(baseFiltered, statusFilter, updateCheckResults)
+    items = filterPackagesByEnabledStorage(items, enabledFilter)
+    items = filterPackagesBySelectedTypes(items, selectedTypes)
+    items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
+    return labelsForPackages(labels, items, selectedLabelIds, selectedTypes)
+  }, [
+    baseFiltered,
+    statusFilter,
+    updateCheckResults,
+    enabledFilter,
+    selectedTypes,
+    selectedTags,
+    labels,
+    selectedLabelIds,
+  ])
+
   const filtered = useMemo(() => {
     let result = filterPackagesByStatus(baseFiltered, statusFilter, updateCheckResults)
     result = filterPackagesByEnabledStorage(result, enabledFilter)
     result = filterPackagesBySelectedTypes(result, selectedTypes)
     result = result.filter((p) => packageMatchesSelectedTags(p, selectedTags))
-    result = result.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds))
+    result = result.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes))
     const sortFns = {
       'Recently installed': (a, b) =>
         (b.firstSeenAt || 0) - (a.firstSeenAt || 0) || (b.fileMtime || 0) - (a.fileMtime || 0),
@@ -509,7 +549,7 @@ export default function LibraryView({ onNavigate, navContext }) {
           { value: 'offloaded', label: 'Offloaded', count: enabledFilterCounts.offloaded },
         ],
       },
-      ...(labels.length
+      ...(visibleLabels.length
         ? [
             {
               key: 'labels',
@@ -518,7 +558,7 @@ export default function LibraryView({ onNavigate, navContext }) {
               value: selectedLabelIds,
               default: FILTER_DEFAULTS.selectedLabelIds,
               onChange: setSelectedLabelIds,
-              labels,
+              labels: visibleLabels,
               placeholder: 'Filter by label…',
               allowNegate: true,
             },
@@ -587,7 +627,7 @@ export default function LibraryView({ onNavigate, navContext }) {
       excludedAuthors,
       selectedTags,
       selectedLabelIds,
-      labels,
+      visibleLabels,
       tagCounts,
       authorCounts,
       license,

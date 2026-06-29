@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { labelsForContentItems } from './ContentView'
+import { labelsForContentItems, LAZY_LABEL_LOADING } from './ContentView'
 
 describe('ContentView label facets', () => {
+  it('keeps label loading eager while facet-filtering options in memory', () => {
+    expect(LAZY_LABEL_LOADING).toBe(false)
+  })
+
   it('keeps label suggestions scoped to visible content and selected labels', () => {
     const labels = [
       { id: 1, name: 'look:vg' },

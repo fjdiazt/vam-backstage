@@ -100,6 +100,7 @@ export default function App() {
     })
     const cleanupContentsUpdated = window.api.onContentsUpdated(() => {
       void useLibraryStore.getState().refreshDetail()
+      if (useContentStore.getState().contents.length) void useContentStore.getState().fetchContents()
       void useContentStore.getState().refreshSelection()
     })
     const cleanupUnreadable = window.api.onScanUnreadable(({ filename }) => {

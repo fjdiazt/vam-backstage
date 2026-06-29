@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkTempVamDir, openTestDatabase } from '../../test/fixtures/index.js'
 import { closeDatabase, getDb } from './db.js'
+import { applyLabelToContents, findOrCreateLabel, LABEL_SOURCE_BROWSERASSIST, setLabelContentSource } from './db.js'
 import {
   buildFromDb,
   effectivePackageType,
@@ -783,6 +784,32 @@ describe('buildFromDb — extracted-preset ownership', () => {
 })
 
 describe('buildFromDb — package summary enrichment', () => {
+  it('includes content labels on package summaries', async () => {
+    const db = getDb()
+    seedPackage(db, {
+      filename: 'Labels.P.1.var',
+      package_name: 'Labels.P',
+      version: '1',
+      is_direct: 1,
+    })
+    seedContent(db, {
+      package_filename: 'Labels.P.1.var',
+      internal_path: 'Saves/scene/look.json',
+      display_name: 'Look',
+      type: 'scene',
+    })
+    const label = findOrCreateLabel('look:vg')
+    const item = { packageFilename: 'Labels.P.1.var', internalPath: 'Saves/scene/look.json' }
+    applyLabelToContents(label.id, [item])
+    setLabelContentSource(label.id, item.packageFilename, item.internalPath, LABEL_SOURCE_BROWSERASSIST, 'Looks')
+
+    buildFromDb()
+
+    const p = getFilteredPackages().find((x) => x.filename === 'Labels.P.1.var')
+    expect(p?.contentLabelIds).toEqual([label.id])
+    expect(p?.contentLabelCategories[label.id]).toEqual(['Looks'])
+  })
+
   it('noLookPresetTag when type is Looks but no look items', async () => {
     const db = getDb()
     seedPackage(db, {
