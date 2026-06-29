@@ -9,12 +9,19 @@ const storeMocks = vi.hoisted(() => ({
   effectivePackageType: vi.fn(() => 'Scenes'),
   getLabelsByPackageMap: vi.fn(() => new Map()),
   getLabelsByContentMap: vi.fn(() => new Map()),
+  getLabelContentSourcesMap: vi.fn(() => new Map()),
   getLabelNameById: vi.fn(() => null),
+  refreshLabels: vi.fn(),
 }))
 
 vi.mock('./store.js', () => storeMocks)
 
-import { syncBrowserAssistTags, browserAssistSettingsDir } from './browser-assist.js'
+import {
+  browserAssistSettingsDir,
+  browserAssistUserTagNames,
+  mergeBrowserAssistUserTags,
+  syncBrowserAssistTags,
+} from './browser-assist.js'
 
 const BA_REL = ['Saves', 'PluginData', 'JayJayWon', 'BrowserAssist', 'VARResourcesUserData']
 
@@ -198,9 +205,9 @@ describe('syncBrowserAssistTags — package-level labels', () => {
     const written = JSON.parse(await readFile(shardPath, 'utf8'))
     expect(written.resources[0].Tags).toEqual([{ tagName: 'pkg', tagCategory: 'Label' }])
     expect(written.resources[1].Tags).toEqual([
+      { tagName: 'own', tagCategory: 'User' },
+      { tagName: 'pkg', tagCategory: 'User' },
       { tagName: 'scene-real', tagCategory: 'User' },
-      { tagName: 'own', tagCategory: 'Label' },
-      { tagName: 'pkg', tagCategory: 'Label' },
     ])
   })
 
@@ -212,5 +219,36 @@ describe('syncBrowserAssistTags — package-level labels', () => {
 
   it('resolves the expected settings directory under vamDir', () => {
     expect(browserAssistSettingsDir('/vam')).toBe(join('/vam', ...BA_REL))
+  })
+})
+
+describe('BrowserAssist user tag helpers', () => {
+  it('reads User category tags except managed scene tags', () => {
+    expect([
+      ...browserAssistUserTagNames([
+        { tagName: 'Favorite', tagCategory: 'User' },
+        { tagName: 'scene-real', tagCategory: 'User' },
+        { tagName: 'fixed', tagCategory: 'Scene' },
+        { tagName: '', tagCategory: 'User' },
+      ]),
+    ]).toEqual(['Favorite'])
+  })
+
+  it('rewrites only User category tags and can append managed scene tag', () => {
+    expect(
+      mergeBrowserAssistUserTags(
+        [
+          { tagName: 'fixed', tagCategory: 'Scene' },
+          { tagName: 'Old', tagCategory: 'User' },
+        ],
+        ['New', 'Favorite'],
+        'scene-look',
+      ),
+    ).toEqual([
+      { tagName: 'fixed', tagCategory: 'Scene' },
+      { tagName: 'Favorite', tagCategory: 'User' },
+      { tagName: 'New', tagCategory: 'User' },
+      { tagName: 'scene-look', tagCategory: 'User' },
+    ])
   })
 })

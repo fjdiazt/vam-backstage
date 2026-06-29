@@ -6,6 +6,7 @@ import {
   getAllLabels,
   getAllLabelPackages,
   getAllLabelContents,
+  listLabelContentSources,
 } from './db.js'
 import { getCachedDetail } from './hub/client.js'
 import {
@@ -101,6 +102,7 @@ let authorCounts = {} // creator string → count of packages with that creator
 let labelIndex = new Map() // label_id → { id, name, color, packageCount, contentCount }
 let labelsByPackage = new Map() // package_filename → number[] of label ids
 let labelsByContent = new Map() // `${package_filename}\0${internal_path}` → number[] of label ids
+let labelContentSources = new Map() // `${package_filename}\0${internal_path}\0${label_id}` → source mask
 let nonDownloadableRids = new Set() // resource IDs known to be non-downloadable
 let stats = emptyStats()
 
@@ -465,6 +467,11 @@ function buildLabels() {
     const entry = labelIndex.get(row.label_id)
     if (entry) entry.contentCount++
   }
+
+  labelContentSources = new Map()
+  for (const row of listLabelContentSources()) {
+    labelContentSources.set(`${row.package_filename}\0${row.internal_path}\0${row.label_id}`, row.source_mask)
+  }
 }
 
 function packageLabelIds(filename) {
@@ -687,6 +694,11 @@ export function getLabelsByPackageMap() {
 /** Live map: `${package_filename}\0${internal_path}` → number[] of label ids. */
 export function getLabelsByContentMap() {
   return labelsByContent
+}
+
+/** Live map: `${package_filename}\0${internal_path}\0${label_id}` → source mask. */
+export function getLabelContentSourcesMap() {
+  return labelContentSources
 }
 
 /** Resolve a label id to its display name; returns null if the id is unknown. */
