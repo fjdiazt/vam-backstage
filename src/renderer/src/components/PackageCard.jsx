@@ -322,7 +322,7 @@ export function HubCard({
 
   return (
     <div
-      className={`@container w-full min-w-0 bg-surface border rounded-lg overflow-hidden text-left transition-all duration-150 flex flex-col border-border ${
+      className={`@container group w-full min-w-0 bg-surface border rounded-lg overflow-hidden text-left transition-all duration-150 flex flex-col border-border ${
         linkAction ? '' : 'card-glow cursor-pointer hover:bg-elevated'
       }`}
     >
@@ -360,7 +360,7 @@ export function HubCard({
                     if (isHidden) onUnhide?.(resource)
                     else onHide?.(resource)
                   }}
-                  className="size-6 rounded-full bg-black/55 backdrop-blur-sm border border-white/15 inline-flex items-center justify-center cursor-pointer text-white/80 hover:text-white transition-colors"
+                  className="size-6 rounded-full bg-black/55 backdrop-blur-sm border border-white/15 inline-flex items-center justify-center cursor-pointer text-white/80 hover:text-white opacity-0 group-hover:opacity-100 transition"
                 >
                   {isHidden ? <Eye size={13} /> : <EyeOff size={13} />}
                 </button>
@@ -458,6 +458,7 @@ export function LibraryCard({
   onClick,
   selected,
   onFilterAuthor,
+  onToggleHidden,
   mode = 'medium',
   hideType,
   bulkMode = false,
@@ -547,6 +548,22 @@ export function LibraryCard({
           </div>
         )}
         <div className="absolute top-2 right-2 flex items-center gap-1 z-1">
+          {onToggleHidden && !bulkMode && (
+            <span
+              role="button"
+              title={pkg.hidden ? 'Unhide' : 'Hide'}
+              aria-label={pkg.hidden ? 'Unhide' : 'Hide'}
+              onClick={(e) => {
+                e.stopPropagation()
+                onToggleHidden(pkg)
+              }}
+              className={`size-6 rounded-full bg-black/55 backdrop-blur-sm border border-white/15 inline-flex items-center justify-center cursor-pointer opacity-0 group-hover:opacity-100 transition ${
+                pkg.hidden ? 'text-error hover:text-error/75' : 'text-white/80 hover:text-white'
+              }`}
+            >
+              {pkg.hidden ? <Eye size={13} /> : <EyeOff size={13} />}
+            </span>
+          )}
           {inactive && (
             <span
               className={`${LIB_CARD_CORNER_ICON} text-error ${THUMB_OUTLINE_ICON_SHADOW}`}
@@ -1040,7 +1057,7 @@ export function ContentCard({
             }}
             className={`size-7 shrink-0 inline-flex items-center justify-center rounded transition ${bulkMode ? 'pointer-events-none' : 'cursor-pointer'} ${
               isHidden
-                ? `opacity-100 text-error bg-transparent ${THUMB_OUTLINE_ICON_SHADOW} ${bulkMode ? '' : 'group-hover:text-error/70 group-hover:bg-black/50 group-hover:backdrop-blur-sm'}`
+                ? `opacity-0 text-error bg-transparent ${THUMB_OUTLINE_ICON_SHADOW} ${bulkMode ? '' : 'group-hover:opacity-100 group-hover:text-error/70 group-hover:bg-black/50 group-hover:backdrop-blur-sm'}`
                 : `opacity-0 text-white/70 bg-black/50 backdrop-blur-sm ${bulkMode ? '' : 'group-hover:opacity-100'}`
             }`}
           >

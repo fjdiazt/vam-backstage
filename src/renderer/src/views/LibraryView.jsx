@@ -824,6 +824,14 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     [toggleBulkSelect],
   )
 
+  const handlePackageHiddenToggle = useCallback(async (pkg) => {
+    try {
+      await useLibraryStore.getState().setPackageHidden(pkg.filename, !pkg.hidden)
+    } catch (err) {
+      toast(`Failed to toggle hidden: ${err.message}`)
+    }
+  }, [])
+
   const bulkEnabledState = useMemo(() => {
     const items = filtered.filter((p) => bulkSelectedFilenames.includes(p.filename))
     if (!items.length) return { allEnabled: false, allDisabled: false, mixed: false }
@@ -1288,6 +1296,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
                     bulkMode={bulkActive}
                     bulkSelected={selectedBulkSet.has(pkg.filename)}
                     onFilterAuthor={handleFilterAuthor}
+                    onToggleHidden={handlePackageHiddenToggle}
                     mode={compactCards ? 'minimal' : 'medium'}
                     hideType={selectedTypes.length === 1}
                     dimmed={dimUpdateUnavailable}
