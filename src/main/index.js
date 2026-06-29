@@ -26,6 +26,7 @@ import { getServePort, getConnectUrl } from './remote/cli.js'
 import { initAutostart, readAutostartUrl } from './remote/autostart.js'
 import { DEFAULT_REMOTE_PORT } from '@shared/remote-config.js'
 import { HUB_HTTP_USER_AGENT } from '@shared/hub-http.js'
+import { loadBrowserAssistDerivedHiddenRules } from './browser-assist.js'
 import {
   attachMainWindowStatePersistence,
   loadMainWindowState,
@@ -351,7 +352,15 @@ async function setupHubConsent() {
   })
 }
 
-function initBackend() {
+async function loadBrowserAssistRulesForIndexes(vamDir) {
+  try {
+    await loadBrowserAssistDerivedHiddenRules(vamDir)
+  } catch (err) {
+    console.warn('[browser-assist] hidden rules load failed:', err.message)
+  }
+}
+
+async function initBackend() {
   // Capture handler registrations into the remote registry BEFORE registering
   // them, so hot-starting the server later can dispatch to every channel.
   installRegistry()
@@ -388,6 +397,7 @@ function initBackend() {
   if (vamDir && scanDone) {
     try {
       buildFromDb()
+      await loadBrowserAssistRulesForIndexes(vamDir)
     } catch {}
     // startWatcher runs after startupScan (see startupScan finally) — starting the
     // FS watcher before the full library scan contends on the same volume and can
@@ -419,6 +429,7 @@ async function startupScan() {
         setPrefsMap(prefs)
       } catch {}
       buildFromDb()
+      await loadBrowserAssistRulesForIndexes(vamDir)
     }
 
     notify('packages:updated')
@@ -476,7 +487,7 @@ app.whenReady().then(async () => {
   })
 
   try {
-    initBackend()
+    await initBackend()
   } catch (err) {
     console.error('Backend init failed:', err)
   }

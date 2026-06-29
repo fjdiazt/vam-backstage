@@ -228,7 +228,6 @@ export async function runScan(vamDir, onProgress = () => {}) {
   } catch (err) {
     console.warn('[browser-assist] hidden rules load failed:', err.message)
   }
-
   // Auto-refresh extracted presets from newly-installed higher versions (runs
   // after the store rebuild so readScene can resolve the new .var files).
   await refreshExtractedPresetsForUpdates(extractRefreshAdditions, vamDir)

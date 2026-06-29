@@ -347,8 +347,8 @@ describe('BrowserAssist user tag helpers', () => {
 
     expect([...rules.hiddenTags]).toEqual(['hidden', 'hidden:old'])
     expect([...rules.hiddenCreators]).toEqual(['alice'])
-    expect([...rules.contentHiddenTagsByCategory.get('Scenes')]).toEqual(['hidden:unwanted'])
-    expect([...rules.contentHiddenCreatorsByCategory.get('Scenes')]).toEqual(['bob'])
+    expect([...rules.contentHiddenTagsByResourceType.get('Scene')]).toEqual(['hidden:unwanted'])
+    expect([...rules.contentHiddenCreatorsByResourceType.get('Scene')]).toEqual(['bob'])
   })
 
   it('computes derived package hidden state from BA tag and creator rules', async () => {
@@ -383,14 +383,14 @@ describe('BrowserAssist user tag helpers', () => {
     const writes = []
     const result = await syncBrowserAssistDerivedContentHidden('VAM', {
       readRules: async () => ({
-        contentHiddenTagsByCategory: new Map([['Scenes', new Set(['hidden:unwanted'])]]),
-        contentHiddenCreatorsByCategory: new Map([['Scenes', new Set(['alice'])]]),
+        contentHiddenTagsByResourceType: new Map([['Scene', new Set(['hidden:unwanted'])]]),
+        contentHiddenCreatorsByResourceType: new Map([['Scene', new Set(['alice'])]]),
       }),
       writeRules: (rules) => writes.push(rules),
     })
 
     expect(result).toEqual({ contentHiddenDerivedTags: 1, contentHiddenDerivedCreators: 1, errors: [] })
-    expect([...writes[0].hiddenTagsByCategory.get('Scenes')]).toEqual(['hidden:unwanted'])
-    expect([...writes[0].hiddenCreatorsByCategory.get('Scenes')]).toEqual(['alice'])
+    expect([...writes[0].hiddenTagsByResourceType.get('Scene')]).toEqual(['hidden:unwanted'])
+    expect([...writes[0].hiddenCreatorsByResourceType.get('Scene')]).toEqual(['alice'])
   })
 })
