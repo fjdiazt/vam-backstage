@@ -641,8 +641,16 @@ export function LibraryCard({
           {onToggleHidden && !bulkMode && (
             <span
               role="button"
-              title={pkg.hidden ? 'Unhide' : 'Hide'}
-              aria-label={pkg.hidden ? 'Unhide' : 'Hide'}
+              title={
+                pkg.hidden && !pkg.hiddenDirect
+                  ? pkg.hiddenReason === 'creator'
+                    ? 'Hidden by creator'
+                    : 'Hidden by tag'
+                  : pkg.hiddenDirect
+                    ? 'Unhide'
+                    : 'Hide'
+              }
+              aria-label={pkg.hiddenDirect ? 'Unhide' : 'Hide'}
               onClick={(e) => {
                 e.stopPropagation()
                 onToggleHidden(pkg)

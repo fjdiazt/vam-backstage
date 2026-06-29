@@ -13,6 +13,7 @@ const storeMocks = vi.hoisted(() => ({
   getLabelContentSourcesMap: vi.fn(() => new Map()),
   getLabelNameById: vi.fn(() => null),
   refreshLabels: vi.fn(),
+  setPackageDerivedHiddenMap: vi.fn(),
 }))
 const dbMocks = vi.hoisted(() => ({
   applyLabelToContents: vi.fn(),
@@ -40,6 +41,8 @@ import {
   browserAssistUserTagNames,
   mergeBrowserAssistUserTags,
   syncBrowserAssistTags,
+  parseBrowserAssistPackageHiddenRules,
+  syncBrowserAssistDerivedPackageHidden,
   syncBrowserAssistPackageHidden,
 } from './browser-assist.js'
 
@@ -326,5 +329,48 @@ describe('BrowserAssist user tag helpers', () => {
 
     expect(result).toEqual({ packagesHiddenImported: 0, errors: [] })
     expect(refreshes).toEqual([])
+  })
+
+  it('parses BrowserAssist package hidden tag and creator rules', () => {
+    const rules = parseBrowserAssistPackageHiddenRules({
+      ResourceSettings: {
+        'VAR Packages': { hiddenTags: ['hidden', 'hidden:old'] },
+      },
+      creatorSettings: [
+        { creatorName: 'Alice', hiddenResourceTypes: ['VAR Packages'] },
+        { creatorName: 'Bob', hiddenResourceTypes: ['Scene'] },
+      ],
+    })
+
+    expect([...rules.hiddenTags]).toEqual(['hidden', 'hidden:old'])
+    expect([...rules.hiddenCreators]).toEqual(['alice'])
+  })
+
+  it('computes derived package hidden state from BA tag and creator rules', async () => {
+    const writes = []
+    const result = await syncBrowserAssistDerivedPackageHidden('VAM', {
+      packageIndex: () =>
+        new Map([
+          ['A.Pkg.1.var', { creator: 'Alice' }],
+          ['B.Pkg.1.var', { creator: 'Bob' }],
+          ['C.Pkg.1.var', { creator: 'Carol' }],
+        ]),
+      labelsByPackageMap: () =>
+        new Map([
+          ['A.Pkg.1.var', [1]],
+          ['B.Pkg.1.var', [2]],
+        ]),
+      labelNameById: (id) => ({ 1: 'hidden', 2: 'normal' })[id],
+      readRules: async () => ({ hiddenTags: new Set(['hidden']), hiddenCreators: new Set(['bob']) }),
+      writeDerived: (map) => writes.push([...map.entries()]),
+    })
+
+    expect(result).toEqual({ packagesHiddenDerived: 2, errors: [] })
+    expect(writes).toEqual([
+      [
+        ['A.Pkg.1.var', { hiddenByTag: true, hiddenByCreator: false }],
+        ['B.Pkg.1.var', { hiddenByTag: false, hiddenByCreator: true }],
+      ],
+    ])
   })
 })

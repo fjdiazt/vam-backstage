@@ -19,6 +19,7 @@ import {
   resolveHubDownloadUrl,
   setPrefsMap,
   packageHasNoLookPresetTag,
+  setPackageDerivedHiddenMap,
 } from './store.js'
 import { setPackagesIndexForTests } from './hub/packages-json.js'
 
@@ -36,6 +37,7 @@ let tmp
 beforeEach(async () => {
   tmp = await mkTempVamDir()
   await openTestDatabase(tmp.dbPath)
+  setPackageDerivedHiddenMap(new Map())
 })
 
 afterEach(async () => {
@@ -784,6 +786,28 @@ describe('buildFromDb — extracted-preset ownership', () => {
 })
 
 describe('buildFromDb — package summary enrichment', () => {
+  it('uses derived BrowserAssist hidden state as effective package hidden', async () => {
+    const db = getDb()
+    seedPackage(db, {
+      filename: 'Derived.Pkg.1.var',
+      creator: 'Derived',
+      package_name: 'Derived.Pkg',
+      version: '1',
+      is_direct: 1,
+    })
+    setPackageDerivedHiddenMap(new Map([['Derived.Pkg.1.var', { hiddenByTag: true, hiddenByCreator: false }]]))
+
+    buildFromDb()
+
+    const pkg = getFilteredPackages().find((p) => p.filename === 'Derived.Pkg.1.var')
+    expect(pkg).toMatchObject({
+      hidden: true,
+      hiddenDirect: false,
+      hiddenByTag: true,
+      hiddenByCreator: false,
+      hiddenReason: 'tag',
+    })
+  })
   it('includes content labels on package summaries', async () => {
     const db = getDb()
     seedPackage(db, {

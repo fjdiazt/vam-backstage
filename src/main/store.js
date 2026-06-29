@@ -103,6 +103,7 @@ let labelIndex = new Map() // label_id → { id, name, color, packageCount, cont
 let labelsByPackage = new Map() // package_filename → number[] of label ids
 let labelsByContent = new Map() // `${package_filename}\0${internal_path}` → number[] of label ids
 let labelContentSources = new Map() // `${package_filename}\0${internal_path}\0${label_id}` → { sourceMask, baCategory }
+let packageDerivedHidden = new Map() // filename → { hiddenByTag, hiddenByCreator }
 let nonDownloadableRids = new Set() // resource IDs known to be non-downloadable
 let stats = emptyStats()
 
@@ -709,6 +710,10 @@ export function getLabelNameById(id) {
   return labelIndex.get(id)?.name ?? null
 }
 
+export function setPackageDerivedHiddenMap(map) {
+  packageDerivedHidden = map instanceof Map ? map : new Map()
+}
+
 function labelSourceCategoriesForContent(packageFilename, internalPath) {
   const ids = labelsByContent.get(packageFilename + '\0' + internalPath) || []
   if (!ids.length) return {}
@@ -837,6 +842,10 @@ function enrichPackageSummary(pkg) {
   const lookItemCount = lookItemCountByPackage.get(pkg.filename) || 0
   const noLookPresetTag = effectiveType === 'Looks' && lookItemCount === 0
   const hasExtractedAppearancePreset = noLookPresetTag && packageHasExtractedAppearance(pkg.filename)
+  const derivedHidden = packageDerivedHidden.get(pkg.filename) || {}
+  const hiddenDirect = !!pkg.hidden
+  const hiddenByTag = !!derivedHidden.hiddenByTag
+  const hiddenByCreator = !!derivedHidden.hiddenByCreator
   return {
     filename: pkg.filename,
     creator: pkg.creator,
@@ -852,6 +861,11 @@ function enrichPackageSummary(pkg) {
     sizeBytes: pkg.size_bytes,
     removableSize,
     isDirect: !!pkg.is_direct,
+    hidden: hiddenDirect || hiddenByTag || hiddenByCreator,
+    hiddenDirect,
+    hiddenByTag,
+    hiddenByCreator,
+    hiddenReason: hiddenDirect ? 'direct' : hiddenByTag ? 'tag' : hiddenByCreator ? 'creator' : null,
     storageState: pkg.storage_state,
     libraryDirId: pkg.library_dir_id ?? null,
     hubResourceId: pkg.hub_resource_id,
