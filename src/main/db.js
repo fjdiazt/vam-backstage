@@ -1640,6 +1640,7 @@ export function getAllLabelContents() {
 }
 
 // Label sync source bits for label_content_sources.source_mask.
+// 0 means local removal is pending export to BrowserAssist.
 // 1 means the assignment is owned by Backstage UI.
 // 2 means the assignment was imported from BrowserAssist User tags.
 // 3 means both sides currently own the assignment.
@@ -1649,12 +1650,11 @@ export const LABEL_SOURCE_BOTH = LABEL_SOURCE_BACKSTAGE | LABEL_SOURCE_BROWSERAS
 
 function validLabelSourceMask(mask) {
   const n = Number(mask)
-  return Number.isInteger(n) && n > 0 ? n : 0
+  return Number.isInteger(n) && n >= 0 ? n : 0
 }
 
 export function setLabelContentSource(labelId, packageFilename, internalPath, sourceMask) {
   const mask = validLabelSourceMask(sourceMask)
-  if (!mask) return 0
   stmt(
     `INSERT INTO label_content_sources (label_id, package_filename, internal_path, source_mask)
      VALUES (?, ?, ?, ?)
