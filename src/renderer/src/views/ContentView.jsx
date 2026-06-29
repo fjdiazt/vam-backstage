@@ -168,12 +168,23 @@ function applyContentSidebarFilters(baseItems, ctx, omit = {}) {
     else if (vf === 'favorites') items = items.filter((c) => c.favorite)
   }
 
-  if (!omit.tagsLabels) {
+  if (!omit.tagsLabels && !omit.selectedTags) {
     items = items.filter((c) => contentMatchesSelectedTags(c, ctx.selectedTags))
+  }
+
+  if (!omit.tagsLabels && !omit.selectedLabelIds) {
     items = items.filter((c) => contentMatchesSelectedLabels(c, ctx.selectedLabelIds))
   }
 
   return items
+}
+
+export function labelsForContentItems(labels, items, selectedLabelIds) {
+  const available = new Set(selectedLabelIds)
+  for (const c of items) {
+    for (const id of contentLabelIds(c)) available.add(id)
+  }
+  return labels.filter((l) => available.has(l.id))
 }
 
 export default function ContentView({ onNavigate, navContext }) {
@@ -479,6 +490,33 @@ export default function ContentView({ onNavigate, navContext }) {
     selectedLabelIds,
   ])
 
+  const visibleLabels = useMemo(() => {
+    const items = applyContentSidebarFilters(
+      baseFiltered,
+      {
+        selectedTypes,
+        selectedPackageTypes,
+        packageFilter,
+        packageStatusFilter,
+        visibilityFilter,
+        selectedTags,
+        selectedLabelIds,
+      },
+      { selectedLabelIds: true },
+    )
+    return labelsForContentItems(labels, items, selectedLabelIds)
+  }, [
+    baseFiltered,
+    selectedTypes,
+    selectedPackageTypes,
+    packageFilter,
+    packageStatusFilter,
+    visibilityFilter,
+    selectedTags,
+    selectedLabelIds,
+    labels,
+  ])
+
   const filtered = useMemo(() => {
     let result = applyContentSidebarFilters(baseFiltered, {
       selectedTypes,
@@ -598,7 +636,7 @@ export default function ContentView({ onNavigate, navContext }) {
           { value: 'local', label: 'Local', count: packageFilterCounts.local },
         ],
       },
-      ...(labels.length
+      ...(visibleLabels.length
         ? [
             {
               key: 'labels',
@@ -607,7 +645,7 @@ export default function ContentView({ onNavigate, navContext }) {
               value: selectedLabelIds,
               default: FILTER_DEFAULTS.selectedLabelIds,
               onChange: setSelectedLabelIds,
-              labels,
+              labels: visibleLabels,
               placeholder: 'Filter by label…',
               allowNegate: true,
             },
@@ -669,7 +707,7 @@ export default function ContentView({ onNavigate, navContext }) {
       excludedAuthors,
       selectedTags,
       selectedLabelIds,
-      labels,
+      visibleLabels,
       tagCounts,
       authorCounts,
       primarySort,
