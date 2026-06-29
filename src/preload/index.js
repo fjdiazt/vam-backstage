@@ -57,6 +57,7 @@ const api = {
     toggleEnabled: (filename) => invoke('packages:toggle-enabled', filename),
     setEnabled: (filenames, enabled) => invoke('packages:set-enabled', { filenames, enabled }),
     enableDeps: (filename) => invoke('packages:enable-deps', filename),
+    setHidden: (payload) => invoke('packages:set-hidden', payload),
     setTypeOverride: (filenameOrPayload, typeOverride) =>
       typeof filenameOrPayload === 'object' && filenameOrPayload !== null && 'filenames' in filenameOrPayload
         ? invoke('packages:set-type-override', filenameOrPayload)
