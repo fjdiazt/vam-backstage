@@ -19,6 +19,7 @@ import {
   getLabelContentSource,
   getNotFoundHubResourceIds,
   getPackagesNeedingHubNameLookup,
+  getPackageHidden,
   insertDownload,
   LABEL_SOURCE_BACKSTAGE,
   LABEL_SOURCE_BROWSERASSIST,
@@ -30,6 +31,7 @@ import {
   setLabelContentSource,
   setHubResourceId,
   setHubUserId,
+  setPackageHidden,
   toIntString,
   upsertHubResourceDetail,
   upsertHubHidden,
@@ -825,6 +827,27 @@ describe('dead Hub resource name lookup', () => {
     `,
     ).run()
     expect(getPackagesNeedingHubNameLookup()).toEqual([{ filename: 'Unlinked.Pkg.1.var', packageName: 'C.Unlinked' }])
+  })
+})
+
+describe('package hidden', () => {
+  beforeEach(async () => {
+    tmp = await mkTempVamDir()
+    await openTestDatabase(tmp.dbPath)
+  })
+
+  it('stores nullable package hidden state', () => {
+    const db = getDb()
+    db.prepare(
+      `INSERT INTO packages (filename, creator, package_name, version, size_bytes, file_mtime, is_direct, storage_state, dep_refs)
+       VALUES ('A.Pkg.1.var', 'A', 'A.Pkg', '1', 1, 0, 1, 'enabled', '[]')`,
+    ).run()
+
+    expect(getPackageHidden('A.Pkg.1.var')).toBe(null)
+    setPackageHidden('A.Pkg.1.var', true)
+    expect(getPackageHidden('A.Pkg.1.var')).toBe(true)
+    setPackageHidden('A.Pkg.1.var', false)
+    expect(getPackageHidden('A.Pkg.1.var')).toBe(false)
   })
 })
 
