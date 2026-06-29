@@ -72,13 +72,16 @@ describe('view-state sanitizers', () => {
         scrollAnchorFilename: 'C.D.1.var',
         selectedTypes: ['Looks'],
         selectedLabelIds: [1, 'x'],
+        visibilityFilter: 'hidden',
       }),
     ).toMatchObject({
       selectedFilename: 'A.B.1.var',
       scrollAnchorFilename: 'C.D.1.var',
       selectedTypes: ['Looks'],
       selectedLabelIds: [1],
+      visibilityFilter: 'hidden',
     })
+    expect(sanitizeLibraryState({ visibilityFilter: 'favorites' })).toMatchObject({ visibilityFilter: 'visible' })
     expect(
       sanitizeContentState({
         selectedItemId: 42,
