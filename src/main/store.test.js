@@ -19,6 +19,7 @@ import {
   resolveHubDownloadUrl,
   setPrefsMap,
   packageHasNoLookPresetTag,
+  setContentDerivedHiddenRules,
   setPackageDerivedHiddenMap,
 } from './store.js'
 import { setPackagesIndexForTests } from './hub/packages-json.js'
@@ -38,6 +39,7 @@ beforeEach(async () => {
   tmp = await mkTempVamDir()
   await openTestDatabase(tmp.dbPath)
   setPackageDerivedHiddenMap(new Map())
+  setContentDerivedHiddenRules({ hiddenTagsByCategory: new Map(), hiddenCreatorsByCategory: new Map() })
 })
 
 afterEach(async () => {
@@ -832,6 +834,42 @@ describe('buildFromDb — package summary enrichment', () => {
     const p = getFilteredPackages().find((x) => x.filename === 'Labels.P.1.var')
     expect(p?.contentLabelIds).toEqual([label.id])
     expect(p?.contentLabelCategories[label.id]).toEqual(['Looks'])
+  })
+
+  it('uses BrowserAssist hidden labels as effective content hidden', async () => {
+    const db = getDb()
+    seedPackage(db, {
+      filename: 'Hidden.Content.1.var',
+      creator: 'Hidden',
+      package_name: 'Hidden.Content',
+      version: '1',
+      is_direct: 1,
+    })
+    seedContent(db, {
+      package_filename: 'Hidden.Content.1.var',
+      internal_path: 'Saves/scene/unwanted.json',
+      display_name: 'Unwanted',
+      type: 'scene',
+    })
+    const label = findOrCreateLabel('hidden:unwanted')
+    const item = { packageFilename: 'Hidden.Content.1.var', internalPath: 'Saves/scene/unwanted.json' }
+    applyLabelToContents(label.id, [item])
+    setLabelContentSource(label.id, item.packageFilename, item.internalPath, LABEL_SOURCE_BROWSERASSIST, 'Scenes')
+    setContentDerivedHiddenRules({
+      hiddenTagsByCategory: new Map([['Scenes', new Set(['hidden:unwanted'])]]),
+      hiddenCreatorsByCategory: new Map(),
+    })
+
+    buildFromDb()
+
+    const content = getFilteredContents().find((c) => c.packageFilename === 'Hidden.Content.1.var')
+    expect(content).toMatchObject({
+      hidden: true,
+      hiddenDirect: false,
+      hiddenByTag: true,
+      hiddenByCreator: false,
+      hiddenReason: 'tag',
+    })
   })
 
   it('noLookPresetTag when type is Looks but no look items', async () => {

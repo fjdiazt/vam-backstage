@@ -13,6 +13,7 @@ const storeMocks = vi.hoisted(() => ({
   getLabelContentSourcesMap: vi.fn(() => new Map()),
   getLabelNameById: vi.fn(() => null),
   refreshLabels: vi.fn(),
+  setContentDerivedHiddenRules: vi.fn(),
   setPackageDerivedHiddenMap: vi.fn(),
 }))
 const dbMocks = vi.hoisted(() => ({
@@ -42,6 +43,7 @@ import {
   mergeBrowserAssistUserTags,
   syncBrowserAssistTags,
   parseBrowserAssistPackageHiddenRules,
+  syncBrowserAssistDerivedContentHidden,
   syncBrowserAssistDerivedPackageHidden,
   syncBrowserAssistPackageHidden,
 } from './browser-assist.js'
@@ -335,6 +337,7 @@ describe('BrowserAssist user tag helpers', () => {
     const rules = parseBrowserAssistPackageHiddenRules({
       ResourceSettings: {
         'VAR Packages': { hiddenTags: ['hidden', 'hidden:old'] },
+        Scene: { hiddenTags: ['hidden:unwanted'] },
       },
       creatorSettings: [
         { creatorName: 'Alice', hiddenResourceTypes: ['VAR Packages'] },
@@ -344,6 +347,8 @@ describe('BrowserAssist user tag helpers', () => {
 
     expect([...rules.hiddenTags]).toEqual(['hidden', 'hidden:old'])
     expect([...rules.hiddenCreators]).toEqual(['alice'])
+    expect([...rules.contentHiddenTagsByCategory.get('Scenes')]).toEqual(['hidden:unwanted'])
+    expect([...rules.contentHiddenCreatorsByCategory.get('Scenes')]).toEqual(['bob'])
   })
 
   it('computes derived package hidden state from BA tag and creator rules', async () => {
@@ -372,5 +377,20 @@ describe('BrowserAssist user tag helpers', () => {
         ['B.Pkg.1.var', { hiddenByTag: false, hiddenByCreator: true }],
       ],
     ])
+  })
+
+  it('writes derived content hidden rules from BA settings', async () => {
+    const writes = []
+    const result = await syncBrowserAssistDerivedContentHidden('VAM', {
+      readRules: async () => ({
+        contentHiddenTagsByCategory: new Map([['Scenes', new Set(['hidden:unwanted'])]]),
+        contentHiddenCreatorsByCategory: new Map([['Scenes', new Set(['alice'])]]),
+      }),
+      writeRules: (rules) => writes.push(rules),
+    })
+
+    expect(result).toEqual({ contentHiddenDerivedTags: 1, contentHiddenDerivedCreators: 1, errors: [] })
+    expect([...writes[0].hiddenTagsByCategory.get('Scenes')]).toEqual(['hidden:unwanted'])
+    expect([...writes[0].hiddenCreatorsByCategory.get('Scenes')]).toEqual(['alice'])
   })
 })

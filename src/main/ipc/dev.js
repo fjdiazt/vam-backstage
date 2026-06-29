@@ -28,8 +28,8 @@ export function registerDevHandlers() {
       const result = await syncBrowserAssistTags(vamDir)
       if ((result.labelsImported ?? 0) > 0 || (result.labelsRemoved ?? 0) > 0) {
         notify('labels:updated')
-        notify('contents:updated')
       }
+      notify('contents:updated')
       notify('packages:updated')
       return { ok: true, ...result }
     } catch (err) {
