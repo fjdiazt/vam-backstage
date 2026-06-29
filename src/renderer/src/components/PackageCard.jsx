@@ -1055,14 +1055,6 @@ export function ContentCard({
           >
             {isHidden ? <EyeOff size={13} /> : <Eye size={13} />}
           </button>
-          {isDisabledPkg && (
-            <div
-              title="Package disabled"
-              className={`size-7 shrink-0 inline-flex items-center justify-center rounded text-error ${THUMB_OUTLINE_ICON_SHADOW}`}
-            >
-              <Power size={13} />
-            </div>
-          )}
           <button
             type="button"
             disabled={bulkMode}
@@ -1072,12 +1064,20 @@ export function ContentCard({
             }}
             className={`size-7 shrink-0 inline-flex items-center justify-center rounded transition ${bulkMode ? 'pointer-events-none' : 'cursor-pointer'} ${
               item.favorite
-                ? `text-warning opacity-100 bg-transparent ${THUMB_FILLED_ICON_SHADOW} ${bulkMode ? '' : 'group-hover:bg-black/50 group-hover:backdrop-blur-sm'}`
+                ? `text-warning opacity-0 bg-transparent ${THUMB_FILLED_ICON_SHADOW} ${bulkMode ? '' : 'group-hover:opacity-100 group-hover:bg-black/50 group-hover:backdrop-blur-sm'}`
                 : `text-white/50 bg-black/50 backdrop-blur-sm opacity-0 ${bulkMode ? '' : 'group-hover:opacity-100'}`
             }`}
           >
             <Star size={13} fill={item.favorite ? 'currentColor' : 'none'} />
           </button>
+          {isDisabledPkg && (
+            <div
+              title="Package disabled"
+              className={`size-7 shrink-0 inline-flex items-center justify-center rounded text-error ${THUMB_OUTLINE_ICON_SHADOW}`}
+            >
+              <Power size={13} />
+            </div>
+          )}
         </div>
         <div className="absolute bottom-0 inset-x-0 px-2.5 pb-2 pt-8 bg-linear-to-t from-black/80 to-transparent">
           <div className="text-[11px] font-medium text-white truncate leading-tight">{item.displayName}</div>
