@@ -825,8 +825,12 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
   )
 
   const handlePackageHiddenToggle = useCallback(async (pkg) => {
+    if (pkg.hidden && !pkg.hiddenDirect) {
+      toast(`Package is hidden by BrowserAssist ${pkg.hiddenReason === 'creator' ? 'creator' : 'tag'} rule`)
+      return
+    }
     try {
-      await useLibraryStore.getState().setPackageHidden(pkg.filename, !pkg.hidden)
+      await useLibraryStore.getState().setPackageHidden(pkg.filename, !pkg.hiddenDirect)
     } catch (err) {
       toast(`Failed to toggle hidden: ${err.message}`)
     }
@@ -2051,8 +2055,12 @@ function LibraryDetailPanel({ pkg, onNavigate, onFilterAuthor, updateInfo }) {
     }
   }
   const handleToggleHidden = async () => {
+    if (pkg.hidden && !pkg.hiddenDirect) {
+      toast(`Package is hidden by BrowserAssist ${pkg.hiddenReason === 'creator' ? 'creator' : 'tag'} rule`)
+      return
+    }
     try {
-      await useLibraryStore.getState().setPackageHidden(pkg.filename, !pkg.hidden)
+      await useLibraryStore.getState().setPackageHidden(pkg.filename, !pkg.hiddenDirect)
     } catch (err) {
       toast(`Failed to toggle hidden: ${err.message}`)
     }
@@ -2214,8 +2222,14 @@ function LibraryDetailPanel({ pkg, onNavigate, onFilterAuthor, updateInfo }) {
               </Button>
             )}
             <Button variant="outline" onClick={handleToggleHidden} className="w-full text-[11px]">
-              {pkg.hidden ? <Eye size={12} /> : <EyeOff size={12} />}
-              {pkg.hidden ? 'Unhide' : 'Hide'}
+              {pkg.hiddenDirect ? <Eye size={12} /> : <EyeOff size={12} />}
+              {pkg.hidden && !pkg.hiddenDirect
+                ? pkg.hiddenReason === 'creator'
+                  ? 'Hidden by creator'
+                  : 'Hidden by tag'
+                : pkg.hiddenDirect
+                  ? 'Unhide'
+                  : 'Hide'}
             </Button>
             {pkg.isDirect ? (
               <div>

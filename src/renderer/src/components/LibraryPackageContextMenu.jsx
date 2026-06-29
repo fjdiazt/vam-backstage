@@ -217,8 +217,12 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
     }
   }
   const handleToggleHidden = async () => {
+    if (p.hidden && !p.hiddenDirect) {
+      toast(`Package is hidden by BrowserAssist ${p.hiddenReason === 'creator' ? 'creator' : 'tag'} rule`)
+      return
+    }
     try {
-      await useLibraryStore.getState().setPackageHidden(p.filename, !p.hidden)
+      await useLibraryStore.getState().setPackageHidden(p.filename, !p.hiddenDirect)
     } catch (err) {
       toast(`Failed to toggle hidden: ${err.message}`)
     }
@@ -633,12 +637,18 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
               )}
               <ContextMenuSeparator />
               <ContextMenuItem onSelect={() => void handleToggleHidden()}>
-                {p.hidden ? (
+                {p.hiddenDirect ? (
                   <Eye size={12} className="shrink-0 text-text-secondary" />
                 ) : (
                   <EyeOff size={12} className="shrink-0 text-text-secondary" />
                 )}
-                {p.hidden ? 'Unhide' : 'Hide'}
+                {p.hidden && !p.hiddenDirect
+                  ? p.hiddenReason === 'creator'
+                    ? 'Hidden by creator'
+                    : 'Hidden by tag'
+                  : p.hiddenDirect
+                    ? 'Unhide'
+                    : 'Hide'}
               </ContextMenuItem>
               {showDisableDialog ? (
                 <ContextMenuItem onSelect={() => setDisableOpen(true)} disabled={!detail}>
