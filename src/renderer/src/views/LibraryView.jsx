@@ -5,6 +5,7 @@ import {
   List,
   AlertTriangle,
   Eye,
+  EyeOff,
   Power,
   Plus,
   Trash2,
@@ -183,6 +184,12 @@ function filterPackagesByEnabledStorage(items, enabledFilter) {
   return items.filter((p) => p.storageState === enabledFilter)
 }
 
+function filterPackagesByVisibility(items, visibilityFilter) {
+  if (visibilityFilter === 'hidden') return items.filter((p) => p.hidden)
+  if (visibilityFilter === 'all') return items
+  return items.filter((p) => !p.hidden)
+}
+
 export default function LibraryView({ onNavigate, navContext, active = true }) {
   const {
     packages,
@@ -193,6 +200,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     authorSearch,
     statusFilter,
     enabledFilter,
+    visibilityFilter,
     selectedTypes,
     selectedTags,
     selectedLabelIds,
@@ -215,6 +223,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     setAuthorSearch,
     setStatusFilter,
     setEnabledFilter,
+    setVisibilityFilter,
     toggleType,
     selectSingleType,
     setSelectedTags,
@@ -342,6 +351,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
   const statusCounts = useMemo(() => {
     if (!packagesLoaded) return { direct: '…', dependency: '…', broken: '…', orphan: '…', local: '…' }
     let items = baseFiltered
+    items = filterPackagesByVisibility(items, visibilityFilter)
     items = filterPackagesBySelectedTypes(items, selectedTypes)
     items = filterPackagesByEnabledStorage(items, enabledFilter)
     items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
@@ -359,11 +369,12 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
       if (p.isLocalOnly) local++
     }
     return { direct, dependency, broken, orphan, local }
-  }, [packagesLoaded, baseFiltered, selectedTypes, enabledFilter, selectedTags, selectedLabelIds])
+  }, [packagesLoaded, baseFiltered, visibilityFilter, selectedTypes, enabledFilter, selectedTags, selectedLabelIds])
 
   const updateFacetCount = useMemo(() => {
     if (!updateCheckResults) return updateCheckLoading ? '…' : '?'
     let items = baseFiltered
+    items = filterPackagesByVisibility(items, visibilityFilter)
     items = filterPackagesBySelectedTypes(items, selectedTypes)
     items = filterPackagesByEnabledStorage(items, enabledFilter)
     items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
@@ -375,6 +386,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     return n
   }, [
     baseFiltered,
+    visibilityFilter,
     selectedTypes,
     enabledFilter,
     selectedTags,
@@ -385,6 +397,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
 
   const typeCounts = useMemo(() => {
     let items = filterPackagesByStatus(baseFiltered, statusFilter, updateCheckResults)
+    items = filterPackagesByVisibility(items, visibilityFilter)
     items = filterPackagesByEnabledStorage(items, enabledFilter)
     items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
     items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes))
@@ -394,11 +407,21 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
       counts[label] = (counts[label] || 0) + 1
     }
     return counts
-  }, [baseFiltered, statusFilter, enabledFilter, selectedTypes, selectedTags, selectedLabelIds, updateCheckResults])
+  }, [
+    baseFiltered,
+    statusFilter,
+    visibilityFilter,
+    enabledFilter,
+    selectedTypes,
+    selectedTags,
+    selectedLabelIds,
+    updateCheckResults,
+  ])
 
   /** Facet counts for Enabled filter: respects status/type/tags/labels but not enabled itself */
   const enabledFilterCounts = useMemo(() => {
     let items = filterPackagesByStatus(baseFiltered, statusFilter, updateCheckResults)
+    items = filterPackagesByVisibility(items, visibilityFilter)
     items = filterPackagesBySelectedTypes(items, selectedTypes)
     items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
     items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes))
@@ -411,10 +434,24 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
       else if (p.storageState === 'enabled') enabled++
     }
     return { all: items.length, enabled, disabled, offloaded }
-  }, [baseFiltered, statusFilter, selectedTypes, selectedTags, selectedLabelIds, updateCheckResults])
+  }, [baseFiltered, statusFilter, visibilityFilter, selectedTypes, selectedTags, selectedLabelIds, updateCheckResults])
+
+  const visibilityCounts = useMemo(() => {
+    let items = filterPackagesByStatus(baseFiltered, statusFilter, updateCheckResults)
+    items = filterPackagesByEnabledStorage(items, enabledFilter)
+    items = filterPackagesBySelectedTypes(items, selectedTypes)
+    items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
+    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes))
+    let hidden = 0
+    for (const p of items) {
+      if (p.hidden) hidden++
+    }
+    return { all: items.length, visible: items.length - hidden, hidden }
+  }, [baseFiltered, statusFilter, enabledFilter, selectedTypes, selectedTags, selectedLabelIds, updateCheckResults])
 
   const visibleLabels = useMemo(() => {
     let items = filterPackagesByStatus(baseFiltered, statusFilter, updateCheckResults)
+    items = filterPackagesByVisibility(items, visibilityFilter)
     items = filterPackagesByEnabledStorage(items, enabledFilter)
     items = filterPackagesBySelectedTypes(items, selectedTypes)
     items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
@@ -422,6 +459,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
   }, [
     baseFiltered,
     statusFilter,
+    visibilityFilter,
     updateCheckResults,
     enabledFilter,
     selectedTypes,
@@ -432,6 +470,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
 
   const filtered = useMemo(() => {
     let result = filterPackagesByStatus(baseFiltered, statusFilter, updateCheckResults)
+    result = filterPackagesByVisibility(result, visibilityFilter)
     result = filterPackagesByEnabledStorage(result, enabledFilter)
     result = filterPackagesBySelectedTypes(result, selectedTypes)
     result = result.filter((p) => packageMatchesSelectedTags(p, selectedTags))
@@ -452,6 +491,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
   }, [
     baseFiltered,
     statusFilter,
+    visibilityFilter,
     enabledFilter,
     selectedTypes,
     selectedTags,
@@ -504,6 +544,19 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
             title: 'Dependencies referenced by your packages but not installed locally',
           },
           { value: 'updates', label: 'Updates', count: updateFacetCount },
+        ],
+      },
+      {
+        key: 'visibility',
+        label: 'Visibility',
+        type: 'list',
+        value: visibilityFilter,
+        onChange: setVisibilityFilter,
+        listCollapsible: false,
+        items: [
+          { value: 'visible', label: 'Visible', count: visibilityCounts.visible },
+          { value: 'hidden', label: 'Hidden', count: visibilityCounts.hidden },
+          { value: 'all', label: 'All', count: visibilityCounts.all },
         ],
       },
       {
@@ -605,10 +658,12 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     [
       statusFilter,
       enabledFilter,
+      visibilityFilter,
       selectedTypes,
       typeCounts,
       statusCounts,
       enabledFilterCounts,
+      visibilityCounts,
       backendCounts,
       updateFacetCount,
       authorSearch,
@@ -623,6 +678,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
       updateCheckLoading,
       updateCheckResults,
       setStatusFilter,
+      setVisibilityFilter,
       toggleType,
       selectSingleType,
       setEnabledFilter,
@@ -640,7 +696,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
   const bulkToggleIntent = useLibraryStore((s) => s.bulkToggleIntent)
   const selectedBulkSet = useMemo(() => new Set(bulkSelectedFilenames), [bulkSelectedFilenames])
 
-  const scrollResetKey = `${search}\0${authorSearch}\0${statusFilter}\0${enabledFilter}\0${selectedTypes.join(',')}\0${selectedTags.join(',')}\0${selectedLabelIds.join(',')}\0${primarySort}\0${secondarySort}\0${license}`
+  const scrollResetKey = `${search}\0${authorSearch}\0${statusFilter}\0${enabledFilter}\0${visibilityFilter}\0${selectedTypes.join(',')}\0${selectedTags.join(',')}\0${selectedLabelIds.join(',')}\0${primarySort}\0${secondarySort}\0${license}`
 
   const lastSelectedIdxRef = useRef(0)
   const prevScrollResetKeyRef = useRef(scrollResetKey)
@@ -767,6 +823,18 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     },
     [toggleBulkSelect],
   )
+
+  const handlePackageHiddenToggle = useCallback(async (pkg) => {
+    if (pkg.hidden && !pkg.hiddenDirect) {
+      toast(`Package is hidden by BrowserAssist ${pkg.hiddenReason === 'creator' ? 'creator' : 'tag'} rule`)
+      return
+    }
+    try {
+      await useLibraryStore.getState().setPackageHidden(pkg.filename, !pkg.hiddenDirect)
+    } catch (err) {
+      toast(`Failed to toggle hidden: ${err.message}`)
+    }
+  }, [])
 
   const bulkEnabledState = useMemo(() => {
     const items = filtered.filter((p) => bulkSelectedFilenames.includes(p.filename))
@@ -1232,6 +1300,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
                     bulkMode={bulkActive}
                     bulkSelected={selectedBulkSet.has(pkg.filename)}
                     onFilterAuthor={handleFilterAuthor}
+                    onToggleHidden={handlePackageHiddenToggle}
                     mode={compactCards ? 'minimal' : 'medium'}
                     hideType={selectedTypes.length === 1}
                     dimmed={dimUpdateUnavailable}
@@ -1985,6 +2054,17 @@ function LibraryDetailPanel({ pkg, onNavigate, onFilterAuthor, updateInfo }) {
       toast(`Failed to toggle package: ${err.message}`)
     }
   }
+  const handleToggleHidden = async () => {
+    if (pkg.hidden && !pkg.hiddenDirect) {
+      toast(`Package is hidden by BrowserAssist ${pkg.hiddenReason === 'creator' ? 'creator' : 'tag'} rule`)
+      return
+    }
+    try {
+      await useLibraryStore.getState().setPackageHidden(pkg.filename, !pkg.hiddenDirect)
+    } catch (err) {
+      toast(`Failed to toggle hidden: ${err.message}`)
+    }
+  }
   const handlePromote = async () => {
     try {
       await window.api.packages.promote(pkg.filename)
@@ -2141,6 +2221,16 @@ function LibraryDetailPanel({ pkg, onNavigate, onFilterAuthor, updateInfo }) {
                 <Compass size={12} /> View on Hub
               </Button>
             )}
+            <Button variant="outline" onClick={handleToggleHidden} className="w-full text-[11px]">
+              {pkg.hiddenDirect ? <Eye size={12} /> : <EyeOff size={12} />}
+              {pkg.hidden && !pkg.hiddenDirect
+                ? pkg.hiddenReason === 'creator'
+                  ? 'Hidden by creator'
+                  : 'Hidden by tag'
+                : pkg.hiddenDirect
+                  ? 'Unhide'
+                  : 'Hide'}
+            </Button>
             {pkg.isDirect ? (
               <div>
                 <div className="flex gap-1.5">

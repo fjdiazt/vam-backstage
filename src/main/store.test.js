@@ -15,6 +15,8 @@ import {
   getTagCounts,
   getAuthorCounts,
   getStats,
+  setContentDerivedHiddenRules,
+  setPackageDerivedHiddenMap,
 } from './store.js'
 import { setPackagesIndexForTests } from './hub/packages-json.js'
 
@@ -32,6 +34,8 @@ let tmp
 beforeEach(async () => {
   tmp = await mkTempVamDir()
   await openTestDatabase(tmp.dbPath)
+  setPackageDerivedHiddenMap(new Map())
+  setContentDerivedHiddenRules({ hiddenTagsByResourceType: new Map(), hiddenCreatorsByResourceType: new Map() })
 })
 
 afterEach(async () => {
@@ -572,6 +576,46 @@ describe('buildFromDb — counts / filters', () => {
 })
 
 describe('buildFromDb — package summary enrichment', () => {
+  it('includes package hidden state on summaries and details', async () => {
+    const db = getDb()
+    seedPackage(db, {
+      filename: 'Hidden.Pkg.1.var',
+      creator: 'Hidden',
+      package_name: 'Hidden.Pkg',
+      version: '1',
+      is_direct: 1,
+    })
+    db.prepare('UPDATE packages SET hidden = 1 WHERE filename = ?').run('Hidden.Pkg.1.var')
+
+    buildFromDb()
+
+    expect(getFilteredPackages().find((p) => p.filename === 'Hidden.Pkg.1.var')?.hidden).toBe(true)
+    expect(getPackageDetail('Hidden.Pkg.1.var').hidden).toBe(true)
+  })
+
+  it('uses derived BrowserAssist hidden state as effective package hidden', async () => {
+    const db = getDb()
+    seedPackage(db, {
+      filename: 'Derived.Pkg.1.var',
+      creator: 'Derived',
+      package_name: 'Derived.Pkg',
+      version: '1',
+      is_direct: 1,
+    })
+    setPackageDerivedHiddenMap(new Map([['Derived.Pkg.1.var', { hiddenByTag: true, hiddenByCreator: false }]]))
+
+    buildFromDb()
+
+    const pkg = getFilteredPackages().find((p) => p.filename === 'Derived.Pkg.1.var')
+    expect(pkg).toMatchObject({
+      hidden: true,
+      hiddenDirect: false,
+      hiddenByTag: true,
+      hiddenByCreator: false,
+      hiddenReason: 'tag',
+    })
+  })
+
   it('includes content labels on package summaries', async () => {
     const db = getDb()
     seedPackage(db, {
@@ -596,6 +640,73 @@ describe('buildFromDb — package summary enrichment', () => {
     const p = getFilteredPackages().find((x) => x.filename === 'Labels.P.1.var')
     expect(p?.contentLabelIds).toEqual([label.id])
     expect(p?.contentLabelCategories[label.id]).toEqual(['Looks'])
+  })
+
+  it('uses BrowserAssist hidden labels as effective content hidden', async () => {
+    const db = getDb()
+    seedPackage(db, {
+      filename: 'Hidden.Content.1.var',
+      creator: 'Hidden',
+      package_name: 'Hidden.Content',
+      version: '1',
+      is_direct: 1,
+    })
+    seedContent(db, {
+      package_filename: 'Hidden.Content.1.var',
+      internal_path: 'Saves/scene/unwanted.json',
+      display_name: 'Unwanted',
+      type: 'scene',
+    })
+    const label = findOrCreateLabel('hidden:unwanted')
+    const item = { packageFilename: 'Hidden.Content.1.var', internalPath: 'Saves/scene/unwanted.json' }
+    applyLabelToContents(label.id, [item])
+    setLabelContentSource(label.id, item.packageFilename, item.internalPath, LABEL_SOURCE_BROWSERASSIST, 'Scenes')
+    setContentDerivedHiddenRules({
+      hiddenTagsByResourceType: new Map([['Scene', new Set(['hidden:unwanted'])]]),
+      hiddenCreatorsByResourceType: new Map(),
+    })
+
+    buildFromDb()
+
+    const content = getFilteredContents().find((c) => c.packageFilename === 'Hidden.Content.1.var')
+    expect(content).toMatchObject({
+      hidden: true,
+      hiddenDirect: false,
+      hiddenByTag: true,
+      hiddenByCreator: false,
+      hiddenReason: 'tag',
+    })
+  })
+
+  it('uses BrowserAssist Scene hidden labels for scene-look content', async () => {
+    const db = getDb()
+    seedPackage(db, {
+      filename: 'Hidden.LookScene.1.var',
+      creator: 'Hidden',
+      package_name: 'Hidden.LookScene',
+      version: '1',
+      is_direct: 1,
+    })
+    seedContent(db, {
+      package_filename: 'Hidden.LookScene.1.var',
+      internal_path: 'Saves/scene/look.json',
+      display_name: 'Look Scene',
+      type: 'scene',
+    })
+    const label = findOrCreateLabel('hidden:unwanted')
+    const item = { packageFilename: 'Hidden.LookScene.1.var', internalPath: 'Saves/scene/look.json' }
+    applyLabelToContents(label.id, [item])
+    setLabelContentSource(label.id, item.packageFilename, item.internalPath, LABEL_SOURCE_BROWSERASSIST, 'Looks')
+    setContentDerivedHiddenRules({
+      hiddenTagsByResourceType: new Map([['Scene', new Set(['hidden:unwanted'])]]),
+      hiddenCreatorsByResourceType: new Map(),
+    })
+
+    buildFromDb()
+
+    const content = getFilteredContents().find((c) => c.packageFilename === 'Hidden.LookScene.1.var')
+    expect(content).toMatchObject({ hidden: true, hiddenByTag: true, hiddenReason: 'tag' })
+    expect(content.labelSourceCategories[label.id]).toBe('Looks')
   })
 
   it('noLookPresetTag when type is Looks but no look items', async () => {

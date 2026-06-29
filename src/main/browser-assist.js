@@ -2,6 +2,7 @@ import { readFile, writeFile, readdir } from 'fs/promises'
 import { join } from 'path'
 import { existsSync } from 'fs'
 import { categoryOf } from '@shared/content-types.js'
+import { BA_VAR_PACKAGES_TYPE, normalizeBrowserAssistResourceType } from '@shared/browser-assist-resource-types.js'
 import {
   getPackageIndex,
   getContentByPackage,
@@ -11,6 +12,9 @@ import {
   getLabelContentSourcesMap,
   getLabelNameById,
   refreshLabels,
+  buildFromDb,
+  setPackageDerivedHiddenMap,
+  setContentDerivedHiddenRules,
 } from './store.js'
 import {
   LABEL_SOURCE_BACKSTAGE,
@@ -18,11 +22,15 @@ import {
   applyLabelToContents,
   clearLabelContentSource,
   findOrCreateLabel,
+  getPackageHidden,
   removeLabelFromContents,
   setLabelContentSource,
+  setPackageHidden,
 } from './db.js'
+import { readPackageHiddenPrefs } from './package-prefs.js'
 
 const BA_REL_PARTS = ['Saves', 'PluginData', 'JayJayWon', 'BrowserAssist', 'VARResourcesUserData']
+const BA_SETTINGS_PARTS = ['Saves', 'PluginData', 'JayJayWon', 'BrowserAssist', 'BASettings.cfg']
 const MANAGED_SCENE_TAGS = new Set(['scene-real', 'scene-look', 'scene-other'])
 const USER_CATEGORY = 'User'
 
@@ -37,6 +45,172 @@ export function browserAssistSettingsDir(vamDir) {
 export function browserAssistSettingsDirExists(vamDir) {
   if (!vamDir || typeof vamDir !== 'string') return false
   return existsSync(browserAssistSettingsDir(vamDir))
+}
+
+export function applyBrowserAssistPackageHidden(currentHidden, baHidden) {
+  return typeof baHidden === 'boolean' ? baHidden : currentHidden
+}
+
+export function browserAssistSettingsPath(vamDir) {
+  return join(vamDir, ...BA_SETTINGS_PARTS)
+}
+
+function strings(value) {
+  return Array.isArray(value) ? value.filter((x) => typeof x === 'string') : []
+}
+
+function includesVarPackages(value) {
+  return strings(value).some((x) => normalizeBrowserAssistResourceType(x) === BA_VAR_PACKAGES_TYPE)
+}
+
+function addToSetMap(map, key, value) {
+  if (!key || !value) return
+  if (!map.has(key)) map.set(key, new Set())
+  map.get(key).add(value)
+}
+
+export function parseBrowserAssistPackageHiddenRules(settings) {
+  const hiddenTags = new Set()
+  const contentHiddenTagsByResourceType = new Map()
+  const resourceSettings =
+    settings?.ResourceSettings && typeof settings.ResourceSettings === 'object' ? settings.ResourceSettings : {}
+  for (const [resourceType, config] of Object.entries(resourceSettings)) {
+    const type = normalizeBrowserAssistResourceType(resourceType)
+    if (type === BA_VAR_PACKAGES_TYPE) {
+      for (const tag of strings(config?.hiddenTags)) hiddenTags.add(tag)
+      continue
+    }
+    for (const tag of strings(config?.hiddenTags)) addToSetMap(contentHiddenTagsByResourceType, type, tag)
+  }
+  const hiddenCreators = new Set()
+  const contentHiddenCreatorsByResourceType = new Map()
+  const creatorSettings = Array.isArray(settings?.creatorSettings) ? settings.creatorSettings : []
+  for (const entry of creatorSettings) {
+    const name = typeof entry?.creatorName === 'string' ? entry.creatorName : ''
+    if (name && includesVarPackages(entry.hiddenResourceTypes)) hiddenCreators.add(name.toLowerCase())
+    for (const resourceType of strings(entry.hiddenResourceTypes)) {
+      const type = normalizeBrowserAssistResourceType(resourceType)
+      if (type === BA_VAR_PACKAGES_TYPE) continue
+      addToSetMap(contentHiddenCreatorsByResourceType, type, name.toLowerCase())
+    }
+    for (const resourceType of strings(entry.hiddenAtomPresetResourceTypes))
+      addToSetMap(
+        contentHiddenCreatorsByResourceType,
+        normalizeBrowserAssistResourceType(resourceType),
+        name.toLowerCase(),
+      )
+  }
+  return { hiddenTags, hiddenCreators, contentHiddenTagsByResourceType, contentHiddenCreatorsByResourceType }
+}
+
+async function readBrowserAssistPackageHiddenRules(vamDir) {
+  const path = browserAssistSettingsPath(vamDir)
+  if (!existsSync(path)) return { hiddenTags: new Set(), hiddenCreators: new Set() }
+  return parseBrowserAssistPackageHiddenRules(JSON.parse(await readFile(path, 'utf8')))
+}
+
+export async function syncBrowserAssistDerivedPackageHidden(
+  vamDir,
+  {
+    packageIndex = getPackageIndex,
+    labelsByPackageMap = getLabelsByPackageMap,
+    labelNameById = getLabelNameById,
+    readRules = readBrowserAssistPackageHiddenRules,
+    writeDerived = setPackageDerivedHiddenMap,
+  } = {},
+) {
+  const errors = []
+  let rules
+  try {
+    rules = await readRules(vamDir)
+  } catch (err) {
+    errors.push(`BASettings.cfg: package hidden rules read failed — ${err.message}`)
+    rules = { hiddenTags: new Set(), hiddenCreators: new Set() }
+  }
+
+  const labelsByPackage = labelsByPackageMap()
+  const map = new Map()
+  for (const [filename, pkg] of packageIndex()) {
+    const labelIds = labelsByPackage.get(filename) || []
+    const hiddenByTag = labelIds.some((id) => rules.hiddenTags.has(labelNameById(id)))
+    const hiddenByCreator = rules.hiddenCreators.has(String(pkg.creator || '').toLowerCase())
+    if (hiddenByTag || hiddenByCreator) map.set(filename, { hiddenByTag, hiddenByCreator })
+  }
+  writeDerived(map)
+  return { packagesHiddenDerived: map.size, errors }
+}
+
+export async function syncBrowserAssistDerivedContentHidden(
+  vamDir,
+  { readRules = readBrowserAssistPackageHiddenRules, writeRules = setContentDerivedHiddenRules } = {},
+) {
+  const errors = []
+  let rules
+  try {
+    rules = await readRules(vamDir)
+  } catch (err) {
+    errors.push(`BASettings.cfg: content hidden rules read failed — ${err.message}`)
+    rules = { contentHiddenTagsByResourceType: new Map(), contentHiddenCreatorsByResourceType: new Map() }
+  }
+  const hiddenTagsByResourceType =
+    rules.contentHiddenTagsByResourceType instanceof Map ? rules.contentHiddenTagsByResourceType : new Map()
+  const hiddenCreatorsByResourceType =
+    rules.contentHiddenCreatorsByResourceType instanceof Map ? rules.contentHiddenCreatorsByResourceType : new Map()
+  writeRules({ hiddenTagsByResourceType, hiddenCreatorsByResourceType })
+  return {
+    contentHiddenDerivedTags: [...hiddenTagsByResourceType.values()].reduce((sum, set) => sum + set.size, 0),
+    contentHiddenDerivedCreators: [...hiddenCreatorsByResourceType.values()].reduce((sum, set) => sum + set.size, 0),
+    errors,
+  }
+}
+
+export async function loadBrowserAssistDerivedHiddenRules(vamDir) {
+  const packages = await syncBrowserAssistDerivedPackageHidden(vamDir)
+  const contents = await syncBrowserAssistDerivedContentHidden(vamDir)
+  return { ...packages, ...contents, errors: [...packages.errors, ...contents.errors] }
+}
+
+export async function syncBrowserAssistPackageHidden(
+  vamDir,
+  {
+    packageIndex = getPackageIndex,
+    readHiddenPrefs = readPackageHiddenPrefs,
+    readCurrentHidden = getPackageHidden,
+    writeHidden = setPackageHidden,
+    refreshStore = buildFromDb,
+  } = {},
+) {
+  const errors = []
+  let packagesHiddenImported = 0
+  const packageHiddenByName = new Map()
+
+  for (const [filename, pkg] of packageIndex()) {
+    const packageName = typeof pkg.package_name === 'string' ? pkg.package_name : ''
+    if (!packageName) continue
+
+    let baHidden
+    if (packageHiddenByName.has(packageName)) {
+      baHidden = packageHiddenByName.get(packageName)
+    } else {
+      try {
+        baHidden = await readHiddenPrefs(vamDir, packageName)
+      } catch (err) {
+        errors.push(`${packageName}: package hidden prefs read failed — ${err.message}`)
+        baHidden = null
+      }
+      packageHiddenByName.set(packageName, baHidden)
+    }
+
+    const currentHidden = readCurrentHidden(filename)
+    const nextHidden = applyBrowserAssistPackageHidden(currentHidden, baHidden)
+    if (nextHidden !== currentHidden) {
+      writeHidden(filename, nextHidden)
+      packagesHiddenImported++
+    }
+  }
+
+  if (packagesHiddenImported > 0) refreshStore({ skipGraph: true })
+  return { packagesHiddenImported, errors }
 }
 
 /**
@@ -239,6 +413,10 @@ function shallowTagsEqual(a, b) {
  *   labelsImported: number,
  *   labelsRemoved: number,
  *   labelsExported: number,
+ *   packagesHiddenImported: number,
+ *   packagesHiddenDerived: number,
+ *   contentHiddenDerivedTags: number,
+ *   contentHiddenDerivedCreators: number,
  *   skippedNoMatch: number,
  *   errors: string[],
  * }>}
@@ -253,8 +431,23 @@ export async function syncBrowserAssistTags(vamDir) {
   let labelsImported = 0
   let labelsRemoved = 0
   let labelsExported = 0
+  let packagesHiddenImported = 0
+  let packagesHiddenDerived = 0
+  let contentHiddenDerivedTags = 0
+  let contentHiddenDerivedCreators = 0
   let skippedNoMatch = 0
   let labelsChanged = false
+
+  const packageHiddenSync = await syncBrowserAssistPackageHidden(vamDir)
+  packagesHiddenImported = packageHiddenSync.packagesHiddenImported
+  errors.push(...packageHiddenSync.errors)
+  const derivedHiddenSync = await syncBrowserAssistDerivedPackageHidden(vamDir)
+  packagesHiddenDerived = derivedHiddenSync.packagesHiddenDerived
+  errors.push(...derivedHiddenSync.errors)
+  const contentDerivedHiddenSync = await syncBrowserAssistDerivedContentHidden(vamDir)
+  contentHiddenDerivedTags = contentDerivedHiddenSync.contentHiddenDerivedTags
+  contentHiddenDerivedCreators = contentDerivedHiddenSync.contentHiddenDerivedCreators
+  errors.push(...contentDerivedHiddenSync.errors)
 
   if (!existsSync(dir)) {
     return {
@@ -265,8 +458,12 @@ export async function syncBrowserAssistTags(vamDir) {
       labelsImported: 0,
       labelsRemoved: 0,
       labelsExported: 0,
+      packagesHiddenImported,
+      packagesHiddenDerived,
+      contentHiddenDerivedTags,
+      contentHiddenDerivedCreators,
       skippedNoMatch: 0,
-      errors: [`BrowserAssist directory not found: ${dir}`],
+      errors: [...errors, `BrowserAssist directory not found: ${dir}`],
     }
   }
 
@@ -282,8 +479,12 @@ export async function syncBrowserAssistTags(vamDir) {
       labelsImported: 0,
       labelsRemoved: 0,
       labelsExported: 0,
+      packagesHiddenImported,
+      packagesHiddenDerived,
+      contentHiddenDerivedTags,
+      contentHiddenDerivedCreators,
       skippedNoMatch: 0,
-      errors: [`Failed to read BrowserAssist directory: ${err.message}`],
+      errors: [...errors, `Failed to read BrowserAssist directory: ${err.message}`],
     }
   }
 
@@ -415,6 +616,10 @@ export async function syncBrowserAssistTags(vamDir) {
     labelsImported,
     labelsRemoved,
     labelsExported,
+    packagesHiddenImported,
+    packagesHiddenDerived,
+    contentHiddenDerivedTags,
+    contentHiddenDerivedCreators,
     skippedNoMatch,
     errors,
   }

@@ -23,7 +23,7 @@ Package hidden state semantics:
 - `hidden: false` = explicitly visible
 - `hidden: true` = hidden
 
-BrowserAssist wins conflicts. If Backstage DB and BrowserAssist prefs disagree during sync/rescan, Backstage imports BrowserAssist state into DB and does not overwrite it.
+BrowserAssist wins conflicts. If Backstage DB and BrowserAssist prefs disagree during sync/rescan, Backstage imports BrowserAssist state into DB and does not overwrite it. This sync only covers direct package hidden state; BrowserAssist derived hidden states from hide-tags or hidden creators are not flattened into Backstage package hidden.
 
 ## Storage
 
@@ -73,6 +73,7 @@ Package card/table/context actions get Hide/Unhide. Hidden rows are excluded fro
 - Do not sync Hub hidden items.
 - Do not hide package contents when hiding a Library package.
 - Do not overwrite unrelated BrowserAssist prefs fields.
+- Do not import BrowserAssist tag-hidden or creator-hidden package state in this first pass.
 
 ## Testing
 

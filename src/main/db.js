@@ -4,7 +4,7 @@ import { app } from 'electron'
 import { join } from 'path'
 import { LOCAL_PACKAGE_FILENAME } from '@shared/local-package.js'
 
-const SCHEMA_VERSION = 27
+const SCHEMA_VERSION = 28
 
 /**
  * Normalize a value to a non-negative integer string, or null. Hub resource/user
@@ -119,6 +119,7 @@ function migrate() {
     if (current < 25) applyV25()
     if (current < 26) applyV26()
     if (current < 27) applyV27()
+    if (current < 28) applyV28()
   }
 
   ensureLocalPackage()
@@ -379,6 +380,10 @@ function applyV27() {
   db.exec(`ALTER TABLE label_content_sources ADD COLUMN ba_category TEXT`)
 }
 
+function applyV28() {
+  db.exec('ALTER TABLE packages ADD COLUMN hidden INTEGER')
+}
+
 /**
  * Ensure the synthetic "local content" package row exists. Loose files under
  * `vamDir/Saves` and `vamDir/Custom` are stored as `contents` rows that point
@@ -433,7 +438,8 @@ function createSchema() {
       type_override TEXT,
       is_corrupted INTEGER NOT NULL DEFAULT 0,
       hub_detail_applied_at INTEGER,
-      hub_name_checked_at INTEGER
+      hub_name_checked_at INTEGER,
+      hidden INTEGER
     );
 
     CREATE INDEX IF NOT EXISTS idx_packages_package_name ON packages(package_name);
@@ -555,6 +561,17 @@ export function deletePackage(filename) {
 
 export function setPackageDirect(filename, isDirect) {
   stmt('UPDATE packages SET is_direct = ? WHERE filename = ?').run(isDirect ? 1 : 0, filename)
+}
+
+export function getPackageHidden(filename) {
+  const row = stmt('SELECT hidden FROM packages WHERE filename = ?').get(filename)
+  if (!row || row.hidden == null) return null
+  return !!row.hidden
+}
+
+export function setPackageHidden(filename, hidden) {
+  const value = hidden == null ? null : hidden ? 1 : 0
+  return stmt('UPDATE packages SET hidden = ? WHERE filename = ?').run(value, filename).changes
 }
 
 /** @param {string | null} typeOverride — null clears override (use scanned / Hub type) */

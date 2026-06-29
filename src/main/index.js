@@ -18,6 +18,7 @@ import { fetchPackagesJson, loadPackagesJsonFromCache } from './hub/packages-jso
 import { scanHubDetails } from './hub/scanner.js'
 import { initHubAuthWatch } from './hub/interactions.js'
 import { initAutoUpdater } from './updater.js'
+import { loadBrowserAssistDerivedHiddenRules } from './browser-assist.js'
 import {
   attachMainWindowStatePersistence,
   loadMainWindowState,
@@ -214,7 +215,15 @@ async function setupHubConsent() {
   })
 }
 
-function initBackend() {
+async function loadBrowserAssistRulesForIndexes(vamDir) {
+  try {
+    await loadBrowserAssistDerivedHiddenRules(vamDir)
+  } catch (err) {
+    console.warn('[browser-assist] hidden rules load failed:', err.message)
+  }
+}
+
+async function initBackend() {
   // Register IPC before DB open so a failed migration/open still exposes handlers
   // (renderer otherwise gets "No handler registered" for every channel).
   registerAllHandlers()
@@ -240,6 +249,7 @@ function initBackend() {
   if (vamDir && scanDone) {
     try {
       buildFromDb()
+      await loadBrowserAssistRulesForIndexes(vamDir)
     } catch {}
     // startWatcher runs after startupScan (see startupScan finally) — starting the
     // FS watcher before the full library scan contends on the same volume and can
@@ -270,6 +280,7 @@ async function startupScan() {
         setPrefsMap(prefs)
       } catch {}
       buildFromDb()
+      await loadBrowserAssistRulesForIndexes(vamDir)
     }
 
     notify('packages:updated')
@@ -318,7 +329,7 @@ app.whenReady().then(async () => {
   })
 
   try {
-    initBackend()
+    await initBackend()
   } catch (err) {
     console.error('Backend init failed:', err)
   }

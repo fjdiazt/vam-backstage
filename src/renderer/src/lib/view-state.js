@@ -13,6 +13,7 @@ const VALID_ENABLED = new Set(['all', 'enabled', 'disabled', 'offloaded'])
 const VALID_PACKAGE_FILTER = new Set(['all', 'direct', 'deps', 'local'])
 const VALID_PACKAGE_STATUS = new Set(['all', 'enabled', 'disabled', 'offloaded'])
 const VALID_VISIBILITY = new Set(['all', 'visible', 'hidden', 'favorites'])
+const VALID_LIBRARY_VISIBILITY = new Set(['all', 'visible', 'hidden'])
 
 const s = (value, fallback = '') => (typeof value === 'string' ? value : fallback)
 const b = (value) => value === true
@@ -63,6 +64,7 @@ export function sanitizeLibraryState(raw) {
     authorSearch: s(r.authorSearch),
     statusFilter: VALID_LIBRARY_STATUS.has(r.statusFilter) ? r.statusFilter : 'direct',
     enabledFilter: VALID_ENABLED.has(r.enabledFilter) ? r.enabledFilter : 'all',
+    visibilityFilter: VALID_LIBRARY_VISIBILITY.has(r.visibilityFilter) ? r.visibilityFilter : 'visible',
     selectedTypes: strings(r.selectedTypes),
     selectedTags: strings(r.selectedTags),
     selectedLabelIds: ints(r.selectedLabelIds),

@@ -4,6 +4,7 @@ import {
   Compass,
   Download,
   Eye,
+  EyeOff,
   Power,
   FolderTree,
   Heart,
@@ -213,6 +214,17 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
       toastIfSingleToggleFailed(res)
     } catch (err) {
       toast(`Failed to toggle package: ${err.message}`)
+    }
+  }
+  const handleToggleHidden = async () => {
+    if (p.hidden && !p.hiddenDirect) {
+      toast(`Package is hidden by BrowserAssist ${p.hiddenReason === 'creator' ? 'creator' : 'tag'} rule`)
+      return
+    }
+    try {
+      await useLibraryStore.getState().setPackageHidden(p.filename, !p.hiddenDirect)
+    } catch (err) {
+      toast(`Failed to toggle hidden: ${err.message}`)
     }
   }
   const handlePromote = async () => {
@@ -624,6 +636,20 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
                 </>
               )}
               <ContextMenuSeparator />
+              <ContextMenuItem onSelect={() => void handleToggleHidden()}>
+                {p.hiddenDirect ? (
+                  <Eye size={12} className="shrink-0 text-text-secondary" />
+                ) : (
+                  <EyeOff size={12} className="shrink-0 text-text-secondary" />
+                )}
+                {p.hidden && !p.hiddenDirect
+                  ? p.hiddenReason === 'creator'
+                    ? 'Hidden by creator'
+                    : 'Hidden by tag'
+                  : p.hiddenDirect
+                    ? 'Unhide'
+                    : 'Hide'}
+              </ContextMenuItem>
               {showDisableDialog ? (
                 <ContextMenuItem onSelect={() => setDisableOpen(true)} disabled={!detail}>
                   <Power size={12} className="shrink-0" />

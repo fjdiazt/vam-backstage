@@ -20,6 +20,7 @@ import {
   parseDepRef,
 } from './scanner/graph.js'
 import { categoryOf, isGalleryVisible, isVisible, LOOK_ITEM_EXACT_TYPES, tagOf } from '@shared/content-types.js'
+import { browserAssistResourceTypesForContent } from '@shared/browser-assist-resource-types.js'
 import { getPackagesIndex, loadPackagesJsonFromCache } from './hub/packages-json.js'
 import { isLocalPackage } from '@shared/local-package.js'
 import { packageHasExtractedAppearance, contentHasExtractedAppearance } from './scenes/extract.js'
@@ -93,6 +94,8 @@ let labelIndex = new Map() // label_id → { id, name, color, packageCount, cont
 let labelsByPackage = new Map() // package_filename → number[] of label ids
 let labelsByContent = new Map() // `${package_filename}\0${internal_path}` → number[] of label ids
 let labelContentSources = new Map() // `${package_filename}\0${internal_path}\0${label_id}` → { sourceMask, baCategory }
+let packageDerivedHidden = new Map() // filename → { hiddenByTag, hiddenByCreator }
+let contentDerivedHiddenRules = { hiddenTagsByResourceType: new Map(), hiddenCreatorsByResourceType: new Map() }
 let nonDownloadableRids = new Set() // resource IDs known to be non-downloadable
 let stats = emptyStats()
 
@@ -522,6 +525,45 @@ export function getLabelNameById(id) {
   return labelIndex.get(id)?.name ?? null
 }
 
+export function setPackageDerivedHiddenMap(map) {
+  packageDerivedHidden = map instanceof Map ? map : new Map()
+}
+
+export function setContentDerivedHiddenRules(rules) {
+  contentDerivedHiddenRules = {
+    hiddenTagsByResourceType:
+      rules?.hiddenTagsByResourceType instanceof Map ? rules.hiddenTagsByResourceType : new Map(),
+    hiddenCreatorsByResourceType:
+      rules?.hiddenCreatorsByResourceType instanceof Map ? rules.hiddenCreatorsByResourceType : new Map(),
+  }
+}
+
+function resourceRuleHas(map, resourceTypes, value) {
+  return !!value && resourceTypes.some((type) => map.get(type)?.has(value))
+}
+
+function enrichContentHidden(c) {
+  const hiddenDirect = !!c.hidden
+  const labelIds = labelsByContent.get(c.package_filename + '\0' + c.internal_path) || []
+  const baResourceTypes = browserAssistResourceTypesForContent(c.internal_path, c.type)
+  const hiddenByTag = labelIds.some((id) => {
+    const name = getLabelNameById(id)
+    return resourceRuleHas(contentDerivedHiddenRules.hiddenTagsByResourceType, baResourceTypes, name)
+  })
+  const hiddenByCreator = resourceRuleHas(
+    contentDerivedHiddenRules.hiddenCreatorsByResourceType,
+    baResourceTypes,
+    String(c.creator || '').toLowerCase(),
+  )
+  return {
+    hidden: hiddenDirect || hiddenByTag || hiddenByCreator,
+    hiddenDirect,
+    hiddenByTag,
+    hiddenByCreator,
+    hiddenReason: hiddenDirect ? 'direct' : hiddenByTag ? 'tag' : hiddenByCreator ? 'creator' : null,
+  }
+}
+
 function labelSourceCategoriesForContent(packageFilename, internalPath) {
   const ids = labelsByContent.get(packageFilename + '\0' + internalPath) || []
   if (!ids.length) return {}
@@ -623,6 +665,10 @@ function enrichPackageSummary(pkg) {
   const lookItemCount = lookItemCountByPackage.get(pkg.filename) || 0
   const noLookPresetTag = effectiveType === 'Looks' && lookItemCount === 0
   const hasExtractedAppearancePreset = noLookPresetTag && packageHasExtractedAppearance(pkg.filename)
+  const derivedHidden = packageDerivedHidden.get(pkg.filename) || {}
+  const hiddenDirect = !!pkg.hidden
+  const hiddenByTag = !!derivedHidden.hiddenByTag
+  const hiddenByCreator = !!derivedHidden.hiddenByCreator
   return {
     filename: pkg.filename,
     creator: pkg.creator,
@@ -638,6 +684,11 @@ function enrichPackageSummary(pkg) {
     sizeBytes: pkg.size_bytes,
     removableSize,
     isDirect: !!pkg.is_direct,
+    hidden: hiddenDirect || hiddenByTag || hiddenByCreator,
+    hiddenDirect,
+    hiddenByTag,
+    hiddenByCreator,
+    hiddenReason: hiddenDirect ? 'direct' : hiddenByTag ? 'tag' : hiddenByCreator ? 'creator' : null,
     storageState: pkg.storage_state,
     libraryDirId: pkg.library_dir_id ?? null,
     hubResourceId: pkg.hub_resource_id,
@@ -712,7 +763,7 @@ export function getPackageDetail(filename) {
       type: c.type,
       category: categoryOf(c.type),
       tag: tagOf(c.type),
-      hidden: c.hidden,
+      ...enrichContentHidden(c),
       favorite: c.favorite,
       thumbnailPath: c.thumbnail_path,
       ownLabelIds: labelsByContent.get(c.package_filename + '\0' + c.internal_path) || [],
@@ -782,7 +833,7 @@ export function getFilteredContents(filters = {}) {
     type: c.type,
     category: c.category,
     tag: c.tag,
-    hidden: c.hidden,
+    ...enrichContentHidden(c),
     favorite: c.favorite,
     thumbnailPath: c.thumbnail_path,
     labelSourceCategories: labelSourceCategoriesForContent(c.package_filename, c.internal_path),
@@ -951,8 +1002,9 @@ export function getContentVisibilityCounts() {
     hidden = 0,
     favorites = 0
   for (const c of contentItems) {
+    const visibility = enrichContentHidden(c)
     all++
-    if (c.hidden) hidden++
+    if (visibility.hidden) hidden++
     else visible++
     if (c.favorite) favorites++
   }
