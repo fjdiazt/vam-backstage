@@ -26,11 +26,13 @@ function applyBulkVisibilityFromStore() {
   const { contents, bulkSelectedIds } = useContentStore.getState()
   const items = contents.filter((c) => bulkSelectedIds.includes(c.id))
   if (!items.length) return
-  const hiddenCount = items.filter((i) => i.hidden).length
+  const hiddenCount = items.filter((i) => i.hiddenDirect ?? i.hidden).length
   const allHidden = hiddenCount === items.length
   const hidden = allHidden ? false : true
+  const writableItems = hidden ? items : items.filter((i) => !i.hidden || i.hiddenDirect)
+  if (!writableItems.length) return
   void window.api.contents.setHiddenBatch({
-    items: items.map((c) => ({ id: c.id, packageFilename: c.packageFilename, internalPath: c.internalPath })),
+    items: writableItems.map((c) => ({ id: c.id, packageFilename: c.packageFilename, internalPath: c.internalPath })),
     hidden,
   })
 }
@@ -102,7 +104,7 @@ export function ContentItemContextMenu({ item, onNavigate, onToggleHidden, onTog
   const bulkVisibilityUi = useMemo(() => {
     const items = bulkSelectedIds.map((id) => contents.find((c) => c.id === id)).filter(Boolean)
     if (!items.length) return { label: 'Hide', allHidden: false, mixed: false }
-    const hiddenCount = items.filter((c) => c.hidden).length
+    const hiddenCount = items.filter((c) => c.hiddenDirect ?? c.hidden).length
     const allHidden = hiddenCount === items.length
     const mixed = hiddenCount > 0 && hiddenCount < items.length
     const label = allHidden ? 'Show' : 'Hide'

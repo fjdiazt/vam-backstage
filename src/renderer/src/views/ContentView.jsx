@@ -692,6 +692,10 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
   )
 
   const handleToggleHidden = useCallback(async (item) => {
+    if (item.hidden && !item.hiddenDirect) {
+      toast(`Item is hidden by BrowserAssist ${item.hiddenReason === 'creator' ? 'creator' : 'tag'} rule`)
+      return
+    }
     try {
       await window.api.contents.toggleHidden({
         id: item.id,
@@ -929,7 +933,7 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
   const bulkVisibilityState = useMemo(() => {
     const items = filtered.filter((c) => bulkSelectedIds.includes(c.id))
     if (!items.length) return { disabled: true, mixed: false, allHidden: false }
-    const hiddenCount = items.filter((c) => c.hidden).length
+    const hiddenCount = items.filter((c) => c.hiddenDirect ?? c.hidden).length
     const allHidden = hiddenCount === items.length
     const allVisible = hiddenCount === 0
     return {
@@ -953,6 +957,7 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
     async (hidden) => {
       const items = filtered
         .filter((c) => bulkSelectedIds.includes(c.id))
+        .filter((c) => hidden || !c.hidden || c.hiddenDirect)
         .map((c) => ({
           id: c.id,
           packageFilename: c.packageFilename,

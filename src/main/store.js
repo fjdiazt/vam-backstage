@@ -94,6 +94,7 @@ let labelsByPackage = new Map() // package_filename → number[] of label ids
 let labelsByContent = new Map() // `${package_filename}\0${internal_path}` → number[] of label ids
 let labelContentSources = new Map() // `${package_filename}\0${internal_path}\0${label_id}` → { sourceMask, baCategory }
 let packageDerivedHidden = new Map() // filename → { hiddenByTag, hiddenByCreator }
+let contentDerivedHiddenRules = { hiddenTagsByCategory: new Map(), hiddenCreatorsByCategory: new Map() }
 let nonDownloadableRids = new Set() // resource IDs known to be non-downloadable
 let stats = emptyStats()
 
@@ -527,6 +528,40 @@ export function setPackageDerivedHiddenMap(map) {
   packageDerivedHidden = map instanceof Map ? map : new Map()
 }
 
+export function setContentDerivedHiddenRules(rules) {
+  contentDerivedHiddenRules = {
+    hiddenTagsByCategory: rules?.hiddenTagsByCategory instanceof Map ? rules.hiddenTagsByCategory : new Map(),
+    hiddenCreatorsByCategory:
+      rules?.hiddenCreatorsByCategory instanceof Map ? rules.hiddenCreatorsByCategory : new Map(),
+  }
+}
+
+function categoryRuleHas(map, category, value) {
+  return !!value && !!category && !!map.get(category)?.has(value)
+}
+
+function enrichContentHidden(c) {
+  const hiddenDirect = !!c.hidden
+  const labelIds = labelsByContent.get(c.package_filename + '\0' + c.internal_path) || []
+  const hiddenByTag = labelIds.some((id) => {
+    const name = getLabelNameById(id)
+    const row = labelContentSources.get(`${c.package_filename}\0${c.internal_path}\0${id}`)
+    return categoryRuleHas(contentDerivedHiddenRules.hiddenTagsByCategory, row?.baCategory || c.category, name)
+  })
+  const hiddenByCreator = categoryRuleHas(
+    contentDerivedHiddenRules.hiddenCreatorsByCategory,
+    c.category,
+    String(c.creator || '').toLowerCase(),
+  )
+  return {
+    hidden: hiddenDirect || hiddenByTag || hiddenByCreator,
+    hiddenDirect,
+    hiddenByTag,
+    hiddenByCreator,
+    hiddenReason: hiddenDirect ? 'direct' : hiddenByTag ? 'tag' : hiddenByCreator ? 'creator' : null,
+  }
+}
+
 function labelSourceCategoriesForContent(packageFilename, internalPath) {
   const ids = labelsByContent.get(packageFilename + '\0' + internalPath) || []
   if (!ids.length) return {}
@@ -726,7 +761,7 @@ export function getPackageDetail(filename) {
       type: c.type,
       category: categoryOf(c.type),
       tag: tagOf(c.type),
-      hidden: c.hidden,
+      ...enrichContentHidden(c),
       favorite: c.favorite,
       thumbnailPath: c.thumbnail_path,
       ownLabelIds: labelsByContent.get(c.package_filename + '\0' + c.internal_path) || [],
@@ -796,7 +831,7 @@ export function getFilteredContents(filters = {}) {
     type: c.type,
     category: c.category,
     tag: c.tag,
-    hidden: c.hidden,
+    ...enrichContentHidden(c),
     favorite: c.favorite,
     thumbnailPath: c.thumbnail_path,
     labelSourceCategories: labelSourceCategoriesForContent(c.package_filename, c.internal_path),
@@ -965,8 +1000,9 @@ export function getContentVisibilityCounts() {
     hidden = 0,
     favorites = 0
   for (const c of contentItems) {
+    const visibility = enrichContentHidden(c)
     all++
-    if (c.hidden) hidden++
+    if (visibility.hidden) hidden++
     else visible++
     if (c.favorite) favorites++
   }
