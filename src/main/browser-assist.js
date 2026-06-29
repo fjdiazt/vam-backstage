@@ -7,16 +7,23 @@ import {
   effectivePackageType,
   getLabelsByPackageMap,
   getLabelsByContentMap,
+  getLabelContentSourcesMap,
   getLabelNameById,
+  refreshLabels,
 } from './store.js'
+import {
+  LABEL_SOURCE_BACKSTAGE,
+  LABEL_SOURCE_BROWSERASSIST,
+  applyLabelToContents,
+  clearLabelContentSource,
+  findOrCreateLabel,
+  removeLabelFromContents,
+  setLabelContentSource,
+} from './db.js'
 
 const BA_REL_PARTS = ['Saves', 'PluginData', 'JayJayWon', 'BrowserAssist', 'VARResourcesUserData']
 const MANAGED_SCENE_TAGS = new Set(['scene-real', 'scene-look', 'scene-other'])
 const USER_CATEGORY = 'User'
-// Separate category for our user-defined labels so we can clean-and-rewrite
-// just our entries without touching unrelated User-category tags. BrowserAssist
-// happily round-trips arbitrary string categories.
-const LABEL_CATEGORY = 'Label'
 
 export function browserAssistSettingsDir(vamDir) {
   return join(vamDir, ...BA_REL_PARTS)
@@ -54,20 +61,32 @@ function sceneTagForPackageType(pt) {
  * Each entry carries:
  *   - `sceneType`: effective package type for scene/legacyScene rows (used to derive
  *     scene-real/scene-look/scene-other), or null for non-scene content.
- *   - `labelNames`: union of user-defined label names — own labels on the content row
- *     plus labels inherited from the package the content lives in.
+ *   - `packageLabelNames`: inherited package labels exported to BrowserAssist.
+ *   - `contentLabels`: content labels plus source rows, keyed by label name.
  *
  * Multiple installed package versions share the same `(packageKey, pathKey)` (BA has
  * no version axis). We merge across versions: any version's scene type sticks; label
  * names are unioned so a label set on either v1 or v2 still appears on the BA tag.
  *
- * @returns {Map<string, { sceneType: string|null, labelNames: Set<string> }>}
+ * @returns {Map<string, { packageFilename: string, internalPath: string, sceneType: string|null, packageLabelNames: Set<string>, contentLabels: Map<string, { id: number, sourceMask: number }> }>}
  */
 function buildContentLookup() {
   const packageIndex = getPackageIndex()
   const contentByPackage = getContentByPackage()
   const labelsByPackage = getLabelsByPackageMap()
   const labelsByContent = getLabelsByContentMap()
+  const labelSources = getLabelContentSourcesMap()
+  const sourcesByContent = new Map()
+  for (const [key, sourceMask] of labelSources) {
+    const [packageFilename, internalPath, labelId] = key.split('\0')
+    const contentKey = packageFilename + '\0' + internalPath
+    let rows = sourcesByContent.get(contentKey)
+    if (!rows) {
+      rows = new Map()
+      sourcesByContent.set(contentKey, rows)
+    }
+    rows.set(Number(labelId), sourceMask)
+  }
 
   const lookup = new Map()
   for (const [filename, pkg] of packageIndex) {
@@ -86,20 +105,27 @@ function buildContentLookup() {
       const pathKey = ip.replace(/\\/g, '/').toLowerCase()
       const key = pkgKey + '\0' + pathKey
 
-      const ownIds = labelsByContent.get(filename + '\0' + item.internal_path) || []
-      const labelNames = []
+      const contentKey = filename + '\0' + item.internal_path
+      const ownIds = labelsByContent.get(contentKey) || []
+      const sourceRows = sourcesByContent.get(contentKey) || new Map()
+      const packageLabelNames = []
+      const contentLabels = new Map()
       const seenIds = new Set()
       for (const id of inheritedIds) {
         if (seenIds.has(id)) continue
         seenIds.add(id)
         const name = getLabelNameById(id)
-        if (name) labelNames.push(name)
+        if (name) packageLabelNames.push(name)
       }
       for (const id of ownIds) {
-        if (seenIds.has(id)) continue
-        seenIds.add(id)
         const name = getLabelNameById(id)
-        if (name) labelNames.push(name)
+        if (!name) continue
+        contentLabels.set(name, { id, sourceMask: sourceRows.get(id) ?? LABEL_SOURCE_BACKSTAGE })
+      }
+      for (const [id, sourceMask] of sourceRows) {
+        if (contentLabels.has(getLabelNameById(id))) continue
+        const name = getLabelNameById(id)
+        if (name) contentLabels.set(name, { id, sourceMask })
       }
 
       const isSceneItem = item.type === 'scene' || item.type === 'legacyScene'
@@ -107,11 +133,24 @@ function buildContentLookup() {
 
       let entry = lookup.get(key)
       if (!entry) {
-        entry = { sceneType, labelNames: new Set(labelNames) }
+        entry = {
+          packageFilename: filename,
+          internalPath: item.internal_path,
+          sceneType,
+          packageLabelNames: new Set(packageLabelNames),
+          contentLabels,
+        }
         lookup.set(key, entry)
       } else {
         if (sceneType && !entry.sceneType) entry.sceneType = sceneType
-        for (const n of labelNames) entry.labelNames.add(n)
+        for (const n of packageLabelNames) entry.packageLabelNames.add(n)
+        for (const [name, info] of contentLabels) {
+          const existing = entry.contentLabels.get(name)
+          entry.contentLabels.set(
+            name,
+            existing ? { ...existing, sourceMask: existing.sourceMask | info.sourceMask } : info,
+          )
+        }
       }
     }
   }
@@ -120,45 +159,32 @@ function buildContentLookup() {
 
 /**
  * @param {unknown} tags
- * @param {string} newTagName
- * @returns {Array<{ tagName: string, tagCategory: string }>}
+ * @returns {Set<string>}
  */
-function mergeSceneUserTag(tags, newTagName) {
+export function browserAssistUserTagNames(tags) {
   const arr = Array.isArray(tags) ? tags : []
-  const filtered = arr.filter((t) => {
-    if (!t || typeof t !== 'object') return true
-    if (t.tagCategory !== USER_CATEGORY) return true
-    if (!MANAGED_SCENE_TAGS.has(t.tagName)) return true
-    return false
-  })
-  return [...filtered, { tagName: newTagName, tagCategory: USER_CATEGORY }]
+  return new Set(
+    arr
+      .filter((t) => t && typeof t === 'object' && t.tagCategory === USER_CATEGORY && typeof t.tagName === 'string')
+      .map((t) => t.tagName.trim())
+      .filter((name) => name && !MANAGED_SCENE_TAGS.has(name)),
+  )
 }
 
 /**
- * Reconcile our managed `Label`-category tags with the supplied label names: drop any
- * existing Label-category entries (so removed/renamed labels disappear from BA) and
- * append one entry per current name, sorted for stable serialization.
- *
- * Returns `tags` unchanged when there's nothing to do (no current labels and no stale
- * Label-category entries to remove) so the shallow-equal short-circuit avoids a write.
- *
  * @param {unknown} tags
  * @param {string[]} labelNames
- * @returns {unknown}
+ * @param {string|null} sceneTagName
+ * @returns {Array<{ tagName: string, tagCategory: string }>}
  */
-function mergeLabelTags(tags, labelNames) {
+export function mergeBrowserAssistUserTags(tags, labelNames, sceneTagName = null) {
   const arr = Array.isArray(tags) ? tags : []
-  const hasStaleLabels = arr.some((t) => t && typeof t === 'object' && t.tagCategory === LABEL_CATEGORY)
-  if (labelNames.length === 0 && !hasStaleLabels) return tags
-
-  const filtered = arr.filter((t) => {
-    if (!t || typeof t !== 'object') return true
-    return t.tagCategory !== LABEL_CATEGORY
-  })
-  if (labelNames.length === 0) return filtered
-
-  const sorted = [...labelNames].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
-  return [...filtered, ...sorted.map((n) => ({ tagName: n, tagCategory: LABEL_CATEGORY }))]
+  const filtered = arr.filter((t) => !t || typeof t !== 'object' || t.tagCategory !== USER_CATEGORY)
+  const wanted = new Set(labelNames.map((n) => String(n ?? '').trim()).filter(Boolean))
+  const sorted = [...wanted].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
+  const next = [...filtered, ...sorted.map((n) => ({ tagName: n, tagCategory: USER_CATEGORY }))]
+  if (sceneTagName) next.push({ tagName: sceneTagName, tagCategory: USER_CATEGORY })
+  return next
 }
 
 /**
@@ -177,6 +203,9 @@ function shallowTagsEqual(a, b) {
  *   shardsWritten: number,
  *   resourcesScanned: number,
  *   tagsUpdated: number,
+ *   labelsImported: number,
+ *   labelsRemoved: number,
+ *   labelsExported: number,
  *   skippedNoMatch: number,
  *   errors: string[],
  * }>}
@@ -188,7 +217,11 @@ export async function syncBrowserAssistTags(vamDir) {
   let shardsWritten = 0
   let resourcesScanned = 0
   let tagsUpdated = 0
+  let labelsImported = 0
+  let labelsRemoved = 0
+  let labelsExported = 0
   let skippedNoMatch = 0
+  let labelsChanged = false
 
   if (!existsSync(dir)) {
     return {
@@ -196,6 +229,9 @@ export async function syncBrowserAssistTags(vamDir) {
       shardsWritten: 0,
       resourcesScanned: 0,
       tagsUpdated: 0,
+      labelsImported: 0,
+      labelsRemoved: 0,
+      labelsExported: 0,
       skippedNoMatch: 0,
       errors: [`BrowserAssist directory not found: ${dir}`],
     }
@@ -210,6 +246,9 @@ export async function syncBrowserAssistTags(vamDir) {
       shardsWritten: 0,
       resourcesScanned: 0,
       tagsUpdated: 0,
+      labelsImported: 0,
+      labelsRemoved: 0,
+      labelsExported: 0,
       skippedNoMatch: 0,
       errors: [`Failed to read BrowserAssist directory: ${err.message}`],
     }
@@ -264,16 +303,62 @@ export async function syncBrowserAssistTags(vamDir) {
         continue
       }
 
-      let nextTags = res.Tags
-      if (entry.sceneType && isSceneContentPath(normPath)) {
-        nextTags = mergeSceneUserTag(nextTags, sceneTagForPackageType(entry.sceneType))
+      const baLabels = browserAssistUserTagNames(res.Tags)
+      const nextContentLabels = new Map(entry.contentLabels)
+
+      for (const name of baLabels) {
+        const label = findOrCreateLabel(name)
+        if (label.created) labelsChanged = true
+        const existing = nextContentLabels.get(label.name)
+        const currentMask = existing?.sourceMask ?? 0
+        if (existing && currentMask === 0) continue
+        const nextMask = currentMask & LABEL_SOURCE_BACKSTAGE ? currentMask : currentMask | LABEL_SOURCE_BROWSERASSIST
+        nextContentLabels.set(label.name, { id: label.id, sourceMask: nextMask })
+        if (!existing || nextMask !== currentMask) {
+          applyLabelToContents(label.id, [{ packageFilename: entry.packageFilename, internalPath: entry.internalPath }])
+          setLabelContentSource(label.id, entry.packageFilename, entry.internalPath, nextMask)
+          labelsImported++
+          labelsChanged = true
+        }
       }
-      nextTags = mergeLabelTags(nextTags, [...entry.labelNames])
+
+      for (const [name, info] of entry.contentLabels) {
+        if (info.sourceMask === 0) {
+          if (!baLabels.has(name)) clearLabelContentSource(info.id, entry.packageFilename, entry.internalPath)
+          nextContentLabels.delete(name)
+          labelsChanged = true
+          continue
+        }
+        if (info.sourceMask & LABEL_SOURCE_BROWSERASSIST && !baLabels.has(name)) {
+          const nextMask = info.sourceMask & ~LABEL_SOURCE_BROWSERASSIST
+          if (nextMask) {
+            setLabelContentSource(info.id, entry.packageFilename, entry.internalPath, nextMask)
+            nextContentLabels.set(name, { ...info, sourceMask: nextMask })
+          } else {
+            removeLabelFromContents(info.id, [
+              { packageFilename: entry.packageFilename, internalPath: entry.internalPath },
+            ])
+            clearLabelContentSource(info.id, entry.packageFilename, entry.internalPath)
+            nextContentLabels.delete(name)
+          }
+          labelsRemoved++
+          labelsChanged = true
+        }
+      }
+
+      const outboundNames = new Set(entry.packageLabelNames)
+      for (const [name, info] of nextContentLabels) {
+        if (info.sourceMask > 0) outboundNames.add(name)
+      }
+      const sceneTagName =
+        entry.sceneType && isSceneContentPath(normPath) ? sceneTagForPackageType(entry.sceneType) : null
+      const nextTags = mergeBrowserAssistUserTags(res.Tags, [...outboundNames], sceneTagName)
 
       if (shallowTagsEqual(res.Tags, nextTags)) continue
       res.Tags = nextTags
       modified = true
       tagsUpdated++
+      labelsExported++
     }
 
     if (modified) {
@@ -286,11 +371,16 @@ export async function syncBrowserAssistTags(vamDir) {
     }
   }
 
+  if (labelsChanged) refreshLabels()
+
   return {
     shardsRead,
     shardsWritten,
     resourcesScanned,
     tagsUpdated,
+    labelsImported,
+    labelsRemoved,
+    labelsExported,
     skippedNoMatch,
     errors,
   }
