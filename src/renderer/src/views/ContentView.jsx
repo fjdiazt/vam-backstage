@@ -124,6 +124,15 @@ function contentMatchesSelectedLabels(c, selectedLabelIds) {
   return matchesPolarityList(selectedLabelIds, contentLabelIds(c))
 }
 
+function contentMatchesSelectedTypes(c, selectedTypes, selectedLabelIds = []) {
+  if (selectedTypes.length === 0) return true
+  const typeSet = new Set(selectedTypes)
+  if (typeSet.has(c.category)) return true
+  if (selectedLabelIds.length === 0) return false
+  const sourceCategories = c.labelSourceCategories || {}
+  return selectedLabelIds.some((id) => typeSet.has(sourceCategories[id]))
+}
+
 function matchesContentPackageFilter(c, packageFilter) {
   if (packageFilter === 'all') return true
   if (packageFilter === 'local') return isLocalPackage(c.packageFilename)
@@ -136,8 +145,7 @@ function applyContentSidebarFilters(baseItems, ctx, omit = {}) {
   let items = baseItems
 
   if (!omit.selectedTypes && ctx.selectedTypes.length > 0) {
-    const typeSet = new Set(ctx.selectedTypes)
-    items = items.filter((c) => typeSet.has(c.category))
+    items = items.filter((c) => contentMatchesSelectedTypes(c, ctx.selectedTypes, ctx.selectedLabelIds))
   }
 
   if (!omit.selectedPackageTypes && ctx.selectedPackageTypes.length > 0) {
@@ -179,10 +187,14 @@ function applyContentSidebarFilters(baseItems, ctx, omit = {}) {
   return items
 }
 
-export function labelsForContentItems(labels, items, selectedLabelIds) {
+export function labelsForContentItems(labels, items, selectedLabelIds, selectedTypes = []) {
   const available = new Set(selectedLabelIds)
+  const typeSet = new Set(selectedTypes)
   for (const c of items) {
-    for (const id of contentLabelIds(c)) available.add(id)
+    for (const id of contentLabelIds(c)) {
+      const baCategory = c.labelSourceCategories?.[id]
+      if (typeSet.size === 0 || typeSet.has(c.category) || typeSet.has(baCategory)) available.add(id)
+    }
   }
   return labels.filter((l) => available.has(l.id))
 }
@@ -502,9 +514,9 @@ export default function ContentView({ onNavigate, navContext }) {
         selectedTags,
         selectedLabelIds,
       },
-      { selectedLabelIds: true },
+      { selectedTypes: true, selectedLabelIds: true },
     )
-    return labelsForContentItems(labels, items, selectedLabelIds)
+    return labelsForContentItems(labels, items, selectedLabelIds, selectedTypes)
   }, [
     baseFiltered,
     selectedTypes,

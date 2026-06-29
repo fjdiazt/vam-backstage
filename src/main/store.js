@@ -102,7 +102,7 @@ let authorCounts = {} // creator string → count of packages with that creator
 let labelIndex = new Map() // label_id → { id, name, color, packageCount, contentCount }
 let labelsByPackage = new Map() // package_filename → number[] of label ids
 let labelsByContent = new Map() // `${package_filename}\0${internal_path}` → number[] of label ids
-let labelContentSources = new Map() // `${package_filename}\0${internal_path}\0${label_id}` → source mask
+let labelContentSources = new Map() // `${package_filename}\0${internal_path}\0${label_id}` → { sourceMask, baCategory }
 let nonDownloadableRids = new Set() // resource IDs known to be non-downloadable
 let stats = emptyStats()
 
@@ -470,7 +470,10 @@ function buildLabels() {
 
   labelContentSources = new Map()
   for (const row of listLabelContentSources()) {
-    labelContentSources.set(`${row.package_filename}\0${row.internal_path}\0${row.label_id}`, row.source_mask)
+    labelContentSources.set(`${row.package_filename}\0${row.internal_path}\0${row.label_id}`, {
+      sourceMask: row.source_mask,
+      baCategory: row.ba_category || null,
+    })
   }
 }
 
@@ -696,7 +699,7 @@ export function getLabelsByContentMap() {
   return labelsByContent
 }
 
-/** Live map: `${package_filename}\0${internal_path}\0${label_id}` → source mask. */
+/** Live map: `${package_filename}\0${internal_path}\0${label_id}` → { sourceMask, baCategory }. */
 export function getLabelContentSourcesMap() {
   return labelContentSources
 }
@@ -704,6 +707,17 @@ export function getLabelContentSourcesMap() {
 /** Resolve a label id to its display name; returns null if the id is unknown. */
 export function getLabelNameById(id) {
   return labelIndex.get(id)?.name ?? null
+}
+
+function labelSourceCategoriesForContent(packageFilename, internalPath) {
+  const ids = labelsByContent.get(packageFilename + '\0' + internalPath) || []
+  if (!ids.length) return {}
+  const out = {}
+  for (const id of ids) {
+    const row = labelContentSources.get(`${packageFilename}\0${internalPath}\0${id}`)
+    if (row?.baCategory) out[id] = row.baCategory
+  }
+  return out
 }
 
 export function getContentByPackage() {
@@ -902,6 +916,7 @@ export function getPackageDetail(filename) {
     favorite: c.favorite,
     thumbnailPath: c.thumbnail_path,
     ownLabelIds: labelsByContent.get(c.package_filename + '\0' + stripDisabledSuffix(c.internal_path)) || [],
+    labelSourceCategories: labelSourceCategoriesForContent(c.package_filename, stripDisabledSuffix(c.internal_path)),
     ...extra,
   })
 
@@ -986,6 +1001,7 @@ export function getFilteredContents(filters = {}) {
     extractedFrom: c.extractedFrom ?? null,
     localDisabled: !!c.localDisabled,
     fileMtime: isLocalPackage(c.package_filename) ? c.file_mtime || 0 : 0,
+    labelSourceCategories: labelSourceCategoriesForContent(c.package_filename, stripDisabledSuffix(c.internal_path)),
     hasExtractedAppearancePreset:
       c.type === 'legacyLook' &&
       contentHasExtractedAppearance({

@@ -494,6 +494,7 @@ function labelContentSourcesSchemaSql() {
       package_filename TEXT NOT NULL REFERENCES packages(filename) ON DELETE CASCADE,
       internal_path TEXT NOT NULL,
       source_mask INTEGER NOT NULL,
+      ba_category TEXT,
       PRIMARY KEY (label_id, package_filename, internal_path)
     );
     CREATE INDEX IF NOT EXISTS idx_label_content_sources_pkgpath
@@ -503,6 +504,10 @@ function labelContentSourcesSchemaSql() {
 
 function applyV30() {
   db.exec(labelContentSourcesSchemaSql())
+  const columns = db.prepare(`PRAGMA table_info(label_content_sources)`).all()
+  if (!columns.some((column) => column.name === 'ba_category')) {
+    db.exec(`ALTER TABLE label_content_sources ADD COLUMN ba_category TEXT`)
+  }
 }
 /**
  * Ensure the synthetic "local content" package row exists. Loose files under
@@ -1653,14 +1658,15 @@ function validLabelSourceMask(mask) {
   return Number.isInteger(n) && n >= 0 ? n : 0
 }
 
-export function setLabelContentSource(labelId, packageFilename, internalPath, sourceMask) {
+export function setLabelContentSource(labelId, packageFilename, internalPath, sourceMask, baCategory = null) {
   const mask = validLabelSourceMask(sourceMask)
   stmt(
-    `INSERT INTO label_content_sources (label_id, package_filename, internal_path, source_mask)
-     VALUES (?, ?, ?, ?)
+    `INSERT INTO label_content_sources (label_id, package_filename, internal_path, source_mask, ba_category)
+     VALUES (?, ?, ?, ?, ?)
      ON CONFLICT(label_id, package_filename, internal_path) DO UPDATE SET
-       source_mask = excluded.source_mask`,
-  ).run(labelId, packageFilename, internalPath, mask)
+       source_mask = excluded.source_mask,
+       ba_category = COALESCE(excluded.ba_category, label_content_sources.ba_category)`,
+  ).run(labelId, packageFilename, internalPath, mask, baCategory)
   return mask
 }
 
@@ -1680,7 +1686,9 @@ export function clearLabelContentSource(labelId, packageFilename, internalPath) 
 }
 
 export function listLabelContentSources() {
-  return stmt('SELECT label_id, package_filename, internal_path, source_mask FROM label_content_sources').all()
+  return stmt(
+    'SELECT label_id, package_filename, internal_path, source_mask, ba_category FROM label_content_sources',
+  ).all()
 }
 
 export function getLabelById(id) {

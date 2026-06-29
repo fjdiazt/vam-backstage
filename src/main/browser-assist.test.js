@@ -18,6 +18,7 @@ vi.mock('./store.js', () => storeMocks)
 
 import {
   browserAssistSettingsDir,
+  browserAssistCategory,
   browserAssistUserTagNames,
   mergeBrowserAssistUserTags,
   syncBrowserAssistTags,
@@ -250,5 +251,12 @@ describe('BrowserAssist user tag helpers', () => {
       { tagName: 'New', tagCategory: 'User' },
       { tagName: 'scene-look', tagCategory: 'User' },
     ])
+  })
+
+  it('derives BA category from scene marker tags before path fallback', () => {
+    expect(
+      browserAssistCategory('Saves/scene/Demo.json', [{ tagName: 'scene-look', tagCategory: 'User' }], 'scene'),
+    ).toBe('Looks')
+    expect(browserAssistCategory('Custom/Hair/Foo.vam', [], 'hairItem')).toBe('Hairstyles')
   })
 })

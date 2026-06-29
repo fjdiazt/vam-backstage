@@ -854,13 +854,14 @@ describe('label content sources', () => {
       LABEL_SOURCE_BACKSTAGE,
     )
 
-    setLabelContentSource(label.id, 'Creator.Package.1.var', 'Saves/scene/Demo.json', LABEL_SOURCE_BOTH)
+    setLabelContentSource(label.id, 'Creator.Package.1.var', 'Saves/scene/Demo.json', LABEL_SOURCE_BOTH, 'Looks')
     expect(listLabelContentSources()).toEqual([
       {
         label_id: label.id,
         package_filename: 'Creator.Package.1.var',
         internal_path: 'Saves/scene/Demo.json',
         source_mask: LABEL_SOURCE_BOTH,
+        ba_category: 'Looks',
       },
     ])
 
