@@ -35,7 +35,7 @@ beforeEach(async () => {
   tmp = await mkTempVamDir()
   await openTestDatabase(tmp.dbPath)
   setPackageDerivedHiddenMap(new Map())
-  setContentDerivedHiddenRules({ hiddenTagsByCategory: new Map(), hiddenCreatorsByCategory: new Map() })
+  setContentDerivedHiddenRules({ hiddenTagsByResourceType: new Map(), hiddenCreatorsByResourceType: new Map() })
 })
 
 afterEach(async () => {
@@ -662,8 +662,8 @@ describe('buildFromDb — package summary enrichment', () => {
     applyLabelToContents(label.id, [item])
     setLabelContentSource(label.id, item.packageFilename, item.internalPath, LABEL_SOURCE_BROWSERASSIST, 'Scenes')
     setContentDerivedHiddenRules({
-      hiddenTagsByCategory: new Map([['Scenes', new Set(['hidden:unwanted'])]]),
-      hiddenCreatorsByCategory: new Map(),
+      hiddenTagsByResourceType: new Map([['Scene', new Set(['hidden:unwanted'])]]),
+      hiddenCreatorsByResourceType: new Map(),
     })
 
     buildFromDb()
@@ -676,6 +676,37 @@ describe('buildFromDb — package summary enrichment', () => {
       hiddenByCreator: false,
       hiddenReason: 'tag',
     })
+  })
+
+  it('uses BrowserAssist Scene hidden labels for scene-look content', async () => {
+    const db = getDb()
+    seedPackage(db, {
+      filename: 'Hidden.LookScene.1.var',
+      creator: 'Hidden',
+      package_name: 'Hidden.LookScene',
+      version: '1',
+      is_direct: 1,
+    })
+    seedContent(db, {
+      package_filename: 'Hidden.LookScene.1.var',
+      internal_path: 'Saves/scene/look.json',
+      display_name: 'Look Scene',
+      type: 'scene',
+    })
+    const label = findOrCreateLabel('hidden:unwanted')
+    const item = { packageFilename: 'Hidden.LookScene.1.var', internalPath: 'Saves/scene/look.json' }
+    applyLabelToContents(label.id, [item])
+    setLabelContentSource(label.id, item.packageFilename, item.internalPath, LABEL_SOURCE_BROWSERASSIST, 'Looks')
+    setContentDerivedHiddenRules({
+      hiddenTagsByResourceType: new Map([['Scene', new Set(['hidden:unwanted'])]]),
+      hiddenCreatorsByResourceType: new Map(),
+    })
+
+    buildFromDb()
+
+    const content = getFilteredContents().find((c) => c.packageFilename === 'Hidden.LookScene.1.var')
+    expect(content).toMatchObject({ hidden: true, hiddenByTag: true, hiddenReason: 'tag' })
+    expect(content.labelSourceCategories[label.id]).toBe('Looks')
   })
 
   it('noLookPresetTag when type is Looks but no look items', async () => {

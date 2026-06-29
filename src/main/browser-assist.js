@@ -2,6 +2,7 @@ import { readFile, writeFile, readdir } from 'fs/promises'
 import { join } from 'path'
 import { existsSync } from 'fs'
 import { categoryOf } from '@shared/content-types.js'
+import { BA_VAR_PACKAGES_TYPE, normalizeBrowserAssistResourceType } from '@shared/browser-assist-resource-types.js'
 import {
   getPackageIndex,
   getContentByPackage,
@@ -30,31 +31,6 @@ import { readPackageHiddenPrefs } from './package-prefs.js'
 
 const BA_REL_PARTS = ['Saves', 'PluginData', 'JayJayWon', 'BrowserAssist', 'VARResourcesUserData']
 const BA_SETTINGS_PARTS = ['Saves', 'PluginData', 'JayJayWon', 'BrowserAssist', 'BASettings.cfg']
-const BA_VAR_PACKAGES_TYPE = 'VAR Packages'
-const BA_RESOURCE_CATEGORY = new Map([
-  ['Scene', 'Scenes'],
-  ['1', 'Scenes'],
-  ['Preset Appearance', 'Looks'],
-  ['2', 'Looks'],
-  ['Preset Clothing', 'Clothing'],
-  ['5', 'Clothing'],
-  ['Preset Hair', 'Hairstyles'],
-  ['8', 'Hairstyles'],
-  ['Preset Pose', 'Poses'],
-  ['11', 'Poses'],
-  ['Clothing (Female)', 'Clothing'],
-  ['18', 'Clothing'],
-  ['Clothing (Male)', 'Clothing'],
-  ['19', 'Clothing'],
-  ['Hair (Female)', 'Hairstyles'],
-  ['24', 'Hairstyles'],
-  ['Hair (Male)', 'Hairstyles'],
-  ['25', 'Hairstyles'],
-  ['Clothing Item Presets', 'Clothing'],
-  ['21', 'Clothing'],
-  ['Hair Item Presets', 'Hairstyles'],
-  ['26', 'Hairstyles'],
-])
 const MANAGED_SCENE_TAGS = new Set(['scene-real', 'scene-look', 'scene-other'])
 const USER_CATEGORY = 'User'
 
@@ -84,12 +60,7 @@ function strings(value) {
 }
 
 function includesVarPackages(value) {
-  return strings(value).some((x) => x === BA_VAR_PACKAGES_TYPE || x === '27' || x === '12')
-}
-
-function includesNonPackageResource(value) {
-  const vals = strings(value)
-  return vals.some((x) => x !== BA_VAR_PACKAGES_TYPE && x !== '27' && x !== '12')
+  return strings(value).some((x) => normalizeBrowserAssistResourceType(x) === BA_VAR_PACKAGES_TYPE)
 }
 
 function addToSetMap(map, key, value) {
@@ -99,30 +70,37 @@ function addToSetMap(map, key, value) {
 }
 
 export function parseBrowserAssistPackageHiddenRules(settings) {
-  const hiddenTags = new Set(strings(settings?.ResourceSettings?.[BA_VAR_PACKAGES_TYPE]?.hiddenTags))
-  const contentHiddenTagsByCategory = new Map()
+  const hiddenTags = new Set()
+  const contentHiddenTagsByResourceType = new Map()
   const resourceSettings =
     settings?.ResourceSettings && typeof settings.ResourceSettings === 'object' ? settings.ResourceSettings : {}
   for (const [resourceType, config] of Object.entries(resourceSettings)) {
-    if (resourceType === BA_VAR_PACKAGES_TYPE) continue
-    const category = BA_RESOURCE_CATEGORY.get(resourceType)
-    for (const tag of strings(config?.hiddenTags)) addToSetMap(contentHiddenTagsByCategory, category, tag)
+    const type = normalizeBrowserAssistResourceType(resourceType)
+    if (type === BA_VAR_PACKAGES_TYPE) {
+      for (const tag of strings(config?.hiddenTags)) hiddenTags.add(tag)
+      continue
+    }
+    for (const tag of strings(config?.hiddenTags)) addToSetMap(contentHiddenTagsByResourceType, type, tag)
   }
   const hiddenCreators = new Set()
-  const contentHiddenCreatorsByCategory = new Map()
+  const contentHiddenCreatorsByResourceType = new Map()
   const creatorSettings = Array.isArray(settings?.creatorSettings) ? settings.creatorSettings : []
   for (const entry of creatorSettings) {
     const name = typeof entry?.creatorName === 'string' ? entry.creatorName : ''
     if (name && includesVarPackages(entry.hiddenResourceTypes)) hiddenCreators.add(name.toLowerCase())
     for (const resourceType of strings(entry.hiddenResourceTypes)) {
-      if (resourceType === BA_VAR_PACKAGES_TYPE || resourceType === '27' || resourceType === '12') continue
-      addToSetMap(contentHiddenCreatorsByCategory, BA_RESOURCE_CATEGORY.get(resourceType), name.toLowerCase())
+      const type = normalizeBrowserAssistResourceType(resourceType)
+      if (type === BA_VAR_PACKAGES_TYPE) continue
+      addToSetMap(contentHiddenCreatorsByResourceType, type, name.toLowerCase())
     }
-    if (name && includesNonPackageResource(entry.hiddenAtomPresetResourceTypes)) {
-      addToSetMap(contentHiddenCreatorsByCategory, 'Other', name.toLowerCase())
-    }
+    for (const resourceType of strings(entry.hiddenAtomPresetResourceTypes))
+      addToSetMap(
+        contentHiddenCreatorsByResourceType,
+        normalizeBrowserAssistResourceType(resourceType),
+        name.toLowerCase(),
+      )
   }
-  return { hiddenTags, hiddenCreators, contentHiddenTagsByCategory, contentHiddenCreatorsByCategory }
+  return { hiddenTags, hiddenCreators, contentHiddenTagsByResourceType, contentHiddenCreatorsByResourceType }
 }
 
 async function readBrowserAssistPackageHiddenRules(vamDir) {
@@ -172,18 +150,24 @@ export async function syncBrowserAssistDerivedContentHidden(
     rules = await readRules(vamDir)
   } catch (err) {
     errors.push(`BASettings.cfg: content hidden rules read failed — ${err.message}`)
-    rules = { contentHiddenTagsByCategory: new Map(), contentHiddenCreatorsByCategory: new Map() }
+    rules = { contentHiddenTagsByResourceType: new Map(), contentHiddenCreatorsByResourceType: new Map() }
   }
-  const hiddenTagsByCategory =
-    rules.contentHiddenTagsByCategory instanceof Map ? rules.contentHiddenTagsByCategory : new Map()
-  const hiddenCreatorsByCategory =
-    rules.contentHiddenCreatorsByCategory instanceof Map ? rules.contentHiddenCreatorsByCategory : new Map()
-  writeRules({ hiddenTagsByCategory, hiddenCreatorsByCategory })
+  const hiddenTagsByResourceType =
+    rules.contentHiddenTagsByResourceType instanceof Map ? rules.contentHiddenTagsByResourceType : new Map()
+  const hiddenCreatorsByResourceType =
+    rules.contentHiddenCreatorsByResourceType instanceof Map ? rules.contentHiddenCreatorsByResourceType : new Map()
+  writeRules({ hiddenTagsByResourceType, hiddenCreatorsByResourceType })
   return {
-    contentHiddenDerivedTags: [...hiddenTagsByCategory.values()].reduce((sum, set) => sum + set.size, 0),
-    contentHiddenDerivedCreators: [...hiddenCreatorsByCategory.values()].reduce((sum, set) => sum + set.size, 0),
+    contentHiddenDerivedTags: [...hiddenTagsByResourceType.values()].reduce((sum, set) => sum + set.size, 0),
+    contentHiddenDerivedCreators: [...hiddenCreatorsByResourceType.values()].reduce((sum, set) => sum + set.size, 0),
     errors,
   }
+}
+
+export async function loadBrowserAssistDerivedHiddenRules(vamDir) {
+  const packages = await syncBrowserAssistDerivedPackageHidden(vamDir)
+  const contents = await syncBrowserAssistDerivedContentHidden(vamDir)
+  return { ...packages, ...contents, errors: [...packages.errors, ...contents.errors] }
 }
 
 export async function syncBrowserAssistPackageHidden(

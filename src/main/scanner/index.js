@@ -29,6 +29,7 @@ import {
 import { isLocalPackage } from '@shared/local-package.js'
 import { refreshLibraryDirs, getAllLibraryDirs } from '../library-dirs.js'
 import { normalizeAuxDisabled } from '../watcher.js'
+import { loadBrowserAssistDerivedHiddenRules } from '../browser-assist.js'
 
 /**
  * Run a full library scan across the main dir and every registered aux dir.
@@ -187,6 +188,11 @@ export async function runScan(vamDir, onProgress = () => {}) {
 
   onProgress({ phase: 'finalizing', step: 1, total: 1, message: 'Building indexes…' })
   buildFromDb()
+  try {
+    await loadBrowserAssistDerivedHiddenRules(vamDir)
+  } catch (err) {
+    console.warn('[browser-assist] hidden rules load failed:', err.message)
+  }
 
   if (isInitialScan) {
     setSetting('initial_scan_done', '1')

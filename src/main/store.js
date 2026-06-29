@@ -20,6 +20,7 @@ import {
   parseDepRef,
 } from './scanner/graph.js'
 import { categoryOf, isGalleryVisible, isVisible, LOOK_ITEM_EXACT_TYPES, tagOf } from '@shared/content-types.js'
+import { browserAssistResourceTypesForContent } from '@shared/browser-assist-resource-types.js'
 import { getPackagesIndex, loadPackagesJsonFromCache } from './hub/packages-json.js'
 import { isLocalPackage } from '@shared/local-package.js'
 import { packageHasExtractedAppearance, contentHasExtractedAppearance } from './scenes/extract.js'
@@ -94,7 +95,7 @@ let labelsByPackage = new Map() // package_filename → number[] of label ids
 let labelsByContent = new Map() // `${package_filename}\0${internal_path}` → number[] of label ids
 let labelContentSources = new Map() // `${package_filename}\0${internal_path}\0${label_id}` → { sourceMask, baCategory }
 let packageDerivedHidden = new Map() // filename → { hiddenByTag, hiddenByCreator }
-let contentDerivedHiddenRules = { hiddenTagsByCategory: new Map(), hiddenCreatorsByCategory: new Map() }
+let contentDerivedHiddenRules = { hiddenTagsByResourceType: new Map(), hiddenCreatorsByResourceType: new Map() }
 let nonDownloadableRids = new Set() // resource IDs known to be non-downloadable
 let stats = emptyStats()
 
@@ -530,27 +531,28 @@ export function setPackageDerivedHiddenMap(map) {
 
 export function setContentDerivedHiddenRules(rules) {
   contentDerivedHiddenRules = {
-    hiddenTagsByCategory: rules?.hiddenTagsByCategory instanceof Map ? rules.hiddenTagsByCategory : new Map(),
-    hiddenCreatorsByCategory:
-      rules?.hiddenCreatorsByCategory instanceof Map ? rules.hiddenCreatorsByCategory : new Map(),
+    hiddenTagsByResourceType:
+      rules?.hiddenTagsByResourceType instanceof Map ? rules.hiddenTagsByResourceType : new Map(),
+    hiddenCreatorsByResourceType:
+      rules?.hiddenCreatorsByResourceType instanceof Map ? rules.hiddenCreatorsByResourceType : new Map(),
   }
 }
 
-function categoryRuleHas(map, category, value) {
-  return !!value && !!category && !!map.get(category)?.has(value)
+function resourceRuleHas(map, resourceTypes, value) {
+  return !!value && resourceTypes.some((type) => map.get(type)?.has(value))
 }
 
 function enrichContentHidden(c) {
   const hiddenDirect = !!c.hidden
   const labelIds = labelsByContent.get(c.package_filename + '\0' + c.internal_path) || []
+  const baResourceTypes = browserAssistResourceTypesForContent(c.internal_path, c.type)
   const hiddenByTag = labelIds.some((id) => {
     const name = getLabelNameById(id)
-    const row = labelContentSources.get(`${c.package_filename}\0${c.internal_path}\0${id}`)
-    return categoryRuleHas(contentDerivedHiddenRules.hiddenTagsByCategory, row?.baCategory || c.category, name)
+    return resourceRuleHas(contentDerivedHiddenRules.hiddenTagsByResourceType, baResourceTypes, name)
   })
-  const hiddenByCreator = categoryRuleHas(
-    contentDerivedHiddenRules.hiddenCreatorsByCategory,
-    c.category,
+  const hiddenByCreator = resourceRuleHas(
+    contentDerivedHiddenRules.hiddenCreatorsByResourceType,
+    baResourceTypes,
     String(c.creator || '').toLowerCase(),
   )
   return {
