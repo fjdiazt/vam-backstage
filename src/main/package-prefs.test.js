@@ -30,4 +30,36 @@ describe('package-prefs', () => {
       await tmp.cleanup()
     }
   })
+
+  it('rejects invalid prefs writes without changing the original file', async () => {
+    const tmp = await mkTempVamDir()
+    try {
+      const p = packagePrefsPath(tmp.vamDir, 'A.Pkg')
+      const original = '{ nope'
+      await mkdir(join(tmp.vamDir, 'AddonPackagesUserPrefs'), { recursive: true })
+      await writeFile(p, original)
+
+      await expect(writePackageHiddenPref(tmp.vamDir, 'A.Pkg', true)).rejects.toThrow()
+      await expect(readFile(p, 'utf8')).resolves.toBe(original)
+    } finally {
+      await tmp.cleanup()
+    }
+  })
+
+  it('uses distinct temp paths for concurrent writes to the same package', async () => {
+    const tmp = await mkTempVamDir()
+    try {
+      const p = packagePrefsPath(tmp.vamDir, 'A.Pkg')
+
+      await Promise.all([
+        writePackageHiddenPref(tmp.vamDir, 'A.Pkg', true),
+        writePackageHiddenPref(tmp.vamDir, 'A.Pkg', false),
+      ])
+
+      const json = JSON.parse(await readFile(p, 'utf8'))
+      expect(typeof json.hidden).toBe('boolean')
+    } finally {
+      await tmp.cleanup()
+    }
+  })
 })
