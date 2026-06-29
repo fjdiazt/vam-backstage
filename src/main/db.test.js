@@ -4,15 +4,24 @@ import { mkTempVamDir, openTestDatabase } from '../../test/fixtures/index.js'
 import {
   closeDatabase,
   clearHubHidden,
+  clearLabelContentSource,
+  deleteLabel,
   deleteHubHidden,
   getDb,
   getHubHiddenIds,
   getHubWishlistIds,
+  getLabelContentSource,
   insertDownload,
   isHubHidden,
   isHubWishlisted,
+  LABEL_SOURCE_BACKSTAGE,
+  LABEL_SOURCE_BROWSERASSIST,
+  LABEL_SOURCE_BOTH,
+  findOrCreateLabel,
+  listLabelContentSources,
   listHubHidden,
   listHubWishlist,
+  setLabelContentSource,
   setHubResourceId,
   setHubUserId,
   toIntString,
@@ -133,7 +142,7 @@ describe('migrate v23 (hub-id cleanup)', () => {
   })
 
   it('bumps schema_version to the current schema', () => {
-    expect(getDb().prepare('SELECT version FROM schema_version').get().version).toBe(25)
+    expect(getDb().prepare('SELECT version FROM schema_version').get().version).toBe(26)
   })
 
   it('nulls non-numeric ids in packages without dropping rows', () => {
@@ -330,5 +339,68 @@ describe('hub hidden', () => {
   it('rejects invalid hidden resource ids', () => {
     expect(() => upsertHubHidden({ resource_id: 'null', title: 'Bad' })).toThrow('resource_id is required')
     expect(getHubHiddenIds()).toEqual([])
+  })
+})
+
+describe('label content sources', () => {
+  beforeEach(async () => {
+    tmp = await mkTempVamDir()
+    await openTestDatabase(tmp.dbPath)
+    getDb()
+      .prepare(
+        `INSERT INTO packages (filename, creator, package_name, version, size_bytes, file_mtime, dep_refs)
+         VALUES ('Creator.Package.1.var', 'Creator', 'Package', '1', 1, 0, '[]')`,
+      )
+      .run()
+  })
+
+  it('creates source ledger in the current schema', () => {
+    const row = getDb()
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'label_content_sources'")
+      .get()
+    expect(row.name).toBe('label_content_sources')
+  })
+
+  it('stores and clears source masks per content label assignment', () => {
+    const label = findOrCreateLabel('Synced')
+    setLabelContentSource(label.id, 'Creator.Package.1.var', 'Saves/scene/Demo.json', LABEL_SOURCE_BACKSTAGE)
+    expect(getLabelContentSource(label.id, 'Creator.Package.1.var', 'Saves/scene/Demo.json')).toBe(
+      LABEL_SOURCE_BACKSTAGE,
+    )
+
+    setLabelContentSource(label.id, 'Creator.Package.1.var', 'Saves/scene/Demo.json', LABEL_SOURCE_BOTH)
+    expect(listLabelContentSources()).toEqual([
+      {
+        label_id: label.id,
+        package_filename: 'Creator.Package.1.var',
+        internal_path: 'Saves/scene/Demo.json',
+        source_mask: LABEL_SOURCE_BOTH,
+      },
+    ])
+
+    clearLabelContentSource(label.id, 'Creator.Package.1.var', 'Saves/scene/Demo.json')
+    expect(getLabelContentSource(label.id, 'Creator.Package.1.var', 'Saves/scene/Demo.json')).toBe(0)
+  })
+
+  it('cascades source rows when labels are deleted', () => {
+    const label = findOrCreateLabel('Delete Me')
+    setLabelContentSource(label.id, 'Creator.Package.1.var', 'Saves/scene/Demo.json', LABEL_SOURCE_BROWSERASSIST)
+
+    deleteLabel(label.id)
+
+    expect(listLabelContentSources()).toEqual([])
+  })
+
+  it('can downgrade source ownership after one side removes an assignment', () => {
+    const label = findOrCreateLabel('Both')
+    setLabelContentSource(label.id, 'Creator.Package.1.var', 'Saves/scene/Demo.json', LABEL_SOURCE_BOTH)
+
+    const nextMask =
+      getLabelContentSource(label.id, 'Creator.Package.1.var', 'Saves/scene/Demo.json') & ~LABEL_SOURCE_BACKSTAGE
+    setLabelContentSource(label.id, 'Creator.Package.1.var', 'Saves/scene/Demo.json', nextMask)
+
+    expect(getLabelContentSource(label.id, 'Creator.Package.1.var', 'Saves/scene/Demo.json')).toBe(
+      LABEL_SOURCE_BROWSERASSIST,
+    )
   })
 })
