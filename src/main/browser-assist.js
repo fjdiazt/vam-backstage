@@ -1,6 +1,7 @@
 import { readFile, writeFile, readdir } from 'fs/promises'
 import { join } from 'path'
 import { existsSync } from 'fs'
+import { categoryOf } from '@shared/content-types.js'
 import {
   getPackageIndex,
   getContentByPackage,
@@ -55,6 +56,20 @@ function sceneTagForPackageType(pt) {
   return 'scene-other'
 }
 
+export function browserAssistCategory(normPath, tags, fallbackType) {
+  const userTags = new Set(
+    (Array.isArray(tags) ? tags : [])
+      .filter((t) => t && typeof t === 'object' && t.tagCategory === USER_CATEGORY && typeof t.tagName === 'string')
+      .map((t) => t.tagName.trim()),
+  )
+  if (userTags.has('scene-look')) return 'Looks'
+  if (userTags.has('scene-real') || userTags.has('scene-other')) return 'Scenes'
+  if (/^Custom\/Clothing\//i.test(normPath)) return 'Clothing'
+  if (/^Custom\/Hair\//i.test(normPath)) return 'Hairstyles'
+  if (/^(Custom\/Atom\/Person\/Pose\/|Saves\/Person\/Pose\/)/i.test(normPath)) return 'Poses'
+  return categoryOf(fallbackType)
+}
+
 /**
  * Build a content lookup keyed by `lower(package_name) + '\0' + lower(internal_path)`.
  *
@@ -68,7 +83,7 @@ function sceneTagForPackageType(pt) {
  * no version axis). We merge across versions: any version's scene type sticks; label
  * names are unioned so a label set on either v1 or v2 still appears on the BA tag.
  *
- * @returns {Map<string, { packageFilename: string, internalPath: string, sceneType: string|null, packageLabelNames: Set<string>, contentLabels: Map<string, { id: number, sourceMask: number }> }>}
+ * @returns {Map<string, { packageFilename: string, internalPath: string, type: string, sceneType: string|null, packageLabelNames: Set<string>, contentLabels: Map<string, { id: number, sourceMask: number, baCategory: string|null }> }>}
  */
 function buildContentLookup() {
   const packageIndex = getPackageIndex()
@@ -120,12 +135,23 @@ function buildContentLookup() {
       for (const id of ownIds) {
         const name = getLabelNameById(id)
         if (!name) continue
-        contentLabels.set(name, { id, sourceMask: sourceRows.get(id) ?? LABEL_SOURCE_BACKSTAGE })
+        const source = sourceRows.get(id)
+        contentLabels.set(name, {
+          id,
+          sourceMask: source?.sourceMask ?? source ?? LABEL_SOURCE_BACKSTAGE,
+          baCategory: source?.baCategory ?? null,
+        })
       }
       for (const [id, sourceMask] of sourceRows) {
         if (contentLabels.has(getLabelNameById(id))) continue
         const name = getLabelNameById(id)
-        if (name) contentLabels.set(name, { id, sourceMask })
+        if (name) {
+          contentLabels.set(name, {
+            id,
+            sourceMask: sourceMask?.sourceMask ?? sourceMask,
+            baCategory: sourceMask?.baCategory ?? null,
+          })
+        }
       }
 
       const isSceneItem = item.type === 'scene' || item.type === 'legacyScene'
@@ -136,6 +162,7 @@ function buildContentLookup() {
         entry = {
           packageFilename: filename,
           internalPath: item.internal_path,
+          type: item.type,
           sceneType,
           packageLabelNames: new Set(packageLabelNames),
           contentLabels,
@@ -148,7 +175,13 @@ function buildContentLookup() {
           const existing = entry.contentLabels.get(name)
           entry.contentLabels.set(
             name,
-            existing ? { ...existing, sourceMask: existing.sourceMask | info.sourceMask } : info,
+            existing
+              ? {
+                  ...existing,
+                  sourceMask: existing.sourceMask | info.sourceMask,
+                  baCategory: existing.baCategory || info.baCategory,
+                }
+              : info,
           )
         }
       }
@@ -304,6 +337,7 @@ export async function syncBrowserAssistTags(vamDir) {
       }
 
       const baLabels = browserAssistUserTagNames(res.Tags)
+      const baCategory = browserAssistCategory(normPath, res.Tags, entry.type)
       const nextContentLabels = new Map(entry.contentLabels)
 
       for (const name of baLabels) {
@@ -313,10 +347,10 @@ export async function syncBrowserAssistTags(vamDir) {
         const currentMask = existing?.sourceMask ?? 0
         if (existing && currentMask === 0) continue
         const nextMask = currentMask | LABEL_SOURCE_BROWSERASSIST
-        nextContentLabels.set(label.name, { id: label.id, sourceMask: nextMask })
-        if (!existing || nextMask !== currentMask) {
+        nextContentLabels.set(label.name, { id: label.id, sourceMask: nextMask, baCategory })
+        if (!existing || nextMask !== currentMask || existing.baCategory !== baCategory) {
           applyLabelToContents(label.id, [{ packageFilename: entry.packageFilename, internalPath: entry.internalPath }])
-          setLabelContentSource(label.id, entry.packageFilename, entry.internalPath, nextMask)
+          setLabelContentSource(label.id, entry.packageFilename, entry.internalPath, nextMask, baCategory)
           labelsImported++
           labelsChanged = true
         }

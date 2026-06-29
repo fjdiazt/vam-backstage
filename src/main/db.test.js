@@ -142,7 +142,7 @@ describe('migrate v23 (hub-id cleanup)', () => {
   })
 
   it('bumps schema_version to the current schema', () => {
-    expect(getDb().prepare('SELECT version FROM schema_version').get().version).toBe(26)
+    expect(getDb().prepare('SELECT version FROM schema_version').get().version).toBe(27)
   })
 
   it('nulls non-numeric ids in packages without dropping rows', () => {
@@ -368,13 +368,14 @@ describe('label content sources', () => {
       LABEL_SOURCE_BACKSTAGE,
     )
 
-    setLabelContentSource(label.id, 'Creator.Package.1.var', 'Saves/scene/Demo.json', LABEL_SOURCE_BOTH)
+    setLabelContentSource(label.id, 'Creator.Package.1.var', 'Saves/scene/Demo.json', LABEL_SOURCE_BOTH, 'Looks')
     expect(listLabelContentSources()).toEqual([
       {
         label_id: label.id,
         package_filename: 'Creator.Package.1.var',
         internal_path: 'Saves/scene/Demo.json',
         source_mask: LABEL_SOURCE_BOTH,
+        ba_category: 'Looks',
       },
     ])
 
