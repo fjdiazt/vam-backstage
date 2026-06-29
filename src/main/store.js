@@ -638,6 +638,7 @@ function enrichPackageSummary(pkg) {
     sizeBytes: pkg.size_bytes,
     removableSize,
     isDirect: !!pkg.is_direct,
+    hidden: !!pkg.hidden,
     storageState: pkg.storage_state,
     libraryDirId: pkg.library_dir_id ?? null,
     hubResourceId: pkg.hub_resource_id,

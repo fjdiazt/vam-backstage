@@ -572,6 +572,23 @@ describe('buildFromDb — counts / filters', () => {
 })
 
 describe('buildFromDb — package summary enrichment', () => {
+  it('includes package hidden state on summaries and details', async () => {
+    const db = getDb()
+    seedPackage(db, {
+      filename: 'Hidden.Pkg.1.var',
+      creator: 'Hidden',
+      package_name: 'Hidden.Pkg',
+      version: '1',
+      is_direct: 1,
+    })
+    db.prepare('UPDATE packages SET hidden = 1 WHERE filename = ?').run('Hidden.Pkg.1.var')
+
+    buildFromDb()
+
+    expect(getFilteredPackages().find((p) => p.filename === 'Hidden.Pkg.1.var')?.hidden).toBe(true)
+    expect(getPackageDetail('Hidden.Pkg.1.var').hidden).toBe(true)
+  })
+
   it('includes content labels on package summaries', async () => {
     const db = getDb()
     seedPackage(db, {

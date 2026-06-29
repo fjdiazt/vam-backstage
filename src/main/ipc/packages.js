@@ -372,14 +372,14 @@ export function registerPackageHandlers() {
   })
 
   ipcMain.handle('packages:set-hidden', async (_, { filename, hidden }) => {
+    if (typeof hidden !== 'boolean') throw new Error('Invalid hidden value')
     const pkg = getPackageIndex().get(filename)
     if (!pkg) throw new Error(`Package not found: ${filename}`)
     const vamDir = getSetting('vam_dir')
     if (!vamDir) throw new Error('VaM directory not configured')
 
-    const nextHidden = !!hidden
-    setPackageHidden(filename, nextHidden)
-    await writePackageHiddenPref(vamDir, pkg.package_name, nextHidden)
+    await writePackageHiddenPref(vamDir, pkg.package_name, hidden)
+    setPackageHidden(filename, hidden)
     buildFromDb({ skipGraph: true })
     notify('packages:updated')
     return { ok: true }
