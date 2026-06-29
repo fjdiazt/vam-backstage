@@ -432,4 +432,10 @@ export const useLibraryStore = create((set, get) => ({
       } catch {}
     }
   },
+
+  setPackageHidden: async (filename, hidden) => {
+    await window.api.packages.setHidden({ filename, hidden })
+    await get().fetchPackages()
+    await get().refreshDetail()
+  },
 }))

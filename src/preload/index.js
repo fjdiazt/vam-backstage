@@ -26,6 +26,7 @@ const api = {
     forceRemove: (filename) => ipcRenderer.invoke('packages:force-remove', filename),
     toggleEnabled: (filename) => ipcRenderer.invoke('packages:toggle-enabled', filename),
     setEnabled: (filenames, enabled) => ipcRenderer.invoke('packages:set-enabled', { filenames, enabled }),
+    setHidden: (payload) => ipcRenderer.invoke('packages:set-hidden', payload),
     setTypeOverride: (filenameOrPayload, typeOverride) =>
       typeof filenameOrPayload === 'object' && filenameOrPayload !== null && 'filenames' in filenameOrPayload
         ? ipcRenderer.invoke('packages:set-type-override', filenameOrPayload)

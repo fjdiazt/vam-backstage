@@ -7,6 +7,7 @@ import {
   setPackageDirect,
   deletePackage,
   getSetting,
+  setPackageHidden,
   setPackageTypeOverride,
   setPackageCorrupted,
   setHubResourceId,
@@ -36,6 +37,7 @@ import {
   isNotDownloadable,
 } from '../store.js'
 import { hidePackageContent, unhidePackageContent, readAllPrefs } from '../vam-prefs.js'
+import { writePackageHiddenPref } from '../package-prefs.js'
 import { computeRemovableDeps, computeCascadeDisable, computeCascadeEnable } from '../scanner/graph.js'
 import { applyStorageState, parseDisableBehavior, nextStorageStateForIntent } from '../storage-state.js'
 import { pkgVarPath, getMainLibraryDirPath } from '../library-dirs.js'
@@ -367,6 +369,20 @@ export function registerPackageHandlers() {
     }
     notify('packages:updated')
     return { ok: true, count: filenames.length }
+  })
+
+  ipcMain.handle('packages:set-hidden', async (_, { filename, hidden }) => {
+    const pkg = getPackageIndex().get(filename)
+    if (!pkg) throw new Error(`Package not found: ${filename}`)
+    const vamDir = getSetting('vam_dir')
+    if (!vamDir) throw new Error('VaM directory not configured')
+
+    const nextHidden = !!hidden
+    setPackageHidden(filename, nextHidden)
+    await writePackageHiddenPref(vamDir, pkg.package_name, nextHidden)
+    buildFromDb({ skipGraph: true })
+    notify('packages:updated')
+    return { ok: true }
   })
 
   ipcMain.handle('packages:toggle-enabled', async (_, filenameOrFilenames) => {
