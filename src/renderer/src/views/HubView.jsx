@@ -48,6 +48,7 @@ import { useHubStore } from '@/stores/useHubStore'
 import { useDownloadStore } from '@/stores/useDownloadStore'
 import { useInstalledStore } from '@/stores/useInstalledStore'
 import { useHubWishlistStore } from '@/stores/useHubWishlistStore'
+import { useHubHiddenStore } from '@/stores/useHubHiddenStore'
 import { useHubInstallState } from '@/hooks/useHubInstallState'
 import { useHubInteractions } from '@/hooks/useHubInteractions'
 import { HubCard, AuthorAvatar, DepRow } from '@/components/PackageCard'
@@ -125,6 +126,7 @@ export default function HubView({ onNavigate, active = true }) {
     sort,
     license,
     hideInstalled,
+    showHidden,
     detailResource,
     pendingDetailResourceId,
     cardMode,
@@ -138,6 +140,7 @@ export default function HubView({ onNavigate, active = true }) {
     setSort,
     setLicense,
     setHideInstalled,
+    setShowHidden,
     setCardMode,
     setCardWidth,
     fetchResources,
@@ -157,6 +160,8 @@ export default function HubView({ onNavigate, active = true }) {
   const wishlistIds = useHubWishlistStore((s) => s.ids)
   const wishlistLoading = useHubWishlistStore((s) => s.loading)
   const toggleWishlist = useHubWishlistStore((s) => s.toggle)
+  const hiddenIds = useHubHiddenStore((s) => s.ids)
+  const hideHubItem = useHubHiddenStore((s) => s.hide)
   const wishlistMode = paidFilter === 'wishlist'
 
   const [searchDraft, setSearchDraft] = useState(search)
@@ -225,6 +230,7 @@ export default function HubView({ onNavigate, active = true }) {
     if (!active) return
     useHubStore.getState().fetchFilters()
     useHubWishlistStore.getState().hydrate()
+    useHubHiddenStore.getState().hydrate()
   }, [active])
 
   // Track gallery container width for the zoom slider
@@ -279,11 +285,13 @@ export default function HubView({ onNavigate, active = true }) {
 
   const installedByHubResourceId = useInstalledStore((s) => s.byHubResourceId)
   const filteredResources = useMemo(() => {
-    if (!hideInstalled) return galleryResources
-    return galleryResources.filter(
-      (r) => !(installedByHubResourceId.get(String(r.resource_id))?.installed ?? r._installed),
-    )
-  }, [galleryResources, hideInstalled, installedByHubResourceId])
+    return galleryResources.filter((r) => {
+      const rid = String(r.resource_id)
+      if (!showHidden && hiddenIds.has(rid)) return false
+      if (hideInstalled && (installedByHubResourceId.get(rid)?.installed ?? r._installed)) return false
+      return true
+    })
+  }, [galleryResources, hiddenIds, hideInstalled, showHidden, installedByHubResourceId])
 
   /** While more pages exist, hide the trailing partial row so the bottom is always full rows */
   const visibleResources = useMemo(() => {
@@ -889,12 +897,23 @@ export default function HubView({ onNavigate, active = true }) {
         options: LICENSE_FILTER_OPTIONS,
       },
       {
-        key: 'installed',
-        label: 'Installed',
-        type: 'switch',
-        switchLabel: 'Hide installed',
-        checked: hideInstalled,
-        onCheckedChange: setHideInstalled,
+        key: 'show',
+        label: 'Show',
+        type: 'switches',
+        items: [
+          {
+            key: 'installed',
+            label: 'Installed',
+            checked: !hideInstalled,
+            onCheckedChange: (checked) => setHideInstalled(!checked),
+          },
+          {
+            key: 'hidden',
+            label: 'Hidden',
+            checked: showHidden,
+            onCheckedChange: setShowHidden,
+          },
+        ],
       },
       { key: 'sort', label: 'Sort by', type: 'select', value: sort, onChange: setSort, options: sortOptions },
     ],
@@ -905,6 +924,7 @@ export default function HubView({ onNavigate, active = true }) {
       authorSearch,
       license,
       hideInstalled,
+      showHidden,
       sort,
       sortOptions,
       hubTypes,
@@ -916,6 +936,7 @@ export default function HubView({ onNavigate, active = true }) {
       setAuthorSearch,
       setLicense,
       setHideInstalled,
+      setShowHidden,
       setSort,
     ],
   )
@@ -1037,6 +1058,9 @@ export default function HubView({ onNavigate, active = true }) {
                         onPromote={handlePromote}
                         onFilterAuthor={handleFilterAuthor}
                         onToggleWishlist={(resource) => toggleWishlist(resource)}
+                        onHide={(resource) => hideHubItem(resource)}
+                        onUnhide={(resource) => useHubHiddenStore.getState().unhide(resource.resource_id)}
+                        isHidden={hiddenIds.has(String(r.resource_id))}
                         isWishlisted={wishlistIds.has(String(r.resource_id))}
                         mode={cardMode}
                         hideType={selectedType !== 'All'}

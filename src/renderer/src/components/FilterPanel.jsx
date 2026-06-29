@@ -204,6 +204,20 @@ export default function FilterPanel({
                 <Switch size="sm" checked={!!section.checked} onCheckedChange={section.onCheckedChange} />
               </label>
             )}
+
+            {section.type === 'switches' && (
+              <div className="space-y-px">
+                {section.items.map((item) => (
+                  <label
+                    key={item.key}
+                    className="flex items-center justify-between gap-3 rounded px-2 py-1.5 text-xs text-text-secondary hover:bg-elevated hover:text-text-primary transition-colors cursor-pointer"
+                  >
+                    <span className="truncate">{item.label}</span>
+                    <Switch size="sm" checked={!!item.checked} onCheckedChange={item.onCheckedChange} />
+                  </label>
+                ))}
+              </div>
+            )}
           </SectionWrapper>
         ))}
       </div>

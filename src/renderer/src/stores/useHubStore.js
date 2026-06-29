@@ -152,6 +152,7 @@ export const useHubStore = create((set, get) => ({
   sort: '',
   license: 'Any',
   hideInstalled: false,
+  showHidden: false,
 
   detailResource: null,
   detailData: null,
@@ -177,6 +178,7 @@ export const useHubStore = create((set, get) => ({
   },
   setLicense: (license) => set({ license }),
   setHideInstalled: (hideInstalled) => set({ hideInstalled }),
+  setShowHidden: (showHidden) => set({ showHidden }),
   setCardMode: (cardMode) => {
     set({ cardMode })
     void window.api.settings.set('hub_card_mode', cardMode)
@@ -311,6 +313,7 @@ export const useHubStore = create((set, get) => ({
       sort: s.sort,
       license: s.license,
       hideInstalled: s.hideInstalled,
+      showHidden: s.showHidden,
       browseMode: s.browseMode,
       page: s.browseMode === 'infinite' ? s.restorePage : s.page,
       perPage: s.perPage,
@@ -329,6 +332,7 @@ export const useHubStore = create((set, get) => ({
       sort: saved.sort,
       license: saved.license,
       hideInstalled: saved.hideInstalled,
+      showHidden: saved.showHidden,
       browseMode: saved.browseMode,
       page: saved.page,
       startPage: saved.page,
@@ -605,6 +609,7 @@ export const useHubStore = create((set, get) => ({
       sort: nextSort,
       license: 'Any',
       hideInstalled: false,
+      showHidden: false,
       pendingDetailResourceId: null,
       page: 1,
       startPage: 1,

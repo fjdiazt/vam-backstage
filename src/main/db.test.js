@@ -3,14 +3,20 @@ import Database from 'better-sqlite3'
 import { mkTempVamDir, openTestDatabase } from '../../test/fixtures/index.js'
 import {
   closeDatabase,
+  clearHubHidden,
+  deleteHubHidden,
   getDb,
+  getHubHiddenIds,
   getHubWishlistIds,
   insertDownload,
+  isHubHidden,
   isHubWishlisted,
+  listHubHidden,
   listHubWishlist,
   setHubResourceId,
   setHubUserId,
   toIntString,
+  upsertHubHidden,
   upsertHubWishlist,
   upsertHubResourceDetail,
   upsertHubUser,
@@ -127,7 +133,7 @@ describe('migrate v23 (hub-id cleanup)', () => {
   })
 
   it('bumps schema_version to the current schema', () => {
-    expect(getDb().prepare('SELECT version FROM schema_version').get().version).toBe(24)
+    expect(getDb().prepare('SELECT version FROM schema_version').get().version).toBe(25)
   })
 
   it('nulls non-numeric ids in packages without dropping rows', () => {
@@ -288,5 +294,41 @@ describe('hub wishlist', () => {
 
     expect(deleteHubWishlist('123')).toBe(1)
     expect(isHubWishlisted('123')).toBe(false)
+  })
+})
+
+describe('hub hidden', () => {
+  beforeEach(async () => {
+    tmp = await mkTempVamDir()
+    await openTestDatabase(tmp.dbPath)
+  })
+
+  it('creates the hidden table in the current schema', () => {
+    const row = getDb().prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'hub_hidden'").get()
+    expect(row.name).toBe('hub_hidden')
+  })
+
+  it('stores title by resource id and can delete or clear', () => {
+    upsertHubHidden({ resource_id: '123', title: 'Nope' })
+    upsertHubHidden({ resource_id: '456', title: 'Also Nope' })
+
+    expect(getHubHiddenIds()).toEqual(['123', '456'])
+    expect(isHubHidden('123')).toBe(true)
+    expect(isHubHidden('null')).toBe(false)
+    expect(
+      listHubHidden()
+        .map((r) => r.title)
+        .sort(),
+    ).toEqual(['Also Nope', 'Nope'])
+
+    expect(deleteHubHidden('123')).toBe(1)
+    expect(isHubHidden('123')).toBe(false)
+    expect(clearHubHidden()).toBe(1)
+    expect(listHubHidden()).toEqual([])
+  })
+
+  it('rejects invalid hidden resource ids', () => {
+    expect(() => upsertHubHidden({ resource_id: 'null', title: 'Bad' })).toThrow('resource_id is required')
+    expect(getHubHiddenIds()).toEqual([])
   })
 })

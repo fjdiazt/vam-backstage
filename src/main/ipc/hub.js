@@ -17,12 +17,17 @@ import {
 import { resolveRef } from '../scanner/graph.js'
 import {
   deleteHubWishlist,
+  clearHubHidden,
+  deleteHubHidden,
+  getHubHiddenIds,
+  listHubHidden,
   setHubResourceId,
   setHubUserId,
   setHubDisplayName,
   upsertHubUser,
   setPackageHubMeta,
   transact,
+  upsertHubHidden,
 } from '../db.js'
 import { cacheAvatarsFromResources } from '../avatar-cache.js'
 import { notify } from '../notify.js'
@@ -95,6 +100,12 @@ export function registerHubHandlers() {
   ipcMain.handle('hub:wishlist:toggle', async (_, resource) => {
     return await toggleWishlist(resource)
   })
+
+  ipcMain.handle('hub:hidden:list', () => listHubHidden())
+  ipcMain.handle('hub:hidden:ids', () => getHubHiddenIds())
+  ipcMain.handle('hub:hidden:hide', (_, resource) => upsertHubHidden(resource))
+  ipcMain.handle('hub:hidden:unhide', (_, resourceId) => deleteHubHidden(resourceId))
+  ipcMain.handle('hub:hidden:clear', () => clearHubHidden())
 
   ipcMain.handle('hub:search', async (_, params) => {
     const result = await searchResources(params)
