@@ -1040,14 +1040,6 @@ export function ContentCard({
         )}
         {/* Corner slot: disabled indicator; visibility/favorite are interactive except in bulk (static badges, like disabled) */}
         <div className="absolute top-1.5 right-1.5 flex items-center gap-0.5 z-2">
-          {isDisabledPkg && (
-            <div
-              title="Package disabled"
-              className={`size-7 shrink-0 inline-flex items-center justify-center rounded text-error ${THUMB_OUTLINE_ICON_SHADOW}`}
-            >
-              <Power size={13} />
-            </div>
-          )}
           <button
             type="button"
             disabled={bulkMode}
@@ -1063,6 +1055,14 @@ export function ContentCard({
           >
             {isHidden ? <EyeOff size={13} /> : <Eye size={13} />}
           </button>
+          {isDisabledPkg && (
+            <div
+              title="Package disabled"
+              className={`size-7 shrink-0 inline-flex items-center justify-center rounded text-error ${THUMB_OUTLINE_ICON_SHADOW}`}
+            >
+              <Power size={13} />
+            </div>
+          )}
           <button
             type="button"
             disabled={bulkMode}
