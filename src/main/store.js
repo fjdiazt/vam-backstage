@@ -6,6 +6,7 @@ import {
   getAllLabels,
   getAllLabelPackages,
   getAllLabelContents,
+  listLabelContentSources,
 } from './db.js'
 import { getCachedDetail } from './hub/client.js'
 import {
@@ -91,6 +92,7 @@ let authorCounts = {} // creator string → count of packages with that creator
 let labelIndex = new Map() // label_id → { id, name, color, packageCount, contentCount }
 let labelsByPackage = new Map() // package_filename → number[] of label ids
 let labelsByContent = new Map() // `${package_filename}\0${internal_path}` → number[] of label ids
+let labelContentSources = new Map() // `${package_filename}\0${internal_path}\0${label_id}` → { sourceMask, baCategory }
 let nonDownloadableRids = new Set() // resource IDs known to be non-downloadable
 let stats = emptyStats()
 
@@ -331,6 +333,14 @@ function buildLabels() {
     const entry = labelIndex.get(row.label_id)
     if (entry) entry.contentCount++
   }
+
+  labelContentSources = new Map()
+  for (const row of listLabelContentSources()) {
+    labelContentSources.set(`${row.package_filename}\0${row.internal_path}\0${row.label_id}`, {
+      sourceMask: row.source_mask,
+      baCategory: row.ba_category || null,
+    })
+  }
 }
 
 function packageLabelIds(filename) {
@@ -502,9 +512,42 @@ export function getLabelsByContentMap() {
   return labelsByContent
 }
 
+/** Live map: `${package_filename}\0${internal_path}\0${label_id}` → { sourceMask, baCategory }. */
+export function getLabelContentSourcesMap() {
+  return labelContentSources
+}
+
 /** Resolve a label id to its display name; returns null if the id is unknown. */
 export function getLabelNameById(id) {
   return labelIndex.get(id)?.name ?? null
+}
+
+function labelSourceCategoriesForContent(packageFilename, internalPath) {
+  const ids = labelsByContent.get(packageFilename + '\0' + internalPath) || []
+  if (!ids.length) return {}
+  const out = {}
+  for (const id of ids) {
+    const row = labelContentSources.get(`${packageFilename}\0${internalPath}\0${id}`)
+    if (row?.baCategory) out[id] = row.baCategory
+  }
+  return out
+}
+
+function contentLabelSummaryForPackage(items = []) {
+  const ids = new Set()
+  const categories = {}
+  for (const c of items) {
+    if (!isVisible(c.type)) continue
+    const ownIds = labelsByContent.get(c.package_filename + '\0' + c.internal_path) || []
+    for (const id of ownIds) {
+      ids.add(id)
+      const cat =
+        labelContentSources.get(`${c.package_filename}\0${c.internal_path}\0${id}`)?.baCategory || categoryOf(c.type)
+      if (!cat) continue
+      ;(categories[id] ||= []).push(cat)
+    }
+  }
+  return { ids: [...ids], categories }
 }
 
 export function getContentByPackage() {
@@ -567,6 +610,7 @@ function enrichPackageSummary(pkg) {
   const missingDeps = transitiveMissingMap.get(pkg.filename) || 0
   const pkgContents = contentByPackage.get(pkg.filename)
   const contentCount = pkgContents?.length ?? 0
+  const contentLabels = contentLabelSummaryForPackage(pkgContents)
   let favoriteContentCount = 0
   if (pkgContents) {
     for (const c of pkgContents) {
@@ -613,6 +657,8 @@ function enrichPackageSummary(pkg) {
     noLookPresetTag,
     hasExtractedAppearancePreset,
     labelIds: packageLabelIds(pkg.filename),
+    contentLabelIds: contentLabels.ids,
+    contentLabelCategories: contentLabels.categories,
   }
 }
 
@@ -670,6 +716,7 @@ export function getPackageDetail(filename) {
       favorite: c.favorite,
       thumbnailPath: c.thumbnail_path,
       ownLabelIds: labelsByContent.get(c.package_filename + '\0' + c.internal_path) || [],
+      labelSourceCategories: labelSourceCategoriesForContent(c.package_filename, c.internal_path),
     }))
 
   const { removableFilenames, removableSize } = computeRemovableDeps(filename, packageIndex, forwardDeps, reverseDeps)
@@ -738,6 +785,7 @@ export function getFilteredContents(filters = {}) {
     hidden: c.hidden,
     favorite: c.favorite,
     thumbnailPath: c.thumbnail_path,
+    labelSourceCategories: labelSourceCategoriesForContent(c.package_filename, c.internal_path),
     hasExtractedAppearancePreset:
       c.type === 'legacyLook' &&
       contentHasExtractedAppearance({

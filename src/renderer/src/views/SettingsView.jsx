@@ -284,7 +284,7 @@ export default function SettingsView() {
         setBaSyncResult({ error: res?.error || 'Sync failed' })
         return
       }
-      const msg = `BrowserAssist: updated ${res.tagsUpdated} resource(s); wrote ${res.shardsWritten} of ${res.shardsRead} shard(s). ${res.resourcesScanned} row(s) processed; ${res.skippedNoMatch} skipped (no local DB match).`
+      const msg = `BrowserAssist: ${res.labelsImported ?? 0} imported; ${res.labelsExported ?? 0} exported; ${res.labelsRemoved ?? 0} removed. Updated ${res.tagsUpdated} resource(s); wrote ${res.shardsWritten} of ${res.shardsRead} shard(s). ${res.resourcesScanned} row(s) processed; ${res.skippedNoMatch} skipped (no local DB match).`
       if (res.errors?.length) {
         setBaSyncResult({ success: msg, warnings: res.errors })
       } else {
@@ -770,9 +770,8 @@ export default function SettingsView() {
                 <div>
                   <div className="text-xs text-text-primary font-medium">Sync with BrowserAssist</div>
                   <div className="text-[11px] text-text-tertiary mt-0.5">
-                    Write User tags (scene-real / scene-look / scene-other) plus user-defined Labels (own + inherited
-                    from package) into JayJayWon BrowserAssist settings for matching resources in this app&apos;s
-                    library.
+                    Sync Backstage Labels with BrowserAssist user tags. Hub tags and non-user BrowserAssist categories
+                    are not changed.
                   </div>
                 </div>
                 <Button
@@ -787,7 +786,7 @@ export default function SettingsView() {
                   ) : (
                     <RefreshCw size={14} className="shrink-0" />
                   )}
-                  {baSyncing ? 'Syncing…' : 'Sync with BrowserAssist'}
+                  {baSyncing ? 'Syncing…' : 'Sync labels'}
                 </Button>
                 {baSyncResult && (
                   <div

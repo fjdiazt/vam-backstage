@@ -69,6 +69,7 @@ import {
 } from '@/lib/mouse-page-nav'
 
 const SORT_OPTIONS = ['Recently installed', 'Name A-Z', 'Package', 'Type']
+export const LAZY_LABEL_LOADING = false
 const isPackageDisabled = (c) => !isPackageActive(c.package?.storageState ?? 'enabled')
 
 function matchesContentPackageStatus(c, packageStatusFilter) {
@@ -107,6 +108,15 @@ function contentMatchesSelectedLabels(c, selectedLabelIds) {
   return true
 }
 
+function contentMatchesSelectedTypes(c, selectedTypes, selectedLabelIds = []) {
+  if (selectedTypes.length === 0) return true
+  const typeSet = new Set(selectedTypes)
+  if (typeSet.has(c.category)) return true
+  if (selectedLabelIds.length === 0) return false
+  const sourceCategories = c.labelSourceCategories || {}
+  return selectedLabelIds.some((id) => typeSet.has(sourceCategories[id]))
+}
+
 function matchesContentPackageFilter(c, packageFilter) {
   if (packageFilter === 'all') return true
   if (packageFilter === 'local') return isLocalPackage(c.packageFilename)
@@ -120,8 +130,7 @@ function applyContentSidebarFilters(baseItems, ctx, omit = {}) {
   let items = baseItems
 
   if (!omit.selectedTypes && ctx.selectedTypes.length > 0) {
-    const typeSet = new Set(ctx.selectedTypes)
-    items = items.filter((c) => typeSet.has(c.category))
+    items = items.filter((c) => contentMatchesSelectedTypes(c, ctx.selectedTypes, ctx.selectedLabelIds))
   }
 
   if (!omit.selectedPackageTypes && ctx.selectedPackageTypes.length > 0) {
@@ -148,12 +157,27 @@ function applyContentSidebarFilters(baseItems, ctx, omit = {}) {
     else if (vf === 'favorites') items = items.filter((c) => c.favorite)
   }
 
-  if (!omit.tagsLabels) {
+  if (!omit.tagsLabels && !omit.selectedTags) {
     items = items.filter((c) => contentMatchesSelectedTags(c, ctx.selectedTags))
+  }
+
+  if (!omit.tagsLabels && !omit.selectedLabelIds) {
     items = items.filter((c) => contentMatchesSelectedLabels(c, ctx.selectedLabelIds))
   }
 
   return items
+}
+
+export function labelsForContentItems(labels, items, selectedLabelIds, selectedTypes = []) {
+  const available = new Set(selectedLabelIds)
+  const typeSet = new Set(selectedTypes)
+  for (const c of items) {
+    for (const id of contentLabelIds(c)) {
+      const baCategory = c.labelSourceCategories?.[id]
+      if (typeSet.size === 0 || typeSet.has(c.category) || typeSet.has(baCategory)) available.add(id)
+    }
+  }
+  return labels.filter((l) => available.has(l.id))
 }
 
 export default function ContentView({ onNavigate, navContext, active = true }) {
@@ -447,6 +471,33 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
     selectedLabelIds,
   ])
 
+  const visibleLabels = useMemo(() => {
+    const items = applyContentSidebarFilters(
+      baseFiltered,
+      {
+        selectedTypes,
+        selectedPackageTypes,
+        packageFilter,
+        packageStatusFilter,
+        visibilityFilter,
+        selectedTags,
+        selectedLabelIds,
+      },
+      { selectedTypes: true, selectedLabelIds: true },
+    )
+    return labelsForContentItems(labels, items, selectedLabelIds, selectedTypes)
+  }, [
+    baseFiltered,
+    selectedTypes,
+    selectedPackageTypes,
+    packageFilter,
+    packageStatusFilter,
+    visibilityFilter,
+    selectedTags,
+    selectedLabelIds,
+    labels,
+  ])
+
   const filtered = useMemo(() => {
     let result = applyContentSidebarFilters(baseFiltered, {
       selectedTypes,
@@ -557,7 +608,7 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
           { value: 'local', label: 'Local', count: packageFilterCounts.local },
         ],
       },
-      ...(labels.length
+      ...(visibleLabels.length
         ? [
             {
               key: 'labels',
@@ -565,7 +616,7 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
               type: 'labels-autocomplete',
               value: selectedLabelIds,
               onChange: setSelectedLabelIds,
-              labels,
+              labels: visibleLabels,
               placeholder: 'Filter by label…',
             },
           ]
@@ -619,7 +670,7 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
       authorSearch,
       selectedTags,
       selectedLabelIds,
-      labels,
+      visibleLabels,
       tagCounts,
       authorCounts,
       primarySort,

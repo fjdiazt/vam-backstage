@@ -13,20 +13,22 @@ import {
 const hubView = readFileSync(resolve(import.meta.dirname, 'HubView.jsx'), 'utf8')
 const filterPanel = readFileSync(resolve(import.meta.dirname, '../components/FilterPanel.jsx'), 'utf8')
 
-describe('Hub installed filter UI', () => {
-  it('uses a switch instead of a two-option list', () => {
-    const start = hubView.indexOf("key: 'installed',")
+describe('Hub show filter UI', () => {
+  it('uses switches for installed and hidden visibility', () => {
+    const start = hubView.indexOf("key: 'show',")
     const end = hubView.indexOf('\n      },', start)
-    const installedSection = hubView.slice(start, end)
+    const showSection = hubView.slice(start, end)
 
-    expect(installedSection).toContain("type: 'switch'")
-    expect(installedSection).toContain("label: 'Installed'")
-    expect(installedSection).toContain("switchLabel: 'Hide installed'")
-    expect(installedSection).toContain('checked: hideInstalled')
-    expect(installedSection).toContain('onCheckedChange: setHideInstalled')
-    expect(installedSection).not.toContain('items:')
+    expect(showSection).toContain("type: 'switches'")
+    expect(showSection).toContain("label: 'Show'")
+    expect(showSection).toContain("label: 'Installed'")
+    expect(showSection).toContain('checked: !hideInstalled')
+    expect(showSection).toContain('onCheckedChange: (checked) => setHideInstalled(!checked)')
+    expect(showSection).toContain("label: 'Hidden'")
+    expect(showSection).toContain('checked: showHidden')
+    expect(showSection).toContain('onCheckedChange: setShowHidden')
     expect(filterPanel).toContain("import { Switch } from '@/components/ui/switch'")
-    expect(filterPanel).toContain("section.type === 'switch'")
+    expect(filterPanel).toContain("section.type === 'switches'")
   })
 })
 

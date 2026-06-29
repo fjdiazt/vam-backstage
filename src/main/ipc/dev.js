@@ -3,6 +3,7 @@ import { is } from '@electron-toolkit/utils'
 import { closeDatabase, deleteDatabaseFiles, getSetting } from '../db.js'
 import { stopWatcher } from '../watcher.js'
 import { syncBrowserAssistTags, browserAssistSettingsDirExists } from '../browser-assist.js'
+import { notify } from '../notify.js'
 
 export function registerDevHandlers() {
   ipcMain.handle('dev:is-dev', () => is.dev)
@@ -17,6 +18,10 @@ export function registerDevHandlers() {
     if (!vamDir) return { ok: false, error: 'VaM directory not configured' }
     try {
       const result = await syncBrowserAssistTags(vamDir)
+      if ((result.labelsImported ?? 0) > 0 || (result.labelsRemoved ?? 0) > 0) {
+        notify('labels:updated')
+        notify('contents:updated')
+      }
       return { ok: true, ...result }
     } catch (err) {
       return { ok: false, error: err.message }
