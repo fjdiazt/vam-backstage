@@ -18,9 +18,12 @@ import {
   applyLabelToContents,
   clearLabelContentSource,
   findOrCreateLabel,
+  getPackageHidden,
   removeLabelFromContents,
   setLabelContentSource,
+  setPackageHidden,
 } from './db.js'
+import { readPackageHiddenPrefs } from './package-prefs.js'
 
 const BA_REL_PARTS = ['Saves', 'PluginData', 'JayJayWon', 'BrowserAssist', 'VARResourcesUserData']
 const MANAGED_SCENE_TAGS = new Set(['scene-real', 'scene-look', 'scene-other'])
@@ -38,6 +41,10 @@ export function browserAssistSettingsDir(vamDir) {
 export function browserAssistSettingsDirExists(vamDir) {
   if (!vamDir || typeof vamDir !== 'string') return false
   return existsSync(browserAssistSettingsDir(vamDir))
+}
+
+export function applyBrowserAssistPackageHidden(currentHidden, baHidden) {
+  return typeof baHidden === 'boolean' ? baHidden : currentHidden
 }
 
 /**
@@ -304,6 +311,7 @@ function shallowTagsEqual(a, b) {
  *   labelsImported: number,
  *   labelsRemoved: number,
  *   labelsExported: number,
+ *   packagesHiddenImported: number,
  *   skippedNoMatch: number,
  *   errors: string[],
  * }>}
@@ -318,6 +326,7 @@ export async function syncBrowserAssistTags(vamDir) {
   let labelsImported = 0
   let labelsRemoved = 0
   let labelsExported = 0
+  let packagesHiddenImported = 0
   let skippedNoMatch = 0
   let labelsChanged = false
 
@@ -330,6 +339,7 @@ export async function syncBrowserAssistTags(vamDir) {
       labelsImported: 0,
       labelsRemoved: 0,
       labelsExported: 0,
+      packagesHiddenImported: 0,
       skippedNoMatch: 0,
       errors: [`BrowserAssist directory not found: ${dir}`],
     }
@@ -347,6 +357,7 @@ export async function syncBrowserAssistTags(vamDir) {
       labelsImported: 0,
       labelsRemoved: 0,
       labelsExported: 0,
+      packagesHiddenImported: 0,
       skippedNoMatch: 0,
       errors: [`Failed to read BrowserAssist directory: ${err.message}`],
     }
@@ -355,6 +366,32 @@ export async function syncBrowserAssistTags(vamDir) {
   const shardFiles = names.filter((n) => /^VARResourcesData.*\.userData$/i.test(n)).sort()
   const contentLookup = buildContentLookup()
   const packageLookup = buildPackageLookup()
+  const packageHiddenByName = new Map()
+
+  for (const [filename, pkg] of getPackageIndex()) {
+    const packageName = typeof pkg.package_name === 'string' ? pkg.package_name : ''
+    if (!packageName) continue
+
+    let baHidden
+    if (packageHiddenByName.has(packageName)) {
+      baHidden = packageHiddenByName.get(packageName)
+    } else {
+      try {
+        baHidden = await readPackageHiddenPrefs(vamDir, packageName)
+      } catch (err) {
+        errors.push(`${packageName}: package hidden prefs read failed — ${err.message}`)
+        baHidden = null
+      }
+      packageHiddenByName.set(packageName, baHidden)
+    }
+
+    const currentHidden = getPackageHidden(filename)
+    const nextHidden = applyBrowserAssistPackageHidden(currentHidden, baHidden)
+    if (nextHidden !== currentHidden) {
+      setPackageHidden(filename, nextHidden)
+      packagesHiddenImported++
+    }
+  }
 
   for (const name of shardFiles) {
     const filePath = join(dir, name)
@@ -494,6 +531,7 @@ export async function syncBrowserAssistTags(vamDir) {
     labelsImported,
     labelsRemoved,
     labelsExported,
+    packagesHiddenImported,
     skippedNoMatch,
     errors,
   }

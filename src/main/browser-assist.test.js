@@ -13,10 +13,27 @@ const storeMocks = vi.hoisted(() => ({
   getLabelNameById: vi.fn(() => null),
   refreshLabels: vi.fn(),
 }))
+const dbMocks = vi.hoisted(() => ({
+  applyLabelToContents: vi.fn(),
+  clearLabelContentSource: vi.fn(),
+  findOrCreateLabel: vi.fn((name) => ({ id: 1, name, created: false })),
+  getPackageHidden: vi.fn(() => null),
+  removeLabelFromContents: vi.fn(),
+  setLabelContentSource: vi.fn(),
+  setPackageHidden: vi.fn(),
+}))
+const packagePrefsMocks = vi.hoisted(() => ({ readPackageHiddenPrefs: vi.fn(() => null) }))
 
 vi.mock('./store.js', () => storeMocks)
+vi.mock('./db.js', () => ({
+  ...dbMocks,
+  LABEL_SOURCE_BACKSTAGE: 1,
+  LABEL_SOURCE_BROWSERASSIST: 2,
+}))
+vi.mock('./package-prefs.js', () => packagePrefsMocks)
 
 import {
+  applyBrowserAssistPackageHidden,
   browserAssistSettingsDir,
   browserAssistCategory,
   browserAssistUserTagNames,
@@ -46,11 +63,15 @@ describe('syncBrowserAssistTags — package-level labels', () => {
     await mkdir(shardDir, { recursive: true })
 
     for (const fn of Object.values(storeMocks)) fn.mockReset()
+    for (const fn of Object.values(dbMocks)) fn.mockClear()
+    packagePrefsMocks.readPackageHiddenPrefs.mockReset().mockResolvedValue(null)
+    dbMocks.getPackageHidden.mockReturnValue(null)
     storeMocks.getPackageIndex.mockReturnValue(new Map())
     storeMocks.getContentByPackage.mockReturnValue(new Map())
     storeMocks.effectivePackageType.mockReturnValue('Scenes')
     storeMocks.getLabelsByPackageMap.mockReturnValue(new Map())
     storeMocks.getLabelsByContentMap.mockReturnValue(new Map())
+    storeMocks.getLabelContentSourcesMap.mockReturnValue(new Map())
     storeMocks.getLabelNameById.mockReturnValue(null)
   })
 
@@ -258,5 +279,12 @@ describe('BrowserAssist user tag helpers', () => {
       browserAssistCategory('Saves/scene/Demo.json', [{ tagName: 'scene-look', tagCategory: 'User' }], 'scene'),
     ).toBe('Looks')
     expect(browserAssistCategory('Custom/Hair/Foo.vam', [], 'hairItem')).toBe('Hairstyles')
+  })
+
+  it('applies BrowserAssist package hidden when explicit', () => {
+    expect(applyBrowserAssistPackageHidden(null, true)).toBe(true)
+    expect(applyBrowserAssistPackageHidden(false, true)).toBe(true)
+    expect(applyBrowserAssistPackageHidden(true, false)).toBe(false)
+    expect(applyBrowserAssistPackageHidden(true, null)).toBe(true)
   })
 })
