@@ -4,6 +4,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 
 const storeMocks = vi.hoisted(() => ({
+  buildFromDb: vi.fn(),
   getPackageIndex: vi.fn(() => new Map()),
   getContentByPackage: vi.fn(() => new Map()),
   effectivePackageType: vi.fn(() => 'Scenes'),
@@ -39,6 +40,7 @@ import {
   browserAssistUserTagNames,
   mergeBrowserAssistUserTags,
   syncBrowserAssistTags,
+  syncBrowserAssistPackageHidden,
 } from './browser-assist.js'
 
 const BA_REL = ['Saves', 'PluginData', 'JayJayWon', 'BrowserAssist', 'VARResourcesUserData']
@@ -286,5 +288,43 @@ describe('BrowserAssist user tag helpers', () => {
     expect(applyBrowserAssistPackageHidden(false, true)).toBe(true)
     expect(applyBrowserAssistPackageHidden(true, false)).toBe(false)
     expect(applyBrowserAssistPackageHidden(true, null)).toBe(true)
+  })
+
+  it('imports package hidden prefs and refreshes summaries', async () => {
+    const writes = []
+    const refreshes = []
+
+    const result = await syncBrowserAssistPackageHidden('VAM', {
+      packageIndex: () =>
+        new Map([
+          ['A.Pkg.1.var', { package_name: 'A.Pkg' }],
+          ['B.Pkg.1.var', { package_name: 'B.Pkg' }],
+        ]),
+      readHiddenPrefs: async (_vamDir, packageName) => (packageName === 'A.Pkg' ? true : null),
+      readCurrentHidden: (filename) => (filename === 'A.Pkg.1.var' ? false : null),
+      writeHidden: (filename, hidden) => writes.push([filename, hidden]),
+      refreshStore: (opts) => refreshes.push(opts),
+    })
+
+    expect(result).toEqual({ packagesHiddenImported: 1, errors: [] })
+    expect(writes).toEqual([['A.Pkg.1.var', true]])
+    expect(refreshes).toEqual([{ skipGraph: true }])
+  })
+
+  it('does not refresh summaries when package prefs make no DB changes', async () => {
+    const refreshes = []
+
+    const result = await syncBrowserAssistPackageHidden('VAM', {
+      packageIndex: () => new Map([['A.Pkg.1.var', { package_name: 'A.Pkg' }]]),
+      readHiddenPrefs: async () => true,
+      readCurrentHidden: () => true,
+      writeHidden: () => {
+        throw new Error('unexpected write')
+      },
+      refreshStore: (opts) => refreshes.push(opts),
+    })
+
+    expect(result).toEqual({ packagesHiddenImported: 0, errors: [] })
+    expect(refreshes).toEqual([])
   })
 })

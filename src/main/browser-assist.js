@@ -11,6 +11,7 @@ import {
   getLabelContentSourcesMap,
   getLabelNameById,
   refreshLabels,
+  buildFromDb,
 } from './store.js'
 import {
   LABEL_SOURCE_BACKSTAGE,
@@ -45,6 +46,49 @@ export function browserAssistSettingsDirExists(vamDir) {
 
 export function applyBrowserAssistPackageHidden(currentHidden, baHidden) {
   return typeof baHidden === 'boolean' ? baHidden : currentHidden
+}
+
+export async function syncBrowserAssistPackageHidden(
+  vamDir,
+  {
+    packageIndex = getPackageIndex,
+    readHiddenPrefs = readPackageHiddenPrefs,
+    readCurrentHidden = getPackageHidden,
+    writeHidden = setPackageHidden,
+    refreshStore = buildFromDb,
+  } = {},
+) {
+  const errors = []
+  let packagesHiddenImported = 0
+  const packageHiddenByName = new Map()
+
+  for (const [filename, pkg] of packageIndex()) {
+    const packageName = typeof pkg.package_name === 'string' ? pkg.package_name : ''
+    if (!packageName) continue
+
+    let baHidden
+    if (packageHiddenByName.has(packageName)) {
+      baHidden = packageHiddenByName.get(packageName)
+    } else {
+      try {
+        baHidden = await readHiddenPrefs(vamDir, packageName)
+      } catch (err) {
+        errors.push(`${packageName}: package hidden prefs read failed — ${err.message}`)
+        baHidden = null
+      }
+      packageHiddenByName.set(packageName, baHidden)
+    }
+
+    const currentHidden = readCurrentHidden(filename)
+    const nextHidden = applyBrowserAssistPackageHidden(currentHidden, baHidden)
+    if (nextHidden !== currentHidden) {
+      writeHidden(filename, nextHidden)
+      packagesHiddenImported++
+    }
+  }
+
+  if (packagesHiddenImported > 0) refreshStore({ skipGraph: true })
+  return { packagesHiddenImported, errors }
 }
 
 /**
@@ -330,6 +374,10 @@ export async function syncBrowserAssistTags(vamDir) {
   let skippedNoMatch = 0
   let labelsChanged = false
 
+  const packageHiddenSync = await syncBrowserAssistPackageHidden(vamDir)
+  packagesHiddenImported = packageHiddenSync.packagesHiddenImported
+  errors.push(...packageHiddenSync.errors)
+
   if (!existsSync(dir)) {
     return {
       shardsRead: 0,
@@ -339,9 +387,9 @@ export async function syncBrowserAssistTags(vamDir) {
       labelsImported: 0,
       labelsRemoved: 0,
       labelsExported: 0,
-      packagesHiddenImported: 0,
+      packagesHiddenImported,
       skippedNoMatch: 0,
-      errors: [`BrowserAssist directory not found: ${dir}`],
+      errors: [...errors, `BrowserAssist directory not found: ${dir}`],
     }
   }
 
@@ -357,41 +405,15 @@ export async function syncBrowserAssistTags(vamDir) {
       labelsImported: 0,
       labelsRemoved: 0,
       labelsExported: 0,
-      packagesHiddenImported: 0,
+      packagesHiddenImported,
       skippedNoMatch: 0,
-      errors: [`Failed to read BrowserAssist directory: ${err.message}`],
+      errors: [...errors, `Failed to read BrowserAssist directory: ${err.message}`],
     }
   }
 
   const shardFiles = names.filter((n) => /^VARResourcesData.*\.userData$/i.test(n)).sort()
   const contentLookup = buildContentLookup()
   const packageLookup = buildPackageLookup()
-  const packageHiddenByName = new Map()
-
-  for (const [filename, pkg] of getPackageIndex()) {
-    const packageName = typeof pkg.package_name === 'string' ? pkg.package_name : ''
-    if (!packageName) continue
-
-    let baHidden
-    if (packageHiddenByName.has(packageName)) {
-      baHidden = packageHiddenByName.get(packageName)
-    } else {
-      try {
-        baHidden = await readPackageHiddenPrefs(vamDir, packageName)
-      } catch (err) {
-        errors.push(`${packageName}: package hidden prefs read failed — ${err.message}`)
-        baHidden = null
-      }
-      packageHiddenByName.set(packageName, baHidden)
-    }
-
-    const currentHidden = getPackageHidden(filename)
-    const nextHidden = applyBrowserAssistPackageHidden(currentHidden, baHidden)
-    if (nextHidden !== currentHidden) {
-      setPackageHidden(filename, nextHidden)
-      packagesHiddenImported++
-    }
-  }
 
   for (const name of shardFiles) {
     const filePath = join(dir, name)
