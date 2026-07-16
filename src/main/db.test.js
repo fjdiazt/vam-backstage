@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import Database from 'better-sqlite3'
+import { readFile } from 'fs/promises'
+import { dirname, join } from 'path'
 import { mkTempVamDir, openTestDatabase } from '../../test/fixtures/index.js'
 import { LOCAL_PACKAGE_FILENAME } from '@shared/local-package.js'
 import {
@@ -237,6 +239,46 @@ describe('migrate v24 (package subpath)', () => {
 
   it('sets needs_rescan so the next scan re-derives nested subpaths', () => {
     expect(getDb().prepare(`SELECT value FROM settings WHERE key = 'needs_rescan'`).get()?.value).toBe('1')
+  })
+})
+
+describe('migrate fork v28 database', () => {
+  it('preserves custom wishlist data while replaying upstream migrations', async () => {
+    tmp = await mkTempVamDir()
+    const thumbnail = Buffer.from('legacy-thumbnail')
+    buildForkV28Database(tmp.dbPath, thumbnail)
+
+    await openTestDatabase(tmp.dbPath)
+
+    const db = getDb()
+    expect(db.pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION)
+    expect(
+      db
+        .prepare('PRAGMA table_info(hub_wishlist)')
+        .all()
+        .map((c) => c.name),
+    ).toEqual(['resource_id', 'snapshot_json', 'created_at', 'snapshot_at', 'unavailable_at'])
+    const row = db.prepare('SELECT * FROM hub_wishlist WHERE resource_id = ?').get('64905')
+    expect(JSON.parse(row.snapshot_json)).toMatchObject({
+      resource_id: '64905',
+      title: 'Legacy wishlist item',
+      image_url: 'https://example.test/thumb.jpg',
+    })
+    expect(row.created_at).toBe(100)
+    expect(row.snapshot_at).toBe(200)
+    expect(await readFile(join(dirname(tmp.dbPath), 'thumb-cache', 'hub-icon-64905.jpg'))).toEqual(thumbnail)
+    expect(
+      db
+        .prepare('PRAGMA table_info(packages)')
+        .all()
+        .map((c) => c.name),
+    ).toEqual(expect.arrayContaining(['subpath', 'missing_since', 'hidden']))
+    expect(
+      db
+        .prepare('PRAGMA table_info(library_dirs)')
+        .all()
+        .map((c) => c.name),
+    ).toContain('browser_assist')
   })
 })
 
@@ -622,6 +664,71 @@ function buildV22Database(dbPath) {
   const hu = raw.prepare(`INSERT INTO hub_users (user_id) VALUES (?)`)
   for (const id of ['5', 'null']) hu.run(id)
 
+  raw.close()
+}
+
+/** Fork schema v28 reused upstream version numbers for local features. */
+function buildForkV28Database(dbPath, thumbnail) {
+  const raw = new Database(dbPath)
+  raw.exec(V22_SCHEMA_SQL)
+  raw.exec(`
+    CREATE TABLE schema_version (version INTEGER NOT NULL);
+    INSERT INTO schema_version (version) VALUES (28);
+    ALTER TABLE packages ADD COLUMN hidden INTEGER;
+    CREATE TABLE hub_wishlist (
+      resource_id TEXT PRIMARY KEY,
+      title TEXT,
+      url TEXT,
+      image_url TEXT,
+      image_blob BLOB,
+      image_mime TEXT,
+      username TEXT,
+      type TEXT,
+      category TEXT,
+      license TEXT,
+      snapshot_json TEXT,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    CREATE TABLE hub_hidden (
+      resource_id TEXT PRIMARY KEY,
+      title TEXT,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    CREATE TABLE label_content_sources (
+      label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+      package_filename TEXT NOT NULL REFERENCES packages(filename) ON DELETE CASCADE,
+      internal_path TEXT NOT NULL,
+      source_mask INTEGER NOT NULL,
+      ba_category TEXT,
+      PRIMARY KEY (label_id, package_filename, internal_path)
+    );
+    CREATE INDEX idx_label_content_sources_pkgpath
+      ON label_content_sources(package_filename, internal_path);
+  `)
+  raw
+    .prepare(
+      `INSERT INTO hub_wishlist (
+        resource_id, title, url, image_url, image_blob, image_mime, username,
+        type, category, license, snapshot_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      '64905',
+      'Legacy wishlist item',
+      'https://hub.virtamate.com/resources/64905/',
+      'https://example.test/thumb.jpg',
+      thumbnail,
+      'image/jpeg',
+      'Creator',
+      'Looks',
+      'Paid',
+      'CC BY',
+      JSON.stringify({ resource_id: '64905', title: 'Legacy wishlist item' }),
+      100,
+      200,
+    )
   raw.close()
 }
 

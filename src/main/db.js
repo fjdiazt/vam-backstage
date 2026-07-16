@@ -1,10 +1,10 @@
 import Database from 'better-sqlite3'
-import { existsSync, unlinkSync } from 'fs'
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'fs'
 import { app } from 'electron'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import { LOCAL_PACKAGE_FILENAME, LOCAL_PACKAGE_DISPLAY_NAME } from '@shared/local-package.js'
 
-export const SCHEMA_VERSION = 31
+export const SCHEMA_VERSION = 32
 
 /**
  * Normalize a value to a non-negative integer string, or null. Hub resource/user
@@ -120,7 +120,13 @@ function adoptLegacySchemaVersion() {
   if (!hasTable) return
   db.transaction(() => {
     const row = db.prepare('SELECT version FROM schema_version').get()
-    if (row?.version) setSchemaVersion(row.version)
+    if (row?.version) {
+      // Fork builds v24-v28 reused upstream version numbers for different
+      // features. Their Wishlist BLOB column is the stable schema fingerprint.
+      const wishlistColumns = db.prepare(`PRAGMA table_info(hub_wishlist)`).all()
+      const isForkSchema = wishlistColumns.some((column) => column.name === 'image_blob')
+      setSchemaVersion(isForkSchema ? 23 : row.version)
+    }
     db.exec('DROP TABLE schema_version')
   })()
 }
@@ -150,6 +156,7 @@ export const MIGRATIONS = [
   [29, applyV29],
   [30, applyV30],
   [31, applyV31],
+  [32, applyV32],
 ]
 
 function migrate() {
@@ -411,8 +418,12 @@ function applyV24() {
  * matches the hub-id hygiene of the other hub tables.
  */
 function applyV25() {
+  migrateLegacyWishlistTable()
+}
+
+function createWishlistTable() {
   db.exec(`
-    CREATE TABLE hub_wishlist (
+    CREATE TABLE IF NOT EXISTS hub_wishlist (
       resource_id TEXT PRIMARY KEY CHECK (${intCheckSql('resource_id')}),
       snapshot_json TEXT NOT NULL,
       created_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -420,6 +431,52 @@ function applyV25() {
       unavailable_at INTEGER
     );
   `)
+}
+
+function migrateLegacyWishlistTable() {
+  const columns = db.prepare(`PRAGMA table_info(hub_wishlist)`).all()
+  if (columns.length === 0) {
+    createWishlistTable()
+    return
+  }
+  if (!columns.some((column) => column.name === 'image_blob')) return
+
+  const rows = db.prepare('SELECT * FROM hub_wishlist').all()
+  const thumbCacheDir = join(dirname(getDatabasePath()), 'thumb-cache')
+  const rowsWithImages = rows.filter((row) => row.image_blob?.length)
+  if (rowsWithImages.length > 0) {
+    mkdirSync(thumbCacheDir, { recursive: true })
+    for (const row of rowsWithImages) {
+      const path = join(thumbCacheDir, `hub-icon-${row.resource_id}.jpg`)
+      if (!existsSync(path)) writeFileSync(path, row.image_blob)
+    }
+  }
+
+  db.exec('ALTER TABLE hub_wishlist RENAME TO hub_wishlist_legacy')
+  createWishlistTable()
+  const insert = db.prepare(
+    `INSERT INTO hub_wishlist (resource_id, snapshot_json, created_at, snapshot_at)
+     VALUES (?, ?, ?, ?)`,
+  )
+  for (const row of rows) {
+    let stored = {}
+    try {
+      stored = JSON.parse(row.snapshot_json) || {}
+    } catch {}
+    const snapshot = {
+      title: row.title,
+      url: row.url,
+      image_url: row.image_url,
+      username: row.username,
+      type: row.type,
+      category: row.category,
+      license: row.license,
+      ...stored,
+      resource_id: row.resource_id,
+    }
+    insert.run(row.resource_id, JSON.stringify(snapshot), row.created_at, row.updated_at || row.created_at)
+  }
+  db.exec('DROP TABLE hub_wishlist_legacy')
 }
 
 /**
@@ -511,7 +568,16 @@ function applyV30() {
   }
 }
 function applyV31() {
-  db.exec('ALTER TABLE packages ADD COLUMN hidden INTEGER')
+  const columns = db.prepare(`PRAGMA table_info(packages)`).all()
+  if (!columns.some((column) => column.name === 'hidden')) {
+    db.exec('ALTER TABLE packages ADD COLUMN hidden INTEGER')
+  }
+}
+
+// Compatibility release: also repairs a fork table if a DB was manually
+// stamped with the merged schema version before legacy-version adoption.
+function applyV32() {
+  migrateLegacyWishlistTable()
 }
 /**
  * Ensure the synthetic "local content" package row exists. Loose files under
