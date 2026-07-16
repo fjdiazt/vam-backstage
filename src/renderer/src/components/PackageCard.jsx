@@ -193,6 +193,9 @@ export function HubCard({
   onInstall,
   onPromote,
   onFilterAuthor,
+  onHide,
+  onUnhide,
+  isHidden = false,
   mode = 'medium',
   hideType,
   linkAction,
@@ -384,6 +387,7 @@ export function HubCard({
 
   return (
     <div
+      data-hub-resource-id={rid}
       className={`@container group w-full min-w-0 bg-surface border rounded-lg overflow-hidden text-left transition-all duration-150 flex flex-col border-border ${
         linkAction ? '' : 'card-glow cursor-pointer hover:bg-elevated'
       }`}
@@ -428,28 +432,45 @@ export function HubCard({
               )}
             </div>
           )}
-          {showWishlistToggle && (
-            <div className="absolute top-1.5 right-1.5 z-2">
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  toggleWishlist(resource)
-                }}
-                title={wishlist || wishlisted ? 'Remove from wishlist' : 'Add to wishlist'}
-                aria-label={wishlist || wishlisted ? 'Remove from wishlist' : 'Add to wishlist'}
-                className={
-                  wishlist
-                    ? 'size-7 shrink-0 inline-flex items-center justify-center rounded transition cursor-pointer text-white/70 bg-black/50 backdrop-blur-sm opacity-0 group-hover:opacity-100 hover:text-error'
-                    : `size-7 shrink-0 inline-flex items-center justify-center rounded transition cursor-pointer ${
-                        wishlisted
-                          ? `text-accent-blue opacity-100 bg-transparent ${THUMB_FILLED_ICON_SHADOW} group-hover:bg-black/50 group-hover:backdrop-blur-sm`
-                          : 'text-white/60 bg-black/50 backdrop-blur-sm opacity-0 group-hover:opacity-100'
-                      }`
-                }
-              >
-                {wishlist ? <Trash2 size={13} /> : <Pin size={13} fill={wishlisted ? 'currentColor' : 'none'} />}
-              </button>
+          {(showWishlistToggle || onHide || onUnhide) && (
+            <div className="absolute top-1.5 right-1.5 z-2 flex items-center gap-1">
+              {(onHide || onUnhide) && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    if (isHidden) onUnhide?.(resource)
+                    else onHide?.(resource)
+                  }}
+                  title={isHidden ? 'Show in Hub' : 'Hide from Hub'}
+                  aria-label={isHidden ? 'Show in Hub' : 'Hide from Hub'}
+                  className="size-7 shrink-0 inline-flex items-center justify-center rounded transition cursor-pointer text-white/60 bg-black/50 backdrop-blur-sm opacity-0 group-hover:opacity-100 hover:text-white"
+                >
+                  {isHidden ? <Eye size={13} /> : <EyeOff size={13} />}
+                </button>
+              )}
+              {showWishlistToggle && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    toggleWishlist(resource)
+                  }}
+                  title={wishlist || wishlisted ? 'Remove from wishlist' : 'Add to wishlist'}
+                  aria-label={wishlist || wishlisted ? 'Remove from wishlist' : 'Add to wishlist'}
+                  className={
+                    wishlist
+                      ? 'size-7 shrink-0 inline-flex items-center justify-center rounded transition cursor-pointer text-white/70 bg-black/50 backdrop-blur-sm opacity-0 group-hover:opacity-100 hover:text-error'
+                      : `size-7 shrink-0 inline-flex items-center justify-center rounded transition cursor-pointer ${
+                          wishlisted
+                            ? `text-accent-blue opacity-100 bg-transparent ${THUMB_FILLED_ICON_SHADOW} group-hover:bg-black/50 group-hover:backdrop-blur-sm`
+                            : 'text-white/60 bg-black/50 backdrop-blur-sm opacity-0 group-hover:opacity-100'
+                        }`
+                  }
+                >
+                  {wishlist ? <Trash2 size={13} /> : <Pin size={13} fill={wishlisted ? 'currentColor' : 'none'} />}
+                </button>
+              )}
             </div>
           )}
           {minimal && (

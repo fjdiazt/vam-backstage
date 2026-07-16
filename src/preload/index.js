@@ -104,6 +104,13 @@ const api = {
     toggleBookmark: (id, currentlyBookmarked) => invoke('hub:toggleBookmark', id, currentlyBookmarked),
     toggleRate: (id, currentlyRated) => invoke('hub:toggleRate', id, currentlyRated),
     toggleLike: (id) => invoke('hub:toggleLike', id),
+    hidden: {
+      list: () => invoke('hub:hidden:list'),
+      ids: () => invoke('hub:hidden:ids'),
+      hide: (resource) => invoke('hub:hidden:hide', resource),
+      unhide: (resourceId) => invoke('hub:hidden:unhide', resourceId),
+      clear: () => invoke('hub:hidden:clear'),
+    },
   },
   wishlist: {
     list: () => invoke('wishlist:list'),

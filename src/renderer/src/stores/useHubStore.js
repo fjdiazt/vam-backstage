@@ -2,10 +2,21 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { toast } from '@/components/Toast'
 import { useInstalledStore } from './useInstalledStore'
-import { persistViewState, oneOf, asArray, asPolarityList, asString, asCardWidth } from './persistViewState'
+import {
+  persistViewState,
+  oneOf,
+  asArray,
+  asPolarityList,
+  asString,
+  asBool,
+  asObject,
+  asClamped,
+  asCardWidth,
+} from './persistViewState'
 
 /** Gallery data sources. Extend this (and the toolbar segmented control) to add future modes. */
 export const GALLERY_MODES = ['hub', 'wishlist']
+export const HUB_PER_PAGE_OPTIONS = [30, 60, 90, 120]
 
 /**
  * Freshness key over the hub-query fields, so returning to Hub doesn't refetch
@@ -20,6 +31,7 @@ export function hubFilterSignature(state) {
     state.selectedHubTags.join(','),
     state.sort,
     state.license,
+    state.perPage,
   ].join('\u0000')
 }
 
@@ -49,6 +61,7 @@ export const WISHLIST_FILTER_DEFAULTS = {
 }
 
 let fetchSeq = 0
+let tailResolveSeq = 0
 
 function syncInstalledFromResources(resources) {
   useInstalledStore.getState().applyBatch(
@@ -66,6 +79,89 @@ function syncInstalledFromDetail(detail) {
   useInstalledStore.getState().update(detail.resource_id, detail._installed, detail._isDirect, detail._localFilename)
 }
 
+function hubResources(result) {
+  return Array.isArray(result?.resources) ? result.resources : []
+}
+
+function hubSearchParams(state, page) {
+  const params = { page, perpage: state.perPage }
+  if (state.sort) params.sort = state.sort
+  if (state.search) params.search = state.search
+  if (state.selectedType !== 'All') params.type = state.selectedType
+  if (state.paidFilter === 'free') params.category = 'Free'
+  else if (state.paidFilter === 'paid') params.category = 'Paid'
+  if (state.authorSearch) params.username = state.authorSearch
+  if (state.selectedHubTags?.length) params.tags = state.selectedHubTags.join(',')
+  if (state.license && state.license !== 'Any') params.license = state.license
+  return params
+}
+
+export function hubTailCacheKey(state) {
+  return JSON.stringify({
+    search: state.search || '',
+    selectedType: state.selectedType || 'All',
+    paidFilter: state.paidFilter || 'all',
+    authorSearch: state.authorSearch || '',
+    selectedHubTags: state.selectedHubTags || [],
+    sort: state.sort || '',
+    license: state.license || 'Any',
+    perPage: state.perPage,
+  })
+}
+
+function cachedTailPage(cache, key) {
+  const entry = cache?.[key]
+  const page = typeof entry === 'number' ? entry : entry?.totalPages
+  return Number.isInteger(page) && page > 0 ? page : null
+}
+
+async function resolveEmptyTailPage(params, requestedPage, isCurrent) {
+  let emptyUpper = requestedPage
+  let lowerPage = 0
+  let lowerResult = null
+  let step = 1
+
+  while (requestedPage - step > 0) {
+    const page = Math.max(1, requestedPage - step)
+    const result = await window.api.hub.search({ ...params, page })
+    if (!isCurrent()) return null
+    if (hubResources(result).length) {
+      lowerPage = page
+      lowerResult = result
+      break
+    }
+    emptyUpper = page
+    step *= 2
+  }
+
+  if (!lowerResult) {
+    const result = await window.api.hub.search({ ...params, page: 1 })
+    return isCurrent() ? { page: 1, result } : null
+  }
+
+  while (lowerPage + 1 < emptyUpper) {
+    const page = Math.floor((lowerPage + emptyUpper) / 2)
+    const result = await window.api.hub.search({ ...params, page })
+    if (!isCurrent()) return null
+    if (hubResources(result).length) {
+      lowerPage = page
+      lowerResult = result
+    } else {
+      emptyUpper = page
+    }
+  }
+
+  return { page: lowerPage, result: lowerResult }
+}
+
+async function resolveTailPage(params, reportedPage, isCurrent) {
+  const page = Math.max(1, Number(reportedPage) || 1)
+  const result = await window.api.hub.search({ ...params, page })
+  if (!isCurrent()) return null
+  if (hubResources(result).length) return { page, result }
+  return resolveEmptyTailPage(params, page, isCurrent)
+}
+
 // Renderer-side detail cache (insertion-order LRU). The main process already
 // caches detail payloads, but every `openDetail` still clears `detailData` and
 // awaits an async IPC round-trip — so without this the panel always flashes a
@@ -81,6 +177,36 @@ function cacheDetail(detail) {
   if (detailCache.size > MAX_DETAIL_CACHE) detailCache.delete(detailCache.keys().next().value)
 }
 
+export const HUB_PERSISTED_STATE = {
+  search: asString,
+  selectedType: asString,
+  paidFilter: oneOf(['all', 'free', 'paid']),
+  selectedHubTags: asArray,
+  authorSearch: asString,
+  license: asString,
+  sort: asString,
+  hideInstalled: asBool,
+  showHidden: asBool,
+  browseMode: oneOf(['infinite', 'paged']),
+  page: asClamped(1, Number.MAX_SAFE_INTEGER),
+  startPage: asClamped(1, Number.MAX_SAFE_INTEGER),
+  restorePage: asClamped(1, Number.MAX_SAFE_INTEGER),
+  perPage: oneOf(HUB_PER_PAGE_OPTIONS),
+  showInfinitePagerControls: asBool,
+  trackInfiniteRestorePage: asBool,
+  tailCache: asObject,
+  wlSearch: asString,
+  wlType: asString,
+  wlTags: asPolarityList,
+  wlPaid: oneOf(['all', 'free', 'paid']),
+  wlAuthor: asString,
+  wlExcludedAuthors: asArray,
+  wlLicense: asString,
+  wlSort: asString,
+  cardMode: oneOf(['minimal', 'medium']),
+  cardWidth: asCardWidth,
+}
+
 export const useHubStore = create(
   persist(
     (set, get) => ({
@@ -88,14 +214,27 @@ export const useHubStore = create(
       totalFound: 0,
       totalPages: 0,
       page: 1,
+      startPage: 1,
+      restorePage: 1,
+      perPage: HUB_PER_PAGE_OPTIONS[0],
+      browseMode: 'infinite',
+      showInfinitePagerControls: true,
+      trackInfiniteRestorePage: true,
       loading: false,
+      loadingPrevious: false,
+      tailResolving: false,
       error: null,
+      tailCache: {},
+      tailCacheKey: '',
+      resolvedTotalPages: null,
       // Hub filter signature at the last reset-fetch; lets HubView skip a redundant
       // reset+fetch on reveal. Not persisted (nor are resources), so launch refetches.
       lastFetchedKey: null,
 
       ...HUB_FILTER_DEFAULTS,
       sort: '',
+      hideInstalled: false,
+      showHidden: false,
 
       // `wlSort` values are the local sort keys defined in HubView (WISHLIST_SORTS);
       // default 'added' = created_at DESC.
@@ -135,6 +274,8 @@ export const useHubStore = create(
       setSelectedHubTags: (selectedHubTags) => set({ selectedHubTags }),
       setSort: (sort) => set({ sort }),
       setLicense: (license) => set({ license }),
+      setHideInstalled: (hideInstalled) => set({ hideInstalled }),
+      setShowHidden: (showHidden) => set({ showHidden }),
       setWlSearch: (wlSearch) => set({ wlSearch }),
       setWlType: (wlType) => set({ wlType }),
       setWlTags: (wlTags) => set({ wlTags }),
@@ -147,20 +288,96 @@ export const useHubStore = create(
       setCardWidth: (cardWidth) => set({ cardWidth }),
       setGalleryMode: (galleryMode) => set({ galleryMode }),
       setPage: (page) => set({ page }),
+      setBrowseMode: (browseMode) => set({ browseMode: browseMode === 'paged' ? 'paged' : 'infinite' }),
+      setShowInfinitePagerControls: (showInfinitePagerControls) => set({ showInfinitePagerControls }),
+      setTrackInfiniteRestorePage: (trackInfiniteRestorePage) => set({ trackInfiniteRestorePage }),
+      setInfiniteRestorePage: (page) => {
+        const state = get()
+        if (!state.trackInfiniteRestorePage) return
+        const restorePage = Math.min(Math.max(1, Number(page) || 1), Math.max(state.totalPages || 1, 1))
+        if (restorePage !== state.restorePage) set({ restorePage })
+      },
+      setPerPage: (perPage) => {
+        const nextPerPage = HUB_PER_PAGE_OPTIONS.includes(Number(perPage)) ? Number(perPage) : HUB_PER_PAGE_OPTIONS[0]
+        const state = get()
+        if (nextPerPage === state.perPage) return
+        const basePage = state.browseMode === 'infinite' ? state.restorePage : state.page
+        const nextPage = Math.floor(((basePage - 1) * state.perPage) / nextPerPage) + 1
+        set({ perPage: nextPerPage, page: nextPage, startPage: nextPage, restorePage: nextPage })
+      },
+      goToPage: async (page) => {
+        const target = Math.max(1, Number(page) || 1)
+        if (get().resolvedTotalPages && target >= get().resolvedTotalPages) {
+          const resolved = await get().resolveTailPages({ force: true })
+          return get().fetchResources(true, { page: resolved || target })
+        }
+        return get().fetchResources(true, { page: target })
+      },
+      startInfiniteAtPage: async (page) => {
+        const target = Math.min(Math.max(1, Number(page) || 1), Math.max(get().totalPages || 1, 1))
+        if (get().resolvedTotalPages && target >= get().resolvedTotalPages) {
+          const resolved = Math.max(1, Number(await get().resolveTailPages({ force: true })) || target)
+          set({ startPage: resolved, restorePage: resolved })
+          return get().fetchResources(true, { page: resolved })
+        }
+        set({ startPage: target, restorePage: target })
+        return get().fetchResources(true, { page: target })
+      },
+      clearCurrentTailCache: () => {
+        const key = hubTailCacheKey(get())
+        if (!get().tailCache[key]) return set({ resolvedTotalPages: null, tailCacheKey: key })
+        const tailCache = { ...get().tailCache }
+        delete tailCache[key]
+        set({ tailCache, resolvedTotalPages: null, tailCacheKey: key })
+      },
+      resolveTailPages: async ({ force = false } = {}) => {
+        const state = get()
+        const key = hubTailCacheKey(state)
+        const cached = cachedTailPage(state.tailCache, key)
+        if (cached && !force) {
+          set({ tailCacheKey: key, resolvedTotalPages: cached, totalPages: cached, tailResolving: false })
+          return cached
+        }
+
+        const seq = ++tailResolveSeq
+        set({ tailCacheKey: key, tailResolving: true })
+        try {
+          const params = hubSearchParams(get(), 1)
+          let reported = cached || Math.max(1, Number(get().totalPages) || 1)
+          if (force && cached) {
+            const nextResult = await window.api.hub.search({ ...params, page: cached + 1 })
+            if (seq !== tailResolveSeq || key !== hubTailCacheKey(get())) return null
+            if (hubResources(nextResult).length)
+              reported = Math.max(cached + 1, Number(nextResult.totalPages) || cached + 1)
+          }
+          const resolved = await resolveTailPage(
+            params,
+            reported,
+            () => seq === tailResolveSeq && key === hubTailCacheKey(get()),
+          )
+          if (!resolved) return null
+          const totalPages = resolved.page
+          const tailCache = { ...get().tailCache, [key]: { totalPages, resolvedAt: Date.now() } }
+          set({ tailCache, tailCacheKey: key, resolvedTotalPages: totalPages, totalPages, tailResolving: false })
+          return totalPages
+        } catch {
+          if (seq === tailResolveSeq) set({ tailResolving: false })
+          return null
+        }
+      },
 
       fetchFilters: async (force) => {
         if (!force && get().filterOptions) return
         if (!get().resources.length) set({ loading: true })
         try {
           const options = await window.api.hub.filters()
-          set({ filterOptions: options })
           const list = options?.sort || []
           let nextSort = get().sort
           // Only adopt/repair sort from a non-empty option list; never wipe a
           // valid persisted sort just because the list came back empty (that
           // would stall the search effect, which bails on an empty sort).
           if (list.length && (!nextSort || !list.includes(nextSort))) nextSort = list[0]
-          set({ sort: nextSort })
+          set({ filterOptions: options, sort: nextSort })
         } catch (err) {
           console.error('Failed to fetch hub filters:', err)
         }
@@ -169,47 +386,99 @@ export const useHubStore = create(
       fetchResources: async (resetPage, opts) => {
         const seq = ++fetchSeq
         const state = get()
-        const page = resetPage ? 1 : state.page
-        const replaceResources = resetPage || page === 1
-        if (resetPage && state.page !== 1) set({ page: 1 })
-        set({ loading: true, error: null, ...(replaceResources ? { resources: [] } : {}) })
+        let requestedPage = Math.max(1, Number(opts?.page ?? (resetPage ? 1 : state.page)) || 1)
+        const append = opts?.append === true
+        set({ loading: true, loadingPrevious: false, error: null, ...(append ? {} : { resources: [] }) })
         try {
           if (opts?.forceRefresh) {
+            get().clearCurrentTailCache()
             await window.api.hub.invalidateCaches()
             await get().fetchFilters(true)
           }
-          const q = get()
-          const params = { page, perpage: 30 }
-          if (q.sort) params.sort = q.sort
-          if (q.search) params.search = q.search
-          if (q.selectedType !== 'All') params.type = q.selectedType
-          if (q.paidFilter === 'free') params.category = 'Free'
-          else if (q.paidFilter === 'paid') params.category = 'Paid'
-          if (q.authorSearch) params.username = q.authorSearch
-          if (q.selectedHubTags?.length) params.tags = q.selectedHubTags.join(',')
-          if (q.license && q.license !== 'Any') params.license = q.license
-
-          const result = await window.api.hub.search(params)
+          const key = hubTailCacheKey(get())
+          const cachedTotalPages = cachedTailPage(get().tailCache, key)
+          if (cachedTotalPages && requestedPage > cachedTotalPages) requestedPage = cachedTotalPages
           if (seq !== fetchSeq) return
-          const incoming = result.resources || []
+          const q = get()
+          const result = await window.api.hub.search(hubSearchParams(q, requestedPage))
+          if (seq !== fetchSeq) return
+          let incoming = hubResources(result)
+          let totalFound = result.totalFound || 0
+          let totalPages = cachedTotalPages || result.totalPages || 0
+          let page = requestedPage
+          if (!append && requestedPage > 1 && incoming.length === 0 && totalPages >= requestedPage) {
+            const resolved = await resolveEmptyTailPage(
+              hubSearchParams(q, requestedPage),
+              requestedPage,
+              () => seq === fetchSeq,
+            )
+            if (!resolved || seq !== fetchSeq) return
+            incoming = hubResources(resolved.result)
+            totalFound = resolved.result.totalFound || totalFound
+            totalPages = incoming.length ? resolved.page : resolved.result.totalPages || 0
+            page = resolved.page
+            const tailCache = { ...get().tailCache, [key]: { totalPages, resolvedAt: Date.now() } }
+            set({ tailCache, resolvedTotalPages: totalPages })
+          }
           syncInstalledFromResources(incoming)
-          set({
-            resources: replaceResources ? incoming : [...q.resources, ...incoming],
-            totalFound: result.totalFound || 0,
-            totalPages: result.totalPages || 0,
+          const patch = {
+            resources: append ? [...get().resources, ...incoming] : incoming,
+            totalFound,
+            totalPages,
+            page,
             loading: false,
-            ...(replaceResources ? { lastFetchedKey: hubFilterSignature(q) } : {}),
-          })
+            tailCacheKey: key,
+            resolvedTotalPages: cachedTotalPages || get().resolvedTotalPages,
+            ...(append ? {} : { lastFetchedKey: hubFilterSignature(q) }),
+          }
+          if (!append && q.browseMode === 'infinite') {
+            patch.startPage = page
+            patch.restorePage = page
+          }
+          set(patch)
         } catch (err) {
           if (seq !== fetchSeq) return
-          set({ error: err.message, loading: false, ...(replaceResources ? { resources: [] } : {}) })
+          set({ error: err.message, loading: false, loadingPrevious: false, ...(append ? {} : { resources: [] }) })
         }
       },
 
-      fetchNextPage: () => {
-        const { page, totalPages, loading } = get()
-        if (loading || page >= totalPages) return
-        set({ page: page + 1, loading: true })
+      fetchNextPage: async () => {
+        const { page, totalPages, loading, resolvedTotalPages } = get()
+        if (loading) return
+        if (resolvedTotalPages && page >= resolvedTotalPages) {
+          const resolved = await get().resolveTailPages({ force: true })
+          if (!resolved || page >= resolved) return
+        } else if (page >= totalPages) {
+          return
+        }
+        return get().fetchResources(false, { page: get().page + 1, append: true })
+      },
+
+      fetchPreviousPage: async () => {
+        const state = get()
+        if (state.loading || state.browseMode !== 'infinite' || state.startPage <= 1) return false
+        const seq = ++fetchSeq
+        const requestedPage = state.startPage - 1
+        set({ loading: true, loadingPrevious: true, error: null })
+        try {
+          const result = await window.api.hub.search(hubSearchParams(get(), requestedPage))
+          if (seq !== fetchSeq) return false
+          const incoming = hubResources(result)
+          syncInstalledFromResources(incoming)
+          set({
+            resources: [...incoming, ...get().resources],
+            totalFound: result.totalFound || get().totalFound,
+            totalPages: get().resolvedTotalPages || result.totalPages || get().totalPages,
+            startPage: requestedPage,
+            loading: false,
+            loadingPrevious: false,
+          })
+          return incoming.length > 0
+        } catch (err) {
+          if (seq !== fetchSeq) return false
+          set({ error: err.message, loading: false, loadingPrevious: false })
+          return false
+        }
       },
 
       /**
@@ -349,7 +618,15 @@ export const useHubStore = create(
       resetFilters: () => {
         const sortOptions = get().filterOptions?.sort
         const nextSort = sortOptions?.[0] || ''
-        set({ ...HUB_FILTER_DEFAULTS, sort: nextSort, page: 1 })
+        set({
+          ...HUB_FILTER_DEFAULTS,
+          sort: nextSort,
+          hideInstalled: false,
+          showHidden: false,
+          page: 1,
+          startPage: 1,
+          restorePage: 1,
+        })
       },
 
       /** Reset the client-side wishlist filters (incl. search) to defaults. Separate from
@@ -367,23 +644,6 @@ export const useHubStore = create(
         set({ authorSearch: author, page: 1, galleryMode: 'hub' })
       },
     }),
-    persistViewState('hub-view', {
-      selectedType: asString,
-      paidFilter: oneOf(['all', 'free', 'paid']),
-      selectedHubTags: asArray,
-      authorSearch: asString,
-      license: asString,
-      sort: asString,
-      wlSearch: asString,
-      wlType: asString,
-      wlTags: asPolarityList,
-      wlPaid: oneOf(['all', 'free', 'paid']),
-      wlAuthor: asString,
-      wlExcludedAuthors: asArray,
-      wlLicense: asString,
-      wlSort: asString,
-      cardMode: oneOf(['minimal', 'medium']),
-      cardWidth: asCardWidth,
-    }),
+    persistViewState('hub-view', HUB_PERSISTED_STATE),
   ),
 )

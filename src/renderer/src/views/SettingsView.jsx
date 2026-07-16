@@ -11,6 +11,8 @@ import {
   Heart,
   Wrench,
   Trash2,
+  Eye,
+  EyeOff,
   ShieldCheck,
   Compass,
   FlaskConical,
@@ -26,6 +28,8 @@ import { DEFAULT_REMOTE_PORT, normalizeConnectUrl } from '@shared/remote-config.
 import { toast } from '@/components/Toast'
 import { useStatusStore } from '@/stores/useStatusStore'
 import { useLibraryStore } from '@/stores/useLibraryStore'
+import { useHubStore } from '@/stores/useHubStore'
+import { useHubHiddenStore } from '@/stores/useHubHiddenStore'
 import { useRemoteUiStore } from '@/stores/useRemoteUiStore'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
@@ -79,6 +83,13 @@ export default function SettingsView() {
   const setDimInactive = useLibraryStore((s) => s.setDimInactive)
   const suppressDisablePackageWarning = useLibraryStore((s) => s.suppressDisablePackageWarning)
   const setSuppressDisablePackageWarning = useLibraryStore((s) => s.setSuppressDisablePackageWarning)
+  const showHubInfinitePager = useHubStore((s) => s.showInfinitePagerControls)
+  const setShowHubInfinitePager = useHubStore((s) => s.setShowInfinitePagerControls)
+  const rememberHubInfinitePage = useHubStore((s) => s.trackInfiniteRestorePage)
+  const setRememberHubInfinitePage = useHubStore((s) => s.setTrackInfiniteRestorePage)
+  const hiddenHubItems = useHubHiddenStore((s) => s.items)
+  const restoreHiddenHubItem = useHubHiddenStore((s) => s.unhide)
+  const clearHiddenHubItems = useHubHiddenStore((s) => s.clear)
   const remoteWarningDismissed = useRemoteUiStore((s) => s.warningDismissed)
   const dismissRemoteWarning = useRemoteUiStore((s) => s.dismissWarning)
   const isRemoteClient = !!window.api.remote?.isRemote
@@ -138,6 +149,7 @@ export default function SettingsView() {
       .catch(() => {})
     window.api.app.getVersion().then(setAppVersion)
     window.api.updater.getChannel().then((c) => setUpdateChannel(c === 'dev' ? 'dev' : 'stable'))
+    useHubHiddenStore.getState().hydrate()
     refreshLibDirs()
   }, [refreshLibDirs])
 
@@ -958,6 +970,80 @@ export default function SettingsView() {
                 onCheckedChange={handleToggleRemoteEnabled}
               />
             </label>
+          </div>
+        </Section>
+
+        <Section title="Hub" description="Control Hub browsing behavior.">
+          <div className="space-y-4">
+            <label className="flex items-center gap-3 cursor-pointer">
+              <div className="flex-1 min-w-0">
+                <div className="text-xs text-text-primary font-medium">Show infinite-scroll page controls</div>
+                <div className="text-[11px] text-text-tertiary mt-0.5">
+                  Show page navigation in the Hub toolbar while using infinite scrolling.
+                </div>
+              </div>
+              <Switch checked={showHubInfinitePager} onCheckedChange={setShowHubInfinitePager} />
+            </label>
+            <label className="flex items-center gap-3 cursor-pointer">
+              <div className="flex-1 min-w-0">
+                <div className="text-xs text-text-primary font-medium">Restore last scrolled page</div>
+                <div className="text-[11px] text-text-tertiary mt-0.5">
+                  Reopen Hub infinite scrolling at the page you last reached.
+                </div>
+              </div>
+              <Switch checked={rememberHubInfinitePage} onCheckedChange={setRememberHubInfinitePage} />
+            </label>
+            <div className="space-y-2 border-t border-border pt-4">
+              <div className="flex items-start gap-3">
+                <div className="flex-1 min-w-0">
+                  <div className="text-xs text-text-primary font-medium flex items-center gap-1.5">
+                    <EyeOff size={13} className="text-text-tertiary" /> Hidden Hub items
+                  </div>
+                  <div className="text-[11px] text-text-tertiary mt-0.5">
+                    {hiddenHubItems.length.toLocaleString()} hidden resource{hiddenHubItems.length === 1 ? '' : 's'}.
+                  </div>
+                </div>
+                <AlertDialog>
+                  <AlertDialogTrigger asChild>
+                    <Button variant="outline" size="sm" disabled={!hiddenHubItems.length} className="shrink-0 text-xs">
+                      <Trash2 size={13} /> Clear
+                    </Button>
+                  </AlertDialogTrigger>
+                  <AlertDialogContent>
+                    <AlertDialogHeader>
+                      <AlertDialogTitle>Clear hidden Hub items?</AlertDialogTitle>
+                      <AlertDialogDescription>All hidden Hub resources will appear again.</AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel>Cancel</AlertDialogCancel>
+                      <AlertDialogAction variant="destructive" onClick={clearHiddenHubItems}>
+                        Clear list
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
+              </div>
+              {!!hiddenHubItems.length && (
+                <ul className="max-h-48 overflow-y-auto rounded-lg border border-border divide-y divide-border bg-surface/50">
+                  {hiddenHubItems.map((item) => (
+                    <li key={item.resource_id} className="flex items-center gap-3 px-3 py-2">
+                      <div className="flex-1 min-w-0">
+                        <div className="text-xs text-text-secondary truncate">{item.title || 'Untitled Hub item'}</div>
+                        <div className="text-[10px] text-text-tertiary font-mono">{item.resource_id}</div>
+                      </div>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => restoreHiddenHubItem(item.resource_id)}
+                        className="shrink-0 text-xs"
+                      >
+                        <Eye size={13} /> Restore
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
           </div>
         </Section>
 

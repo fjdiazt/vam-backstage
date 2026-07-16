@@ -5,6 +5,7 @@ import ResizeHandle from './ResizeHandle'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Button } from '@/components/ui/button'
+import { Switch } from '@/components/ui/switch'
 import { TextAutocomplete } from './filter-panel/TextAutocomplete'
 import { TagsAutocomplete } from './filter-panel/TagsAutocomplete'
 import { LabelsAutocomplete } from './filter-panel/LabelsAutocomplete'
@@ -136,6 +137,20 @@ export default function FilterPanel({
           {sections.map((section, i) => (
             <SectionWrapper key={section.key} section={section} active={activeFlags[i] === true}>
               {section.type === 'list' && <ListSection section={section} />}
+
+              {section.type === 'switches' && (
+                <div className="space-y-px">
+                  {section.items.map((item) => (
+                    <label
+                      key={item.key}
+                      className="flex items-center justify-between gap-3 rounded px-2 py-1.5 text-xs text-text-secondary hover:bg-elevated hover:text-text-primary transition-colors cursor-pointer"
+                    >
+                      <span className="truncate">{item.label}</span>
+                      <Switch size="sm" checked={!!item.checked} onCheckedChange={item.onCheckedChange} />
+                    </label>
+                  ))}
+                </div>
+              )}
 
               {section.type === 'tags' && (
                 <div className="space-y-px">

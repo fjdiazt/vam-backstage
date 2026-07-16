@@ -6,6 +6,7 @@ import {
   MIGRATIONS,
   SCHEMA_VERSION,
   closeDatabase,
+  clearHubHidden,
   countMissingPackages,
   countOrphanContentLabels,
   forgetDeletedData,
@@ -13,6 +14,7 @@ import {
   getAllPackages,
   getDb,
   getNotFoundHubResourceIds,
+  listHubHidden,
   getPackagesNeedingHubNameLookup,
   insertDownload,
   markPackageMissing,
@@ -21,6 +23,7 @@ import {
   setHubUserId,
   toIntString,
   upsertHubResourceDetail,
+  upsertHubHidden,
   upsertHubUser,
 } from './db.js'
 
@@ -50,6 +53,21 @@ describe('toIntString', () => {
 
   it('rejects non-integer numeric-ish strings', () => {
     for (const v of ['1.0', '-1', '1e3', '12a', '0x10']) expect(toIntString(v)).toBeNull()
+  })
+})
+
+describe('Hub hidden resources', () => {
+  beforeEach(async () => {
+    tmp = await mkTempVamDir()
+    await openTestDatabase(tmp.dbPath)
+  })
+
+  it('stores, updates, removes, and clears hidden resources', () => {
+    upsertHubHidden({ resource_id: 42, title: 'First' })
+    upsertHubHidden({ resource_id: '42', title: 'Updated' })
+    expect(listHubHidden()).toMatchObject([{ resource_id: '42', title: 'Updated' }])
+    expect(clearHubHidden()).toBe(1)
+    expect(listHubHidden()).toEqual([])
   })
 })
 

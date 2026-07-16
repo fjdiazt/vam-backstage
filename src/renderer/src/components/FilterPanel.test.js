@@ -1,10 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { filterLabelMatches } from './FilterPanel'
+import { sectionActive } from './FilterPanel'
 
-describe('filterLabelMatches', () => {
-  it('returns every unselected label when query is empty', () => {
-    const labels = Array.from({ length: 40 }, (_, i) => ({ id: i + 1, name: `label-${i + 1}` }))
-
-    expect(filterLabelMatches(labels, [2], '')).toHaveLength(39)
+describe('sectionActive', () => {
+  it('marks switch groups active when their value differs from the default', () => {
+    expect(sectionActive({ value: [false, false], default: [false, false] })).toBe(false)
+    expect(sectionActive({ value: [true, false], default: [false, false] })).toBe(true)
   })
 })

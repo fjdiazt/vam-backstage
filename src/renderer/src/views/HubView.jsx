@@ -1,9 +1,28 @@
 import { useState, useEffect, useCallback, useRef, useMemo, Activity } from 'react'
-import { Grid2x2, Grid3x3, Loader2, RefreshCw, Pin } from 'lucide-react'
+import {
+  BookOpen,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
+  Grid2x2,
+  Grid3x3,
+  Infinity as InfinityIcon,
+  Loader2,
+  RefreshCw,
+  Pin,
+} from 'lucide-react'
 import { dismissTransientOverlays } from '@/lib/dismissOverlays'
 import { CONTENT_TYPES, compareContentTypes, getTypeColor } from '@/lib/utils'
-import { useHubStore, hubFilterSignature, HUB_FILTER_DEFAULTS, WISHLIST_FILTER_DEFAULTS } from '@/stores/useHubStore'
+import {
+  useHubStore,
+  hubFilterSignature,
+  HUB_FILTER_DEFAULTS,
+  HUB_PER_PAGE_OPTIONS,
+  WISHLIST_FILTER_DEFAULTS,
+} from '@/stores/useHubStore'
 import { useWishlistStore } from '@/stores/useWishlistStore'
+import { useHubHiddenStore } from '@/stores/useHubHiddenStore'
 import { useDownloadStore } from '@/stores/useDownloadStore'
 import { useInstalledStore } from '@/stores/useInstalledStore'
 import { HubCard } from '@/components/PackageCard'
@@ -16,6 +35,7 @@ import { matchesPolarityList, matchesAuthorFilter, matchesLicenseFilter } from '
 import { SearchOnHubButton } from '@/components/SearchOnHubButton'
 import { ThumbnailSizeSlider } from '@/components/ThumbnailSizeSlider'
 import { VirtualGrid } from '@/components/VirtualGrid'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 
 /** Hub text search: avoid a network request on every keystroke */
 const HUB_SEARCH_DEBOUNCE_MS = 320
@@ -25,6 +45,22 @@ const HUB_SEARCH_DEBOUNCE_MS = 320
  * (pt-2 8 + gradient button 32 + pb-3 12 = ~52px) ≈ 120px.
  */
 const HUB_CARD_FOOTER_PX = 120
+
+export function hubPageForVisibleResourceIndex(index, perPage, startPage = 1) {
+  return Number.isInteger(index) ? startPage + Math.floor(index / Math.max(1, perPage)) : startPage
+}
+
+export function hubPageCountLabel(maxPage) {
+  return Math.max(1, Number(maxPage) || 1).toLocaleString()
+}
+
+export function shouldRenderHubPageNav(browseMode, maxPage, showInfinitePagerControls = true) {
+  return maxPage > 1 && (browseMode === 'paged' || showInfinitePagerControls)
+}
+
+export function shouldRenderHubPageSummary(browseMode, showInfinitePagerControls = true) {
+  return browseMode === 'paged' || showInfinitePagerControls
+}
 
 /**
  * Local sort options for the wishlist gallery. Unlike the hub sort list (which
@@ -123,6 +159,15 @@ export default function HubView({ onNavigate }) {
     totalFound,
     totalPages,
     page,
+    startPage,
+    restorePage,
+    perPage,
+    browseMode,
+    showInfinitePagerControls,
+    trackInfiniteRestorePage,
+    loadingPrevious,
+    tailResolving,
+    resolvedTotalPages,
     loading,
     error,
     search,
@@ -132,6 +177,8 @@ export default function HubView({ onNavigate }) {
     selectedHubTags,
     sort,
     license,
+    hideInstalled,
+    showHidden,
     wlSearch,
     wlType,
     wlTags,
@@ -156,6 +203,8 @@ export default function HubView({ onNavigate }) {
     setSelectedHubTags,
     setSort,
     setLicense,
+    setHideInstalled,
+    setShowHidden,
     setWlSearch,
     setWlType,
     setWlTags,
@@ -168,14 +217,24 @@ export default function HubView({ onNavigate }) {
     resetWishlistFilters,
     setCardMode,
     setCardWidth,
+    setBrowseMode,
+    setPerPage,
+    setInfiniteRestorePage,
     fetchResources,
     fetchNextPage,
+    fetchPreviousPage,
+    goToPage,
+    startInfiniteAtPage,
+    resolveTailPages,
     openDetail,
     closeDetail,
     popDetailHistory,
   } = useHubStore()
 
   const wishlistMode = galleryMode === 'wishlist'
+  const galleryRef = useRef(null)
+  const [startPageDraft, setStartPageDraft] = useState(String(restorePage))
+  useEffect(() => setStartPageDraft(String(restorePage)), [restorePage])
   const detailBackLabel = detailHistory.length > 0 ? detailHistory[detailHistory.length - 1].title : null
 
   const [searchDraft, setSearchDraft] = useState(search)
@@ -239,6 +298,7 @@ export default function HubView({ onNavigate }) {
 
   useEffect(() => {
     useHubStore.getState().fetchFilters()
+    useHubHiddenStore.getState().hydrate()
   }, [])
 
   // Wishlist: id set drives the segmented-control count + detail toggle state
@@ -271,6 +331,19 @@ export default function HubView({ onNavigate }) {
     setGridCols(cols)
   }, [])
 
+  const hiddenHubIds = useHubHiddenStore((state) => state.ids)
+  const installedByHubResourceId = useInstalledStore((state) => state.byHubResourceId)
+  const filteredHubResources = useMemo(
+    () =>
+      resources.filter((resource) => {
+        const rid = String(resource.resource_id)
+        if (!showHidden && hiddenHubIds.has(rid)) return false
+        if (hideInstalled && (installedByHubResourceId.get(rid)?.installed ?? resource._installed)) return false
+        return true
+      }),
+    [resources, showHidden, hiddenHubIds, hideInstalled, installedByHubResourceId],
+  )
+
   // Wishlist filtering/sorting is client-side over the locally stored snapshots.
   const wishlistFiltered = useMemo(
     () =>
@@ -291,19 +364,20 @@ export default function HubView({ onNavigate }) {
   // full rows — the ragged remainder fills in once the next chunk loads. `gridCols` comes from
   // VirtualGrid's onLayout (its actual column count), so the trim tracks resize/slider changes.
   const visibleResources = useMemo(() => {
-    if (page >= totalPages) return resources
-    const fullRowCount = Math.floor(resources.length / gridCols) * gridCols
-    if (fullRowCount === 0) return resources
-    return resources.slice(0, fullRowCount)
-  }, [resources, page, totalPages, gridCols])
+    if (browseMode === 'paged' || page >= totalPages) return filteredHubResources
+    const fullRowCount = Math.floor(filteredHubResources.length / gridCols) * gridCols
+    if (fullRowCount === 0) return filteredHubResources
+    return filteredHubResources.slice(0, fullRowCount)
+  }, [filteredHubResources, page, totalPages, gridCols, browseMode])
 
   // Per-mode scroll reset keys: each grid resets only on a filter change within its
   // own mode, so toggling Hub<->Wishlist keeps both scroll positions. The hub key
   // reuses the fetch-guard signature so "filters changed" means the same thing for
   // scroll reset and refetch.
   const hubScrollResetKey = useMemo(
-    () => hubFilterSignature({ search, selectedType, paidFilter, authorSearch, selectedHubTags, sort, license }),
-    [search, selectedType, paidFilter, authorSearch, selectedHubTags, sort, license],
+    () =>
+      hubFilterSignature({ search, selectedType, paidFilter, authorSearch, selectedHubTags, sort, license, perPage }),
+    [search, selectedType, paidFilter, authorSearch, selectedHubTags, sort, license, perPage],
   )
   const wlScrollResetKey = useMemo(
     () =>
@@ -321,20 +395,14 @@ export default function HubView({ onNavigate }) {
     if (!sort) return // wait for sort options to load
     const s = useHubStore.getState()
     if (hubFilterSignature(s) === s.lastFetchedKey) return
-    s.fetchResources(true)
-  }, [search, selectedType, paidFilter, authorSearch, selectedHubTags, sort, license])
+    const initialPage = s.lastFetchedKey == null ? (s.browseMode === 'infinite' ? s.restorePage : s.page) : 1
+    s.fetchResources(true, { page: initialPage })
+  }, [search, selectedType, paidFilter, authorSearch, selectedHubTags, sort, license, perPage])
 
-  // Page changes (without filter change) → fetch same filters, new page (append mode)
-  const pageRef = useRef(page)
   useEffect(() => {
-    if (pageRef.current === page) return
-    pageRef.current = page
-    // Filter resets already fetch page 1 themselves. Starting an append fetch here
-    // would supersede that request without recording its filter key, leaving the
-    // freshness guard able to mistake filtered resources for a neutral result.
-    if (page === 1) return
-    useHubStore.getState().fetchResources()
-  }, [page])
+    if (wishlistMode || loading || !totalPages) return
+    void resolveTailPages()
+  }, [wishlistMode, loading, totalPages, resolveTailPages])
 
   // When packages change (promote, download completes, uninstall), resync install status from DB.
   // The hub detail panel is refreshed at App level; here we only patch the
@@ -541,6 +609,21 @@ export default function HubView({ onNavigate }) {
         ],
       },
       {
+        key: 'show',
+        label: 'Show',
+        type: 'switches',
+        active: hideInstalled || showHidden,
+        items: [
+          {
+            key: 'installed',
+            label: 'Installed',
+            checked: !hideInstalled,
+            onCheckedChange: (checked) => setHideInstalled(!checked),
+          },
+          { key: 'hidden', label: 'Hidden', checked: showHidden, onCheckedChange: setShowHidden },
+        ],
+      },
+      {
         key: 'tags',
         label: 'Tags',
         type: 'tags-autocomplete',
@@ -574,6 +657,8 @@ export default function HubView({ onNavigate }) {
     [
       selectedType,
       paidFilter,
+      hideInstalled,
+      showHidden,
       selectedHubTags,
       authorSearch,
       license,
@@ -584,6 +669,8 @@ export default function HubView({ onNavigate }) {
       userSuggestions,
       setSelectedType,
       setPaidFilter,
+      setHideInstalled,
+      setShowHidden,
       setSelectedHubTags,
       setAuthorSearch,
       setLicense,
@@ -726,6 +813,211 @@ export default function HubView({ onNavigate }) {
     ],
   )
 
+  const maxHubPage = Math.max(resolvedTotalPages || totalPages || 1, 1)
+  const pageCountLabel = hubPageCountLabel(maxHubPage)
+  const pageButtons = useMemo(() => {
+    if (maxHubPage <= 7) return Array.from({ length: maxHubPage }, (_, i) => i + 1)
+    const pages = new Set([1, maxHubPage, page - 1, page, page + 1])
+    if (page <= 4) for (let p = 2; p <= 5; p += 1) pages.add(p)
+    if (page >= maxHubPage - 3) for (let p = maxHubPage - 4; p < maxHubPage; p += 1) pages.add(p)
+    const sorted = [...pages].filter((p) => p >= 1 && p <= maxHubPage).sort((a, b) => a - b)
+    return sorted.flatMap((p, i) => (i && p - sorted[i - 1] > 1 ? ['...', p] : [p]))
+  }, [maxHubPage, page])
+
+  const topVisiblePage = useCallback(() => {
+    const root = galleryRef.current
+    if (!root) return restorePage
+    const rootTop = root.getBoundingClientRect().top
+    for (const card of root.querySelectorAll('[data-hub-resource-id]')) {
+      if (card.getBoundingClientRect().bottom <= rootTop + 8) continue
+      const index = resources.findIndex((r) => String(r.resource_id) === card.dataset.hubResourceId)
+      return hubPageForVisibleResourceIndex(index, perPage, startPage)
+    }
+    return restorePage
+  }, [perPage, resources, restorePage, startPage])
+
+  useEffect(() => {
+    const root = galleryRef.current
+    if (!root || wishlistMode || browseMode !== 'infinite' || !trackInfiniteRestorePage) return
+    let frame = 0
+    const onScroll = () => {
+      cancelAnimationFrame(frame)
+      frame = requestAnimationFrame(() => setInfiniteRestorePage(topVisiblePage()))
+    }
+    root.addEventListener('scroll', onScroll, { passive: true })
+    return () => {
+      cancelAnimationFrame(frame)
+      root.removeEventListener('scroll', onScroll)
+    }
+  }, [browseMode, setInfiniteRestorePage, topVisiblePage, trackInfiniteRestorePage, wishlistMode])
+
+  const goPagedPage = useCallback(
+    (nextPage) => {
+      galleryRef.current?.scrollTo({ top: 0 })
+      void goToPage(nextPage)
+    },
+    [goToPage],
+  )
+  const goInfiniteStartPage = useCallback(
+    (nextPage) => {
+      galleryRef.current?.scrollTo({ top: 0 })
+      void startInfiniteAtPage(nextPage)
+    },
+    [startInfiniteAtPage],
+  )
+  const toggleBrowseMode = useCallback(() => {
+    if (browseMode === 'infinite') {
+      const target = topVisiblePage()
+      setBrowseMode('paged')
+      goPagedPage(target)
+    } else {
+      setBrowseMode('infinite')
+      goInfiniteStartPage(page)
+    }
+  }, [browseMode, goInfiniteStartPage, goPagedPage, page, setBrowseMode, topVisiblePage])
+
+  const captureScrollAnchor = useCallback(() => {
+    const root = galleryRef.current
+    if (!root) return null
+    const rootTop = root.getBoundingClientRect().top
+    for (const card of root.querySelectorAll('[data-hub-resource-id]')) {
+      const rect = card.getBoundingClientRect()
+      if (rect.bottom > rootTop + 8) return { id: card.dataset.hubResourceId, top: rect.top }
+    }
+    return null
+  }, [])
+  const fetchPreviousHubPage = useCallback(async () => {
+    const anchor = captureScrollAnchor()
+    if (!(await fetchPreviousPage()) || !anchor) return
+    requestAnimationFrame(() => {
+      const root = galleryRef.current
+      const card = [...(root?.querySelectorAll('[data-hub-resource-id]') || [])].find(
+        (node) => node.dataset.hubResourceId === anchor.id,
+      )
+      if (root && card) root.scrollTop += card.getBoundingClientRect().top - anchor.top
+    })
+  }, [captureScrollAnchor, fetchPreviousPage])
+  const handleGalleryWheel = useCallback(
+    (event) => {
+      if (wishlistMode || browseMode !== 'infinite' || loading || startPage <= 1 || event.deltaY >= 0) return
+      if ((galleryRef.current?.scrollTop || 0) <= 8) void fetchPreviousHubPage()
+    },
+    [browseMode, fetchPreviousHubPage, loading, startPage, wishlistMode],
+  )
+
+  const currentPage = browseMode === 'infinite' ? restorePage : page
+  const canRecheckTail = !!resolvedTotalPages && !tailResolving
+  const goCurrentModePage = browseMode === 'infinite' ? goInfiniteStartPage : goPagedPage
+  const rangePage = browseMode === 'infinite' ? startPage : page
+  const pageStart = resources.length ? (rangePage - 1) * perPage + 1 : 0
+  const pageEnd = resources.length ? Math.min(pageStart + resources.length - 1, totalFound) : 0
+  const pageRange = resources.length
+    ? `Showing ${pageStart.toLocaleString()}-${pageEnd.toLocaleString()} of ${totalFound.toLocaleString()}`
+    : `Showing 0 of ${totalFound.toLocaleString()}`
+
+  const renderPageNav = () => {
+    if (wishlistMode || !shouldRenderHubPageNav(browseMode, maxHubPage, showInfinitePagerControls)) return null
+    const iconClass =
+      'h-8 w-8 rounded flex items-center justify-center text-text-tertiary hover:text-text-primary hover:bg-elevated disabled:opacity-30 cursor-pointer disabled:cursor-default'
+    const numbered = browseMode === 'paged'
+    return (
+      <div className="flex min-w-0 max-w-full items-center justify-center gap-1">
+        <button
+          type="button"
+          disabled={loading || currentPage <= 1}
+          onClick={() => goCurrentModePage(1)}
+          title="First Hub page"
+          className={iconClass}
+        >
+          <ChevronsLeft size={17} />
+        </button>
+        <button
+          type="button"
+          disabled={loading || currentPage <= 1}
+          onClick={() => goCurrentModePage(currentPage - 1)}
+          title="Previous Hub page"
+          className={iconClass}
+        >
+          <ChevronLeft size={18} />
+        </button>
+        {numbered ? (
+          pageButtons.map((item, index) =>
+            item === '...' ? (
+              <span key={`ellipsis-${index}`} className="px-1 text-text-tertiary">
+                ...
+              </span>
+            ) : (
+              <button
+                key={item}
+                type="button"
+                disabled={loading || item === page}
+                onClick={() => goPagedPage(item)}
+                aria-current={item === page ? 'page' : undefined}
+                className={`h-8 min-w-8 rounded px-2 text-xs tabular-nums ${item === page ? 'bg-hover text-text-primary font-medium' : 'text-text-tertiary hover:bg-elevated hover:text-text-primary'}`}
+              >
+                {item.toLocaleString()}
+              </button>
+            ),
+          )
+        ) : (
+          <span className="flex h-8 items-center gap-1 px-2 text-xs text-text-tertiary">
+            <span>Page</span>
+            <input
+              type="number"
+              min="1"
+              max={maxHubPage}
+              value={startPageDraft}
+              disabled={loading}
+              onChange={(event) => setStartPageDraft(event.target.value)}
+              onBlur={() => goInfiniteStartPage(startPageDraft)}
+              onKeyDown={(event) => event.key === 'Enter' && event.currentTarget.blur()}
+              aria-label="Hub start page"
+              className="h-6 w-16 rounded border border-input bg-elevated px-2 text-right text-xs tabular-nums text-text-primary outline-none focus:border-ring/50"
+            />
+            <span className="tabular-nums">of {pageCountLabel}</span>
+          </span>
+        )}
+        <button
+          type="button"
+          disabled={loading || (currentPage >= maxHubPage && !canRecheckTail)}
+          onClick={() => goCurrentModePage(currentPage + 1)}
+          title="Next Hub page"
+          className={iconClass}
+        >
+          <ChevronRight size={18} />
+        </button>
+        <button
+          type="button"
+          disabled={loading || (currentPage >= maxHubPage && !canRecheckTail)}
+          onClick={() => goCurrentModePage(maxHubPage)}
+          title="Last Hub page"
+          className={iconClass}
+        >
+          <ChevronsRight size={17} />
+        </button>
+      </div>
+    )
+  }
+
+  const renderPageSummary = () => (
+    <div className="flex min-w-0 items-center justify-end gap-2">
+      <span className="text-right text-[11px] tabular-nums text-text-tertiary">{pageRange}</span>
+      <span className="text-[11px] text-text-tertiary">Page size</span>
+      <Select value={String(perPage)} onValueChange={setPerPage}>
+        <SelectTrigger size="sm" className="h-8 min-w-[72px]" aria-label="Hub page size">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent align="end" className="min-w-[72px]">
+          {HUB_PER_PAGE_OPTIONS.map((size) => (
+            <SelectItem key={size} value={String(size)}>
+              {size}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  )
+
   const activeSections = wishlistMode ? wishlistSections : sections
   const activeFilterCount = activeSections.filter((s) => sectionActive(s) === true).length
 
@@ -746,95 +1038,121 @@ export default function HubView({ onNavigate }) {
 
       <div className="flex-1 flex flex-col min-w-0 min-h-0">
         {/* Toolbar */}
-        <div className="h-10 flex items-center px-4 border-b border-border shrink-0 gap-2">
-          {/* dismissTransientOverlays: the mode toggle hides one <Activity> gallery surface, which
+        <div className="min-h-10 grid grid-cols-[minmax(120px,1fr)_auto_minmax(120px,1fr)] items-center px-4 py-1 border-b border-border shrink-0 gap-2">
+          <div className="flex min-w-0 items-center gap-2">
+            {/* dismissTransientOverlays: the mode toggle hides one <Activity> gallery surface, which
               would orphan any overlay (tooltip/menu) still open or animating out inside it. */}
-          <div className="flex items-center gap-px bg-elevated rounded p-0.5 text-[11px]">
-            <button
-              type="button"
-              onClick={() => {
-                dismissTransientOverlays()
-                setGalleryMode('hub')
-              }}
-              className={`px-2 py-1 rounded cursor-pointer transition-colors ${!wishlistMode ? 'bg-hover text-text-primary' : 'text-text-tertiary hover:text-text-secondary'}`}
-            >
-              Hub
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                dismissTransientOverlays()
-                setGalleryMode('wishlist')
-              }}
-              className={`px-2 py-1 rounded cursor-pointer transition-colors flex items-center gap-1 ${wishlistMode ? 'bg-hover text-text-primary' : 'text-text-tertiary hover:text-text-secondary'}`}
-            >
-              Wishlist
-              {wishlistCount > 0 && <span className="tabular-nums opacity-70">{wishlistCount}</span>}
-            </button>
-          </div>
-          <span className="text-[11px] text-text-tertiary">
-            {wishlistMode
-              ? wishlistLoading && !wishlistLoaded
-                ? 'Loading…'
-                : wishlistFiltered.length !== wishlistItems.length
-                  ? `${wishlistFiltered.length.toLocaleString()} of ${wishlistItems.length.toLocaleString()} wishlisted`
-                  : `${wishlistItems.length.toLocaleString()} wishlisted`
-              : loading && resources.length === 0
-                ? 'Searching…'
-                : `${totalFound.toLocaleString()} packages`}
-          </span>
-          {activeFilterCount > 0 && (
-            <span className="shrink-0 flex items-center gap-1.5 whitespace-nowrap text-[11px] text-text-tertiary">
-              <span aria-hidden="true">·</span>
-              <span>
-                {activeFilterCount} {activeFilterCount === 1 ? 'filter' : 'filters'}
-              </span>
-              <span>
-                (
-                <button
-                  type="button"
-                  onClick={() => (wishlistMode ? resetWishlistFilters() : resetFilters())}
-                  title="Reset all filters to their defaults"
-                  className="text-text-tertiary hover:text-text-secondary transition-colors cursor-pointer"
-                >
-                  Reset
-                </button>
-                )
-              </span>
+            <div className="flex items-center gap-px bg-elevated rounded p-0.5 text-[11px]">
+              <button
+                type="button"
+                onClick={() => {
+                  dismissTransientOverlays()
+                  setGalleryMode('hub')
+                }}
+                className={`px-2 py-1 rounded cursor-pointer transition-colors ${!wishlistMode ? 'bg-hover text-text-primary' : 'text-text-tertiary hover:text-text-secondary'}`}
+              >
+                Hub
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  dismissTransientOverlays()
+                  setGalleryMode('wishlist')
+                }}
+                className={`px-2 py-1 rounded cursor-pointer transition-colors flex items-center gap-1 ${wishlistMode ? 'bg-hover text-text-primary' : 'text-text-tertiary hover:text-text-secondary'}`}
+              >
+                Wishlist
+                {wishlistCount > 0 && <span className="tabular-nums opacity-70">{wishlistCount}</span>}
+              </button>
+            </div>
+            <span className="text-[11px] text-text-tertiary">
+              {wishlistMode
+                ? wishlistLoading && !wishlistLoaded
+                  ? 'Loading…'
+                  : wishlistFiltered.length !== wishlistItems.length
+                    ? `${wishlistFiltered.length.toLocaleString()} of ${wishlistItems.length.toLocaleString()} wishlisted`
+                    : `${wishlistItems.length.toLocaleString()} wishlisted`
+                : loading && resources.length === 0
+                  ? 'Searching…'
+                  : hideInstalled || showHidden
+                    ? `${visibleResources.length.toLocaleString()} shown`
+                    : `${totalFound.toLocaleString()} packages`}
             </span>
-          )}
-          {/* Network-backed hub search gets a cache-busting refresh; the wishlist
+            {activeFilterCount > 0 && (
+              <span className="shrink-0 flex items-center gap-1.5 whitespace-nowrap text-[11px] text-text-tertiary">
+                <span aria-hidden="true">·</span>
+                <span>
+                  {activeFilterCount} {activeFilterCount === 1 ? 'filter' : 'filters'}
+                </span>
+                <span>
+                  (
+                  <button
+                    type="button"
+                    onClick={() => (wishlistMode ? resetWishlistFilters() : resetFilters())}
+                    title="Reset all filters to their defaults"
+                    className="text-text-tertiary hover:text-text-secondary transition-colors cursor-pointer"
+                  >
+                    Reset
+                  </button>
+                  )
+                </span>
+              </span>
+            )}
+            {/* Network-backed hub search gets a cache-busting refresh; the wishlist
               is local + live, so it needs none. */}
-          {!wishlistMode && (
-            <button
-              type="button"
-              onClick={() => fetchResources(true, { forceRefresh: true })}
-              disabled={refreshBusy}
-              title="Refresh"
-              className="p-1 rounded text-text-tertiary hover:text-text-secondary disabled:opacity-30 cursor-pointer disabled:cursor-default"
-            >
-              <RefreshCw size={13} className={refreshBusy ? 'animate-spin' : ''} />
-            </button>
-          )}
-          <div className="flex-1" />
-          <ThumbnailSizeSlider cardWidth={cardWidth} availableWidth={availableWidth} onCardWidthChange={setCardWidth} />
-          <div className="flex items-center gap-px bg-elevated rounded p-0.5">
-            <button
-              type="button"
-              onClick={() => setCardMode('minimal')}
-              title="Small cards"
-              className={`p-1.5 rounded cursor-pointer ${cardMode === 'minimal' ? 'bg-hover text-text-primary' : 'text-text-tertiary'}`}
-            >
-              <Grid3x3 size={14} />
-            </button>
-            <button
-              type="button"
-              onClick={() => setCardMode('medium')}
-              title="Large cards"
-              className={`p-1.5 rounded cursor-pointer ${cardMode === 'medium' ? 'bg-hover text-text-primary' : 'text-text-tertiary'}`}
-            >
-              <Grid2x2 size={14} />
-            </button>
+            {!wishlistMode && (
+              <button
+                type="button"
+                onClick={() =>
+                  fetchResources(true, {
+                    forceRefresh: true,
+                    page: browseMode === 'infinite' ? restorePage : page,
+                  })
+                }
+                disabled={refreshBusy}
+                title="Refresh"
+                className="p-1 rounded text-text-tertiary hover:text-text-secondary disabled:opacity-30 cursor-pointer disabled:cursor-default"
+              >
+                <RefreshCw size={13} className={refreshBusy ? 'animate-spin' : ''} />
+              </button>
+            )}
+          </div>
+          {renderPageNav()}
+          <div className="col-start-3 flex min-w-0 flex-wrap items-center justify-end gap-2">
+            {!wishlistMode && shouldRenderHubPageSummary(browseMode, showInfinitePagerControls) && renderPageSummary()}
+            <ThumbnailSizeSlider
+              cardWidth={cardWidth}
+              availableWidth={availableWidth}
+              onCardWidthChange={setCardWidth}
+            />
+            {!wishlistMode && (
+              <button
+                type="button"
+                onClick={toggleBrowseMode}
+                title={browseMode === 'infinite' ? 'Infinite scroll' : 'Paged browsing'}
+                className="p-1.5 rounded cursor-pointer text-text-tertiary hover:text-text-primary hover:bg-elevated"
+              >
+                {browseMode === 'infinite' ? <InfinityIcon size={14} /> : <BookOpen size={14} />}
+              </button>
+            )}
+            <div className="flex items-center gap-px bg-elevated rounded p-0.5">
+              <button
+                type="button"
+                onClick={() => setCardMode('minimal')}
+                title="Small cards"
+                className={`p-1.5 rounded cursor-pointer ${cardMode === 'minimal' ? 'bg-hover text-text-primary' : 'text-text-tertiary'}`}
+              >
+                <Grid3x3 size={14} />
+              </button>
+              <button
+                type="button"
+                onClick={() => setCardMode('medium')}
+                title="Large cards"
+                className={`p-1.5 rounded cursor-pointer ${cardMode === 'medium' ? 'bg-hover text-text-primary' : 'text-text-tertiary'}`}
+              >
+                <Grid2x2 size={14} />
+              </button>
+            </div>
           </div>
         </div>
 
@@ -867,12 +1185,14 @@ export default function HubView({ onNavigate }) {
                     itemHeight={compactCards ? cardWidth : cardWidth + HUB_CARD_FOOTER_PX}
                     fixedHeight={compactCards ? 0 : HUB_CARD_FOOTER_PX}
                     className="flex-1"
+                    scrollRef={galleryRef}
+                    onWheel={handleGalleryWheel}
                     scrollResetKey={hubScrollResetKey}
                     onLayout={handleGridLayout}
                     hideEmptyMessage
-                    onEndReached={page < totalPages ? fetchNextPage : undefined}
+                    onEndReached={browseMode === 'infinite' && page < totalPages ? fetchNextPage : undefined}
                     footer={
-                      loading && resources.length > 0 ? (
+                      loading && !loadingPrevious && resources.length > 0 ? (
                         <div className="flex items-center justify-center -mt-3 pb-4">
                           <Loader2 size={20} className="animate-spin text-accent-blue" />
                           <span className="text-[11px] text-text-tertiary ml-2">Loading more…</span>
@@ -888,6 +1208,9 @@ export default function HubView({ onNavigate }) {
                         onInstall={handleInstall}
                         onPromote={handlePromote}
                         onFilterAuthor={handleFilterAuthor}
+                        onHide={(resource) => useHubHiddenStore.getState().hide(resource)}
+                        onUnhide={(resource) => useHubHiddenStore.getState().unhide(resource.resource_id)}
+                        isHidden={hiddenHubIds.has(String(r.resource_id))}
                         mode={cardMode}
                         hideType={selectedType !== 'All'}
                       />

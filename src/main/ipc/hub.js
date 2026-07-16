@@ -25,6 +25,11 @@ import {
   upsertHubUser,
   setPackageHubMeta,
   transact,
+  clearHubHidden,
+  deleteHubHidden,
+  getHubHiddenIds,
+  listHubHidden,
+  upsertHubHidden,
 } from '../db.js'
 import { cacheAvatarsFromResources } from '../avatar-cache.js'
 import { notify } from '../notify.js'
@@ -92,6 +97,12 @@ export function registerHubHandlers() {
   )
   ipcMain.handle('hub:toggleRate', (_, id, currentlyRated) => withAuthGuard(toggleRate)(id, currentlyRated))
   ipcMain.handle('hub:toggleLike', (_, id) => withAuthGuard(toggleLike)(id))
+
+  ipcMain.handle('hub:hidden:list', () => listHubHidden())
+  ipcMain.handle('hub:hidden:ids', () => getHubHiddenIds())
+  ipcMain.handle('hub:hidden:hide', (_, resource) => upsertHubHidden(resource))
+  ipcMain.handle('hub:hidden:unhide', (_, resourceId) => deleteHubHidden(resourceId))
+  ipcMain.handle('hub:hidden:clear', () => clearHubHidden())
 
   ipcMain.handle('hub:search', async (_, params) => {
     const result = await searchResources(params)

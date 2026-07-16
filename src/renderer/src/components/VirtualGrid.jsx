@@ -29,6 +29,8 @@ export function VirtualGrid({
   selectedIndex,
   /** Fired when the last visible row is within `endReachedThreshold` rows of the end (infinite scroll). */
   onEndReached,
+  scrollRef: providedScrollRef,
+  onWheel,
   /** How many rows from the bottom trigger `onEndReached`. `range.endIndex` already includes `overscan`,
    *  so a small value fires roughly a viewport-plus before the end (matches the old ~1600px prefetch margin). */
   endReachedThreshold = 4,
@@ -38,7 +40,8 @@ export function VirtualGrid({
   hideEmptyMessage = false,
 }) {
   const rowGap = gapY ?? gap
-  const scrollRef = useRef(null)
+  const ownScrollRef = useRef(null)
+  const scrollRef = providedScrollRef || ownScrollRef
   const [layout, setLayout] = useState({ cols: 1, cellWidth: itemWidth })
   const layoutRef = useRef(layout)
   const scrollFixRef = useRef(null)
@@ -69,7 +72,7 @@ export function VirtualGrid({
     }
     el.addEventListener('scroll', onScroll, { passive: true })
     return () => el.removeEventListener('scroll', onScroll)
-  }, [calcRowHeight, rowGap, padding])
+  }, [calcRowHeight, rowGap, padding, scrollRef])
 
   const measure = useCallback(() => {
     const el = scrollRef.current
@@ -100,14 +103,14 @@ export function VirtualGrid({
     layoutRef.current = next
     setLayout(next)
     onLayout?.({ cols: newCols, cellWidth: newCellWidth, availableWidth: avail })
-  }, [itemWidth, calcRowHeight, gap, rowGap, padding, onLayout])
+  }, [itemWidth, calcRowHeight, gap, rowGap, padding, onLayout, scrollRef])
 
   useEffect(() => {
     measure()
     const ro = new ResizeObserver(measure)
     if (scrollRef.current) ro.observe(scrollRef.current)
     return () => ro.disconnect()
-  }, [measure])
+  }, [measure, scrollRef])
 
   const { cols, cellWidth } = layout
   const rowHeight = calcRowHeight(cellWidth)
@@ -156,7 +159,7 @@ export function VirtualGrid({
         })
       }
     }
-  }, [cols, cellWidth, rowHeight, rowGap, virtualizer])
+  }, [cols, cellWidth, rowHeight, rowGap, virtualizer, scrollRef])
 
   // Scroll reset/restore. Reset to top only when scrollResetKey actually changes (a
   // real filter change); otherwise restore the last user offset. <Activity> re-runs
@@ -191,7 +194,7 @@ export function VirtualGrid({
       // the previously captured offset instead of overwriting it with a clamped 0.
       if (el.clientHeight > 0) scrollTopRef.current = el.scrollTop
     }
-  }, [scrollResetKey])
+  }, [scrollResetKey, scrollRef])
 
   const onScrollMouseDown = useCallback(
     (e) => {
@@ -213,7 +216,12 @@ export function VirtualGrid({
 
   return (
     <div className={`relative ${className}`}>
-      <div ref={scrollRef} className="absolute inset-0 overflow-y-auto" onMouseDown={onScrollMouseDown}>
+      <div
+        ref={scrollRef}
+        className="absolute inset-0 overflow-y-auto"
+        onMouseDown={onScrollMouseDown}
+        onWheel={onWheel}
+      >
         <div style={{ height: virtualizer.getTotalSize() + padding * 2, position: 'relative' }}>
           {virtualizer.getVirtualItems().map((vRow) => {
             const startIdx = vRow.index * cols

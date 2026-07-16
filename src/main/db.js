@@ -4,7 +4,7 @@ import { app } from 'electron'
 import { join } from 'path'
 import { LOCAL_PACKAGE_FILENAME, LOCAL_PACKAGE_DISPLAY_NAME } from '@shared/local-package.js'
 
-export const SCHEMA_VERSION = 28
+export const SCHEMA_VERSION = 29
 
 /**
  * Normalize a value to a non-negative integer string, or null. Hub resource/user
@@ -147,6 +147,7 @@ export const MIGRATIONS = [
   [26, applyV26],
   [27, applyV27],
   [28, applyV28],
+  [29, applyV29],
 ]
 
 function migrate() {
@@ -470,6 +471,21 @@ function applyV28() {
   )
 }
 
+function applyV29() {
+  db.exec(hubHiddenSchemaSql())
+}
+
+function hubHiddenSchemaSql() {
+  return `
+    CREATE TABLE IF NOT EXISTS hub_hidden (
+      resource_id TEXT PRIMARY KEY CHECK (${intCheckSql('resource_id')}),
+      title TEXT,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+  `
+}
+
 /**
  * Ensure the synthetic "local content" package row exists. Loose files under
  * `vamDir/Saves` and `vamDir/Custom` are stored as `contents` rows that point
@@ -590,6 +606,8 @@ function createSchema() {
       snapshot_at INTEGER NOT NULL DEFAULT (unixepoch()),
       unavailable_at INTEGER
     );
+
+    ${hubHiddenSchemaSql()}
 
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
@@ -1447,6 +1465,40 @@ export function isWishlisted(resourceId) {
   const rid = toIntString(resourceId)
   if (rid === null) return false
   return !!stmt('SELECT 1 FROM hub_wishlist WHERE resource_id = ?').get(rid)
+}
+
+export function listHubHidden() {
+  return stmt(
+    `SELECT resource_id, title, created_at, updated_at
+     FROM hub_hidden
+     ORDER BY updated_at DESC, created_at DESC`,
+  ).all()
+}
+
+export function getHubHiddenIds() {
+  return stmt('SELECT resource_id FROM hub_hidden')
+    .all()
+    .map((row) => row.resource_id)
+}
+
+export function upsertHubHidden(resource) {
+  const rid = toIntString(resource?.resource_id ?? resource?.resourceId)
+  if (rid === null) throw new Error('Hub hidden resource_id is required')
+  stmt(
+    `INSERT INTO hub_hidden (resource_id, title)
+     VALUES (?, ?)
+     ON CONFLICT(resource_id) DO UPDATE SET title = excluded.title, updated_at = unixepoch()`,
+  ).run(rid, resource?.title ?? null)
+  return stmt('SELECT * FROM hub_hidden WHERE resource_id = ?').get(rid)
+}
+
+export function deleteHubHidden(resourceId) {
+  const rid = toIntString(resourceId)
+  return rid === null ? 0 : stmt('DELETE FROM hub_hidden WHERE resource_id = ?').run(rid).changes
+}
+
+export function clearHubHidden() {
+  return stmt('DELETE FROM hub_hidden').run().changes
 }
 
 /**

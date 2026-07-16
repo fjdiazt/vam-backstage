@@ -5,13 +5,14 @@ import { describe, expect, it } from 'vitest'
 const source = readFileSync(resolve(import.meta.dirname, 'VirtualGrid.jsx'), 'utf8')
 
 describe('virtual scroll back-to-top wiring', () => {
-  it('imports and renders the shared BackToTopButton', () => {
-    expect(source).toContain("import BackToTopButton from './BackToTopButton'")
-    expect(source.match(/<BackToTopButton scrollRef=\{scrollRef\} \/>/g)).toHaveLength(2)
+  it('renders the upstream shared ScrollToTopButton', () => {
+    expect(source).toContain("import { ScrollToTopButton } from '@/components/ScrollToTopButton'")
+    expect(source.match(/<ScrollToTopButton scrollRef=\{scrollRef\} \/>/g)).toHaveLength(2)
   })
 
-  it('gates the button behind showBackToTop for grid and list', () => {
-    expect(source.match(/showBackToTop = false/g)).toHaveLength(2)
-    expect(source.match(/\{showBackToTop && <BackToTopButton/g)).toHaveLength(2)
+  it('accepts an external scroll ref and wheel handler for Hub reverse paging', () => {
+    expect(source).toContain('scrollRef: providedScrollRef')
+    expect(source).toContain('const scrollRef = providedScrollRef || ownScrollRef')
+    expect(source).toContain('onWheel={onWheel}')
   })
 })

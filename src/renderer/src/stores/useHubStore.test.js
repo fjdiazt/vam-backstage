@@ -1,10 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { hubTailCacheKey, useHubStore } from './useHubStore'
+import { HUB_PERSISTED_STATE, hubTailCacheKey, useHubStore } from './useHubStore'
 import { useInstalledStore } from './useInstalledStore'
+import { persistViewState } from './persistViewState'
 
 function resource(id) {
   return { resource_id: id, title: `Resource ${id}` }
 }
+
+const persistedState = () => persistViewState('test', HUB_PERSISTED_STATE).partialize(useHubStore.getState())
 
 describe('useHubStore', () => {
   beforeEach(() => {
@@ -65,18 +68,22 @@ describe('useHubStore', () => {
     expect(useHubStore.getState().page).toBe(2)
   })
 
-  it('persists infinite restore page instead of last loaded page', () => {
+  it('persists infinite restore page separately from the loaded tail page', () => {
     useHubStore.setState({ browseMode: 'infinite', startPage: 1, restorePage: 3, page: 5 })
 
-    expect(useHubStore.getState().getPersistedState()).toMatchObject({ browseMode: 'infinite', page: 3 })
+    expect(persistedState()).toMatchObject({ browseMode: 'infinite', page: 5, restorePage: 3 })
   })
 
   it('persists and restores page size', () => {
     useHubStore.setState({ browseMode: 'paged', page: 4, perPage: 120 })
 
-    expect(useHubStore.getState().getPersistedState()).toMatchObject({ page: 4, perPage: 120 })
+    expect(persistedState()).toMatchObject({ page: 4, perPage: 120 })
 
-    useHubStore.getState().applyPersistedState({ page: 2, perPage: 90 })
+    const restored = persistViewState('test', HUB_PERSISTED_STATE).merge(
+      { page: 2, startPage: 2, restorePage: 2, perPage: 90 },
+      useHubStore.getState(),
+    )
+    useHubStore.setState(restored)
 
     expect(useHubStore.getState()).toMatchObject({ page: 2, startPage: 2, restorePage: 2, perPage: 90 })
   })
@@ -84,12 +91,16 @@ describe('useHubStore', () => {
   it('persists and restores Hub visibility toggles', () => {
     useHubStore.setState({ hideInstalled: true, showHidden: true })
 
-    expect(useHubStore.getState().getPersistedState()).toMatchObject({
+    expect(persistedState()).toMatchObject({
       hideInstalled: true,
       showHidden: true,
     })
 
-    useHubStore.getState().applyPersistedState({ hideInstalled: false, showHidden: true })
+    const restored = persistViewState('test', HUB_PERSISTED_STATE).merge(
+      { hideInstalled: false, showHidden: true },
+      useHubStore.getState(),
+    )
+    useHubStore.setState(restored)
 
     expect(useHubStore.getState()).toMatchObject({ hideInstalled: false, showHidden: true })
   })
@@ -119,12 +130,13 @@ describe('useHubStore', () => {
     })
   })
 
-  it('resizes infinite start page from the restore page', async () => {
+  it('resizes infinite start page from the restore page without fetching twice', () => {
     useHubStore.setState({ browseMode: 'infinite', startPage: 1, restorePage: 3, page: 5, perPage: 60 })
 
-    await useHubStore.getState().setPerPage(120)
+    useHubStore.getState().setPerPage(120)
 
-    expect(window.api.hub.search).toHaveBeenCalledWith(expect.objectContaining({ page: 2, perpage: 120 }))
+    expect(useHubStore.getState()).toMatchObject({ page: 2, startPage: 2, restorePage: 2, perPage: 120 })
+    expect(window.api.hub.search).not.toHaveBeenCalled()
   })
 
   it('tracks infinite restore page when enabled', () => {
@@ -133,7 +145,7 @@ describe('useHubStore', () => {
     useHubStore.getState().setInfiniteRestorePage(4)
 
     expect(useHubStore.getState().startPage).toBe(1)
-    expect(useHubStore.getState().getPersistedState()).toMatchObject({ page: 4 })
+    expect(persistedState()).toMatchObject({ restorePage: 4 })
   })
 
   it('can disable infinite restore tracking later', () => {
@@ -147,39 +159,7 @@ describe('useHubStore', () => {
 
     useHubStore.getState().setInfiniteRestorePage(4)
 
-    expect(useHubStore.getState().getPersistedState()).toMatchObject({ page: 1 })
-  })
-
-  it('hydrates the infinite page memory setting', async () => {
-    window.api.settings.get.mockImplementation((key) =>
-      Promise.resolve(key === 'hub_remember_infinite_page' ? '0' : null),
-    )
-
-    await useHubStore.getState().hydrateHubFilterPreferences()
-
-    expect(useHubStore.getState().trackInfiniteRestorePage).toBe(false)
-  })
-
-  it('persists the infinite page memory setting', () => {
-    useHubStore.getState().setTrackInfiniteRestorePage(false)
-
-    expect(useHubStore.getState().trackInfiniteRestorePage).toBe(false)
-    expect(window.api.settings.set).toHaveBeenCalledWith('hub_remember_infinite_page', '0')
-  })
-
-  it('hydrates the infinite pager controls setting', async () => {
-    window.api.settings.get.mockImplementation((key) => Promise.resolve(key === 'hub_show_infinite_pager' ? '0' : null))
-
-    await useHubStore.getState().hydrateHubFilterPreferences()
-
-    expect(useHubStore.getState().showInfinitePagerControls).toBe(false)
-  })
-
-  it('persists the infinite pager controls setting', () => {
-    useHubStore.getState().setShowInfinitePagerControls(false)
-
-    expect(useHubStore.getState().showInfinitePagerControls).toBe(false)
-    expect(window.api.settings.set).toHaveBeenCalledWith('hub_show_infinite_pager', '0')
+    expect(persistedState()).toMatchObject({ restorePage: 1 })
   })
 
   it('normalizes hub sort before exposing loaded filter options', async () => {
@@ -234,9 +214,7 @@ describe('useHubStore', () => {
 
   it('uses a persisted resolved tail page cache', async () => {
     const key = hubTailCacheKey(useHubStore.getState())
-    window.api.settings.get.mockImplementation((setting) =>
-      Promise.resolve(setting === 'hub_tail_page_cache_v1' ? JSON.stringify({ [key]: { totalPages: 6 } }) : null),
-    )
+    useHubStore.setState({ tailCache: { [key]: { totalPages: 6 } } })
 
     await useHubStore.getState().fetchResources(true, { page: 10 })
 
@@ -244,7 +222,7 @@ describe('useHubStore', () => {
     expect(useHubStore.getState()).toMatchObject({ page: 6, totalPages: 6, resolvedTotalPages: 6 })
   })
 
-  it('resolves and persists the actual tail page', async () => {
+  it('resolves and caches the actual tail page', async () => {
     window.api.hub.search.mockImplementation(({ page }) => {
       const resources = page <= 6 ? [resource(page)] : []
       return Promise.resolve({ resources, totalFound: 300, totalPages: 10 })
@@ -254,10 +232,8 @@ describe('useHubStore', () => {
     await useHubStore.getState().resolveTailPages()
 
     expect(useHubStore.getState()).toMatchObject({ totalPages: 6, resolvedTotalPages: 6 })
-    expect(window.api.settings.set).toHaveBeenCalledWith(
-      'hub_tail_page_cache_v1',
-      expect.stringContaining('"totalPages":6'),
-    )
+    const key = hubTailCacheKey(useHubStore.getState())
+    expect(useHubStore.getState().tailCache[key]).toMatchObject({ totalPages: 6 })
   })
 
   it('force rechecks a cached tail page for newly-added pages', async () => {
