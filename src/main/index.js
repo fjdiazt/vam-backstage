@@ -115,10 +115,6 @@ function registerWebviewWindowOpenHandler() {
     if (mainWindow) {
       attachNativeTextContextMenu(contents, mainWindow)
     }
-    contents.on('app-command', (event, command) => {
-      if (!sendPageAppCommand(command)) return
-      event.preventDefault()
-    })
     contents.setWindowOpenHandler(({ url }) => {
       if (url && url !== 'about:blank') {
         try {

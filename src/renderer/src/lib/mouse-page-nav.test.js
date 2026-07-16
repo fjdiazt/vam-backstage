@@ -46,7 +46,6 @@ describe('mouse page navigation wiring', () => {
 
   it('routes native mouse browser commands and captures webview back before guest history', () => {
     expect(mainIndex).toContain("on('app-command'")
-    expect(mainIndex).toContain("contents.on('app-command'")
     expect(mainIndex).toContain("webContents.send('app-command'")
     expect(hubView).toContain("window.api.on('app-command'")
     expect(libraryView).toContain("window.api.on('app-command'")
@@ -56,5 +55,9 @@ describe('mouse page navigation wiring', () => {
     expect(hubView).toContain("document.addEventListener('mousedown'")
     expect(hubView).toContain("document.addEventListener('mouseup'")
     expect(hubView).toContain("document.addEventListener('auxclick'")
+  })
+
+  it('does not forward webview app-command after guest capture handles it', () => {
+    expect(mainIndex).not.toContain("contents.on('app-command'")
   })
 })
