@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'fs'
 import { resolve } from 'path'
 import {
+  createMousePageDirectionGate,
   getAppCommandPageDirection,
   getMousePageDirection,
   isMousePageBackButton,
@@ -13,6 +14,10 @@ const hubView = readFileSync(resolve(import.meta.dirname, '../views/HubView.jsx'
 const libraryView = readFileSync(resolve(import.meta.dirname, '../views/LibraryView.jsx'), 'utf8')
 const contentView = readFileSync(resolve(import.meta.dirname, '../views/ContentView.jsx'), 'utf8')
 const virtualGrid = readFileSync(resolve(import.meta.dirname, '../components/VirtualGrid.jsx'), 'utf8')
+const hubDetail = readFileSync(resolve(import.meta.dirname, '../components/HubDetail.jsx'), 'utf8')
+const mousePageHook = readFileSync(resolve(import.meta.dirname, '../hooks/useMousePageNavigation.js'), 'utf8')
+const webviewPreload = readFileSync(resolve(import.meta.dirname, '../../../preload/hub-webview.js'), 'utf8')
+const viteConfig = readFileSync(resolve(import.meta.dirname, '../../../../electron.vite.config.mjs'), 'utf8')
 const mainIndex = readFileSync(resolve(import.meta.dirname, '../../../main/index.js'), 'utf8')
 
 describe('mouse page navigation buttons', () => {
@@ -34,30 +39,35 @@ describe('mouse page navigation buttons', () => {
     expect(shouldIgnoreMousePageTargetName('button')).toBe(false)
     expect(shouldIgnoreMousePageTargetName('div')).toBe(false)
   })
+
+  it('deduplicates one native command emitted through two event paths', () => {
+    const gate = createMousePageDirectionGate(120)
+    expect(gate(-1, 1000)).toBe(true)
+    expect(gate(-1, 1050)).toBe(false)
+    expect(gate(1, 1050)).toBe(true)
+    expect(gate(1, 1170)).toBe(true)
+  })
 })
 
 describe('mouse page navigation wiring', () => {
   it('wires Hub, Library, Content, and virtual scrollers', () => {
-    expect(hubView).toContain('onMouseUp={handleMousePageButton}')
-    expect(libraryView).toContain('onMouseUp={handleMousePageButton}')
-    expect(contentView).toContain('onMouseUp={handleMousePageButton}')
+    expect(hubView).toContain('useMousePageNavigation')
+    expect(libraryView).toContain('useMousePageNavigation')
+    expect(contentView).toContain('useMousePageNavigation')
+    expect(mousePageHook).toContain("window.api.on('app-command'")
     expect(virtualGrid).toContain('data-page-nav-scroll')
   })
 
-  it('routes native mouse browser commands and captures webview back before guest history', () => {
+  it('routes native mouse browser commands', () => {
     expect(mainIndex).toContain("on('app-command'")
     expect(mainIndex).toContain("webContents.send('app-command'")
-    expect(hubView).toContain("window.api.on('app-command'")
-    expect(libraryView).toContain("window.api.on('app-command'")
-    expect(contentView).toContain("window.api.on('app-command'")
-    expect(hubView).toContain('__VAM_MOUSE_PAGE_BACK__:')
-    expect(hubView).toContain('webviewBackCaptureReady')
-    expect(hubView).toContain("document.addEventListener('mousedown'")
-    expect(hubView).toContain("document.addEventListener('mouseup'")
-    expect(hubView).toContain("document.addEventListener('auxclick'")
   })
 
-  it('does not forward webview app-command after guest capture handles it', () => {
-    expect(mainIndex).not.toContain("contents.on('app-command'")
+  it('captures Hub webview back before page load without guest-page patching', () => {
+    expect(viteConfig).toContain("'hub-webview'")
+    expect(webviewPreload).toContain("ipcRenderer.sendToHost('hub-page-nav'")
+    expect(hubDetail).toContain('hubWebviewPreload')
+    expect(hubDetail).toContain("e.channel !== 'hub-page-nav'")
+    expect(hubDetail).not.toContain('__VAM_MOUSE_PAGE_BACK__:')
   })
 })

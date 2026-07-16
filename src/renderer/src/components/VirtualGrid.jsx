@@ -218,6 +218,7 @@ export function VirtualGrid({
     <div className={`relative ${className}`}>
       <div
         ref={scrollRef}
+        data-page-nav-scroll
         className="absolute inset-0 overflow-y-auto"
         onMouseDown={onScrollMouseDown}
         onWheel={onWheel}
@@ -296,7 +297,7 @@ export function VirtualList({ items, rowHeight = 37, renderRow, className = '', 
 
   return (
     <div className={`relative ${className}`}>
-      <div ref={scrollRef} className="absolute inset-0 overflow-y-auto">
+      <div ref={scrollRef} data-page-nav-scroll className="absolute inset-0 overflow-y-auto">
         <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
           {virtualizer.getVirtualItems().map((vRow) => (
             <div key={vRow.key} style={{ position: 'absolute', top: vRow.start, left: 0, right: 0, height: rowHeight }}>

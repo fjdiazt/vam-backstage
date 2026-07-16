@@ -27,6 +27,17 @@ export function getAppCommandPageDirection(command) {
   return 0
 }
 
+export function createMousePageDirectionGate(windowMs = 120) {
+  let lastDirection = 0
+  let lastAt = -Infinity
+  return (direction, now = Date.now()) => {
+    if (direction === lastDirection && now - lastAt < windowMs) return false
+    lastDirection = direction
+    lastAt = now
+    return true
+  }
+}
+
 export function shouldIgnoreMousePageTargetName(tagName) {
   return IGNORED_TARGETS.has(String(tagName || '').toUpperCase())
 }

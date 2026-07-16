@@ -12,6 +12,14 @@ export default defineConfig({
     },
   },
   preload: {
+    build: {
+      rollupOptions: {
+        input: {
+          index: resolve('src/preload/index.js'),
+          'hub-webview': resolve('src/preload/hub-webview.js'),
+        },
+      },
+    },
     resolve: {
       alias: {
         '@shared': resolve('src/shared'),

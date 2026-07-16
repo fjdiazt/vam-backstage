@@ -36,6 +36,9 @@ import { SearchOnHubButton } from '@/components/SearchOnHubButton'
 import { ThumbnailSizeSlider } from '@/components/ThumbnailSizeSlider'
 import { VirtualGrid } from '@/components/VirtualGrid'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { useViewStore } from '@/stores/useViewStore'
+import { useMousePageNavigation } from '@/hooks/useMousePageNavigation'
+import { scrollMousePage, shouldIgnoreMousePageTarget } from '@/lib/mouse-page-nav'
 
 /** Hub text search: avoid a network request on every keystroke */
 const HUB_SEARCH_DEBOUNCE_MS = 320
@@ -154,6 +157,7 @@ function filterAndSortWishlist(items, state) {
 }
 
 export default function HubView({ onNavigate }) {
+  const hubActive = useViewStore((state) => state.view === 'hub')
   const {
     resources,
     totalFound,
@@ -908,6 +912,36 @@ export default function HubView({ onNavigate }) {
   const currentPage = browseMode === 'infinite' ? restorePage : page
   const canRecheckTail = !!resolvedTotalPages && !tailResolving
   const goCurrentModePage = browseMode === 'infinite' ? goInfiniteStartPage : goPagedPage
+  const handlePageDirection = useCallback(
+    (direction, target, root) => {
+      if (detailResource) {
+        if (direction < 0) popDetailHistory()
+        return
+      }
+      if (target && shouldIgnoreMousePageTarget(target)) return
+      if (wishlistMode) {
+        scrollMousePage(target || root, root, direction)
+        return
+      }
+      if (loading || (direction < 0 && currentPage <= 1)) return
+      if (direction > 0 && currentPage >= maxHubPage && !canRecheckTail) return
+      goCurrentModePage(currentPage + direction)
+    },
+    [
+      canRecheckTail,
+      currentPage,
+      detailResource,
+      goCurrentModePage,
+      loading,
+      maxHubPage,
+      popDetailHistory,
+      wishlistMode,
+    ],
+  )
+  const { rootRef: pageNavRootRef, onMouseUpCapture: handleMousePageButton } = useMousePageNavigation({
+    active: hubActive,
+    onDirection: handlePageDirection,
+  })
   const rangePage = browseMode === 'infinite' ? startPage : page
   const pageStart = resources.length ? (rangePage - 1) * perPage + 1 : 0
   const pageEnd = resources.length ? Math.min(pageStart + resources.length - 1, totalFound) : 0
@@ -1024,7 +1058,7 @@ export default function HubView({ onNavigate }) {
   const refreshBusy = loading && resources.length === 0
 
   return (
-    <div className="h-full flex min-w-0 relative">
+    <div ref={pageNavRootRef} className="h-full flex min-w-0 relative" onMouseUpCapture={handleMousePageButton}>
       {/* Both modes use the same panel; hub filters drive the server query while
           wishlist filters run client-side over the local snapshots. */}
       <FilterPanel

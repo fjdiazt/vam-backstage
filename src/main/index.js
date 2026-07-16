@@ -79,6 +79,15 @@ import {
 let mainWindow = null
 
 const HUB_ORIGIN = new URL('https://hub.virtamate.com').origin
+const PAGE_APP_COMMANDS = new Set(['browser-backward', 'browser-forward'])
+
+function attachAppCommandBridge(window) {
+  window.on('app-command', (event, command) => {
+    if (!PAGE_APP_COMMANDS.has(command)) return
+    event.preventDefault()
+    window.webContents.send('app-command', command)
+  })
+}
 
 // `npm run dev` sets VAM_DEV_USERDATA to isolate dev in a `-dev` userData;
 // `dev:installed` leaves it unset to attach to the installed data. Must run
@@ -290,6 +299,7 @@ function createWindow() {
 
   attachNativeTextContextMenu(mainWindow.webContents, mainWindow)
   attachDevToolsHotkeys(mainWindow)
+  attachAppCommandBridge(mainWindow)
 
   mainWindow.webContents.on('did-finish-load', () => flushBufferedLogs())
 

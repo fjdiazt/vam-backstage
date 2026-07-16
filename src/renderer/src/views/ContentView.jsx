@@ -62,6 +62,9 @@ import { isLocalPackage } from '@shared/local-package.js'
 import { isPackageActive } from '@shared/storage-state-predicates.js'
 import { packageNeedsDisableConfirmation } from '@/lib/package-disable-confirm'
 import { StorageStateChip } from '@/components/StorageStateChip'
+import { useViewStore } from '@/stores/useViewStore'
+import { useMousePageNavigation } from '@/hooks/useMousePageNavigation'
+import { scrollMousePage, shouldIgnoreMousePageTarget } from '@/lib/mouse-page-nav'
 
 const SORT_OPTIONS = ['Recently installed', 'Name A-Z', 'Package', 'Type']
 export const LAZY_LABEL_LOADING = false
@@ -201,6 +204,7 @@ export function labelsForContentItems(labels, items, selectedLabelIds, selectedT
 }
 
 export default function ContentView({ onNavigate, navContext }) {
+  const contentActive = useViewStore((state) => state.view === 'content')
   const {
     contents,
     selectedItem,
@@ -237,6 +241,7 @@ export default function ContentView({ onNavigate, navContext }) {
     cardWidth,
     setCardWidth,
     selectItem,
+    clearSelection,
     bulkSelectedIds,
     toggleBulkSelect,
     rangeBulkSelect,
@@ -870,6 +875,22 @@ export default function ContentView({ onNavigate, navContext }) {
     columnCount: viewMode === 'grid' ? gridLayout.cols : 1,
   })
 
+  const handlePageDirection = useCallback(
+    (direction, target, root) => {
+      if (direction < 0 && selectedItem && !bulkActive) {
+        clearSelection()
+        return
+      }
+      if (target && shouldIgnoreMousePageTarget(target)) return
+      scrollMousePage(target || root, root, direction)
+    },
+    [bulkActive, clearSelection, selectedItem],
+  )
+  const { rootRef: pageNavRootRef, onMouseUpCapture: handleMousePageButton } = useMousePageNavigation({
+    active: contentActive,
+    onDirection: handlePageDirection,
+  })
+
   useEffect(() => {
     function onKeyDown(e) {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return
@@ -1058,7 +1079,7 @@ export default function ContentView({ onNavigate, navContext }) {
   }, [bulkSelectedIds, filtered.length])
 
   return (
-    <div className="h-full flex">
+    <div ref={pageNavRootRef} className="h-full flex" onMouseUpCapture={handleMousePageButton}>
       <FilterPanel
         search={search}
         onSearchChange={setSearch}

@@ -432,6 +432,11 @@ export default function HubDetail({
     }
     const onStartLoading = () => setIsLoading(true)
     const onStopLoading = () => setIsLoading(false)
+    const onIpcMessage = (e) => {
+      if (e.channel !== 'hub-page-nav') return
+      const direction = Number(e.args?.[0])
+      if (direction < 0) onBack()
+    }
 
     // Inject a click-interceptor into the guest page so that:
     //  • External links (non-hub origin) open in the user's default browser via shell.openExternal.
@@ -521,6 +526,7 @@ export default function HubDetail({
     wv.addEventListener('did-fail-load', ignoreAbort)
     wv.addEventListener('did-start-loading', onStartLoading)
     wv.addEventListener('did-stop-loading', onStopLoading)
+    wv.addEventListener('ipc-message', onIpcMessage)
     wv.addEventListener('dom-ready', injectLinkHandler)
     wv.addEventListener('console-message', onConsoleMessage)
     return () => {
@@ -529,11 +535,12 @@ export default function HubDetail({
       wv.removeEventListener('did-fail-load', ignoreAbort)
       wv.removeEventListener('did-start-loading', onStartLoading)
       wv.removeEventListener('did-stop-loading', onStopLoading)
+      wv.removeEventListener('ipc-message', onIpcMessage)
       wv.removeEventListener('dom-ready', injectLinkHandler)
       wv.removeEventListener('console-message', onConsoleMessage)
     }
     // `hubActive` dep: reattach to the freshly-mounted <webview> on return to Hub.
-  }, [resourceId, tabUrls, tabs, hubActive])
+  }, [resourceId, tabUrls, tabs, hubActive, onBack])
 
   const goBack = useCallback(() => webviewRef.current?.goBack(), [])
   const goForward = useCallback(() => webviewRef.current?.goForward(), [])
@@ -1170,6 +1177,7 @@ export default function HubDetail({
                 key={browserResourceId}
                 ref={webviewRef}
                 src={navUrl}
+                preload={window.api.app.hubWebviewPreload}
                 partition="persist:hub"
                 allowpopups="true"
                 className="w-full h-full"

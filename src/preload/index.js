@@ -1,6 +1,8 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 import { createRemoteTransport } from './remote-transport.js'
+import { join } from 'path'
+import { pathToFileURL } from 'url'
 
 // `--connect=<url>` is forwarded here via webPreferences.additionalArguments in
 // client mode. It must be read synchronously to pick the transport before any
@@ -184,6 +186,7 @@ const api = {
   },
   app: {
     getVersion: () => invoke('app:version'),
+    hubWebviewPreload: pathToFileURL(join(__dirname, 'hub-webview.js')).toString(),
   },
   updater: {
     install: () => invoke('updater:install'),

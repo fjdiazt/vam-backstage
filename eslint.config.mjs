@@ -40,7 +40,7 @@ export default [
       'react-hooks/immutability': 'off',
       'react-refresh/only-export-components': 'off',
       'react-hooks/incompatible-library': 'off',
-      'react/no-unknown-property': ['error', { ignore: ['partition', 'allowpopups'] }],
+      'react/no-unknown-property': ['error', { ignore: ['partition', 'allowpopups', 'preload'] }],
     },
   },
   eslintConfigPrettier,

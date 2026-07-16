@@ -99,6 +99,9 @@ import {
   ForceRemoveDialogContent,
 } from '@/components/package-action-dialogs'
 import { packageNeedsDisableConfirmation } from '@/lib/package-disable-confirm'
+import { useViewStore } from '@/stores/useViewStore'
+import { useMousePageNavigation } from '@/hooks/useMousePageNavigation'
+import { scrollMousePage, shouldIgnoreMousePageTarget } from '@/lib/mouse-page-nav'
 
 const SORT_OPTIONS = ['Recently installed', 'Type', 'Name', 'Size', 'Content', 'Deps', 'Morphs']
 export const LAZY_LABEL_LOADING = false
@@ -201,6 +204,7 @@ function filterPackagesByVisibility(items, visibilityFilter) {
 }
 
 export default function LibraryView({ onNavigate, navContext }) {
+  const libraryActive = useViewStore((state) => state.view === 'library')
   const {
     packages,
     selectedDetail,
@@ -248,6 +252,7 @@ export default function LibraryView({ onNavigate, navContext }) {
     fetchMissingDeps,
     refreshUpdateCheck,
     selectPackage,
+    clearSelection,
     bulkSelectedFilenames,
     toggleBulkSelect,
     rangeBulkSelect,
@@ -951,6 +956,22 @@ export default function LibraryView({ onNavigate, navContext }) {
     columnCount: viewMode !== 'table' ? gridLayout.cols : 1,
   })
 
+  const handlePageDirection = useCallback(
+    (direction, target, root) => {
+      if (direction < 0 && selectedDetail && !bulkActive) {
+        clearSelection()
+        return
+      }
+      if (target && shouldIgnoreMousePageTarget(target)) return
+      scrollMousePage(target || root, root, direction)
+    },
+    [bulkActive, clearSelection, selectedDetail],
+  )
+  const { rootRef: pageNavRootRef, onMouseUpCapture: handleMousePageButton } = useMousePageNavigation({
+    active: libraryActive,
+    onDirection: handlePageDirection,
+  })
+
   useEffect(() => {
     function onKeyDown(e) {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return
@@ -985,7 +1006,7 @@ export default function LibraryView({ onNavigate, navContext }) {
   }, [bulkSelectedFilenames, filtered.length])
 
   return (
-    <div className="h-full flex">
+    <div ref={pageNavRootRef} className="h-full flex" onMouseUpCapture={handleMousePageButton}>
       <FilterPanel
         search={search}
         onSearchChange={setSearch}
