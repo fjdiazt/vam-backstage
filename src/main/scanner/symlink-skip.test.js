@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { join } from 'path'
 
 // ── Synthetic-dirent unit test for collectVarCandidates ───────────────────────
 //
@@ -129,8 +130,8 @@ describe('collectVarCandidates — symlink skip', () => {
     await collectVarCandidates('/root', out, true)
     expect(out).toHaveLength(1)
     expect(out[0].canonical).toBe('A.B.1.var')
-    expect(out[0].barePath).toBe('/root/A.B.1.var')
-    expect(out[0].disabledPath).toBe('/root/A.B.1.var.disabled')
+    expect(out[0].barePath).toBe(join('/root', 'A.B.1.var'))
+    expect(out[0].disabledPath).toBe(join('/root', 'A.B.1.var.disabled'))
   })
 
   it('does not dedup across different dirs — both canonical copies appear', async () => {

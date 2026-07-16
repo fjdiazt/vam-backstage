@@ -1,36 +1,21 @@
-import { PassThrough } from 'stream'
 import { readFileSync } from 'fs'
 import { resolve } from 'path'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 const electronMock = vi.hoisted(() => ({
-  request: vi.fn(),
   fetch: vi.fn(),
   fromPartition: vi.fn(),
 }))
 
 vi.mock('electron', () => ({
-  net: { request: electronMock.request, fetch: electronMock.fetch },
+  net: { fetch: electronMock.fetch },
   session: { fromPartition: electronMock.fromPartition },
 }))
 
-import { concreteDepFilename, isFlexibleFilename, openDownloadStream } from './manager.js'
-
-function mockResponse(body) {
-  const req = new PassThrough()
-  req.setHeader = vi.fn()
-  req.end = vi.fn(() => req.emit('response', body))
-  req.abort = vi.fn(() => req.emit('abort'))
-  electronMock.request.mockReturnValue(req)
-  return req
-}
-
-beforeEach(() => {
-  electronMock.request.mockReset()
-  electronMock.fetch.mockReset()
-})
+import { concreteDepFilename, isFlexibleFilename } from './manager.js'
 
 const managerSource = readFileSync(resolve(import.meta.dirname, './manager.js'), 'utf8')
+const mainSource = readFileSync(resolve(import.meta.dirname, '../index.js'), 'utf8')
 const downloadsPanelSource = readFileSync(
   resolve(import.meta.dirname, '../../renderer/src/components/DownloadsPanel.jsx'),
   'utf8',
@@ -117,35 +102,23 @@ describe('isFlexibleFilename', () => {
   })
 })
 
-describe('openDownloadStream', () => {
-  it('does not use fetch for Hub responses with non-ASCII filenames', async () => {
-    const body = PassThrough.from([Buffer.from('ok')])
-    body.statusCode = 200
-    body.statusMessage = 'OK'
-    body.headers = {
-      'content-disposition': 'attachment; filename="Qing.黑色符文（免费版）.1.var"',
-    }
-    mockResponse(body)
-
-    const res = await openDownloadStream('https://hub.virtamate.com/resources/10418/download', {
-      headers: { 'User-Agent': 'VaMBackstage/1.0' },
-    })
-    const chunks = []
-    for await (const chunk of res.body) chunks.push(chunk)
-
-    expect(electronMock.fetch).not.toHaveBeenCalled()
-    expect(res.ok).toBe(true)
-    expect(Buffer.concat(chunks).toString()).toBe('ok')
+describe('download transport', () => {
+  it('uses Electron net.fetch with a response-header sanitizer for non-ASCII filenames', () => {
+    expect(managerSource).toContain('await net.fetch(download_url')
+    expect(mainSource).toContain('function installDownloadHeaderSanitizer')
+    expect(mainSource).toContain("key.toLowerCase() !== 'content-disposition'")
+    expect(mainSource).toContain('return encodeURIComponent(v)')
   })
 })
 
 describe('download pause state wiring', () => {
   it('persists global paused state and keeps queued downloads stopped at startup', () => {
-    expect(managerSource).toContain("const DOWNLOADS_PAUSED_SETTING = 'downloads_paused'")
-    expect(managerSource).toContain("paused = getSetting(DOWNLOADS_PAUSED_SETTING) === '1'")
-    expect(managerSource).toContain("setSetting(DOWNLOADS_PAUSED_SETTING, '1')")
-    expect(managerSource).toContain("setSetting(DOWNLOADS_PAUSED_SETTING, '0')")
-    expect(managerSource).toContain('if (paused) {\n    resetActiveDownloads()')
+    expect(managerSource).toContain("const PAUSED_SETTING = 'downloads_paused'")
+    expect(managerSource).toContain("const wasPaused = getSetting(PAUSED_SETTING) === '1'")
+    expect(managerSource).toContain('persistPaused(true)')
+    expect(managerSource).toContain('persistPaused(false)')
+    expect(managerSource).toContain('if (wasPaused) {')
+    expect(managerSource).toContain('paused = true\n    resetActiveDownloads()')
     expect(managerSource).toContain('function processQueue() {\n  if (paused) return')
   })
 
