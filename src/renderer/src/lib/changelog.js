@@ -1,18 +1,172 @@
 /**
  * In-app release notes (substantial user-facing changes only), newest first.
- * @typedef {{ kind: 'new' | 'improved' | 'fixed', title: string, body: string }} ChangelogNote
+ * @typedef {{ kind: 'new' | 'improved' | 'fixed' | 'removed', title: string, body: string }} ChangelogNote
  * @typedef {{ version: string, date: string, notes: ChangelogNote[] }} ChangelogEntry
  * @type {ChangelogEntry[]}
  */
 export const CHANGELOG = [
   {
-    version: '0.2.4',
-    date: '2026-06-24',
+    version: '0.4.0',
+    date: '2026-07-15',
     notes: [
       {
         kind: 'new',
-        title: 'Favorites and bookmarks',
-        body: 'When signed in to the Hub browser, favorite and bookmark resources right from their details panel.',
+        title: 'Interactive dependency graph',
+        body: 'See your entire enabled library as one living picture and discover the shared dependencies that tie it together.',
+      },
+      {
+        kind: 'new',
+        title: 'Drag and drop packages to add them',
+        body: 'Drop .var files or whole folders onto the window to copy them into your library, even when connected to a remote library over the network.',
+      },
+      {
+        kind: 'new',
+        title: 'Import your Hub wishlist',
+        body: 'Bring your Hub favorites and bookmarks into your Wishlist from Settings.',
+      },
+      {
+        kind: 'improved',
+        title: 'Spot and fix broken dependencies',
+        body: 'Packages with disabled or offloaded dependencies are now highlighted, with a one-click "Enable disabled dependencies" to fix them.',
+      },
+      {
+        kind: 'improved',
+        title: 'Many small improvements',
+        body: '"favorite" as a search term, clickable dependencies in the Hub panel, and a second launch that just focuses the existing window.',
+      },
+      {
+        kind: 'fixed',
+        title: 'Many small fixes',
+        body: 'Spurious disable warnings and table layouts.',
+      },
+    ],
+  },
+  {
+    version: '0.3.1',
+    date: '2026-07-11',
+    notes: [
+      {
+        kind: 'new',
+        title: 'Powerful search and filters',
+        body: 'Prefix an author, tag, or label with "-" or "!" in sidebar filters to exclude matching items; clicking an added tag or label does the same. Main search now combines ordinary words with @author, #tag, %label, and exclusions across Library, Content, and Wishlist. For example, "@MacGruber hair -male".',
+      },
+      {
+        kind: 'new',
+        title: 'Hub interactions are back',
+        body: "When signed in to the Hub browser, open any resource's details to rate or react to it, add it to favorites, or bookmark it.",
+      },
+      {
+        kind: 'improved',
+        title: 'Instant view switching',
+        body: 'Moving between Hub, Library, Content, and Wishlist now feels like switching tabs, while long galleries stay fast and smooth.',
+      },
+      {
+        kind: 'improved',
+        title: 'Many small improvements',
+        body: 'Downloads that you pause stay paused across restarts, long galleries have a back-to-top button, and Hub browser controls work more naturally.',
+      },
+      {
+        kind: 'fixed',
+        title: 'Many small fixes',
+        body: 'MacOS updates, stale Hub links, and loose-file sorting in Content.',
+      },
+    ],
+  },
+  {
+    version: '0.3.0',
+    date: '2026-07-08',
+    notes: [
+      {
+        kind: 'new',
+        title: 'Use your library from other devices',
+        body: 'New client-server mode lets a second computer on your network connect to your main library and browse, download, and manage packages remotely. Set it up in Settings.',
+      },
+      {
+        kind: 'new',
+        title: 'Wishlist for Hub packages',
+        body: 'Pin packages you want to grab later, right from Hub cards or the details panel, then browse them in the new Wishlist tab with its own search, filters, and sorting. Wishlisted packages stay visible even if they disappear from the Hub.',
+      },
+      {
+        kind: 'new',
+        title: 'Find more from an author on the Hub',
+        body: 'When filtering your library, content, or wishlist by author, a new arrow button next to the filter jumps straight to a Hub search for that creator.',
+      },
+      {
+        kind: 'improved',
+        title: 'Extracted presets know where they came from',
+        body: 'Presets extracted from packages are now tied to their source: they show an "extracted" badge, follow the package when it is disabled or removed, and can be re-extracted from the right-click menu to update them.',
+      },
+      {
+        kind: 'improved',
+        title: 'Many small improvements',
+        body: "Type any address into the Hub browser's address bar; flip through content thumbnails with arrow keys.",
+      },
+      {
+        kind: 'fixed',
+        title: 'Bulk right-click actions',
+        body: 'Right-click menu actions now reliably apply to every selected item.',
+      },
+      {
+        kind: 'fixed',
+        title: 'Many small fixes',
+        body: 'The macOS installer no longer has signature issues, plus fixes to Hub link refresh and update checks.',
+      },
+    ],
+  },
+  {
+    version: '0.2.5',
+    date: '2026-07-03',
+    notes: [
+      {
+        kind: 'removed',
+        title: 'Removed Hub favorites, bookmarks, and likes features',
+        body: 'By request of the Hub admins, favoriting, bookmarking, and liking resources from the details panel is disabled.',
+      },
+      {
+        kind: 'improved',
+        title: 'Picks up where you left off',
+        body: 'The app now reopens on the view you were last using and remembers your filters, sorting, and layout between restarts.',
+      },
+      {
+        kind: 'fixed',
+        title: 'Small fixes',
+        body: 'Fixed some Patreon links that would not open, and Hub downloads that could sometimes fail.',
+      },
+    ],
+  },
+  {
+    version: '0.2.4',
+    date: '2026-06-30',
+    notes: [
+      {
+        kind: 'new',
+        title: 'Favorites, bookmarks, and likes on the Hub',
+        body: 'When signed in to the Hub browser, favorite, bookmark, and like resources right from their details panel.',
+      },
+      {
+        kind: 'new',
+        title: 'Link packages to the Hub',
+        body: 'Packages missing from the public index, like paid ones, now get matched to the Hub automatically, and you can link any package to its Hub page yourself with "Link to Hub..." in the right-click menu.',
+      },
+      {
+        kind: 'new',
+        title: 'Packages in subfolders',
+        body: "Packages organized into subfolders now show up and behave like any other instead of being skipped, and offload directories can now live inside VaM's Saves folder, such as the one BrowserAssist offloads to.",
+      },
+      {
+        kind: 'improved',
+        title: 'Browse the Hub without losing your place',
+        body: 'Step through search results with Previous/Next buttons and arrow keys, and when you follow a link inside the Hub browser the details panel updates to match the package you land on.',
+      },
+      {
+        kind: 'improved',
+        title: 'Many small improvements',
+        body: 'Newly added content stays grouped together under "Recently installed", arrow keys move across rows and columns in grids, Hub browsing and downloads follow your system proxy settings, and Hub search ignores stray spaces.',
+      },
+      {
+        kind: 'fixed',
+        title: 'Many small fixes',
+        body: "Fixed downloads for packages with non-Latin names, a freeze when removing packages from the right-click menu, Hub scrolling that could stop loading more, and a search box that wouldn't always clear. Startup is also quicker on Windows.",
       },
     ],
   },

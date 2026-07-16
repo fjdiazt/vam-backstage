@@ -8,7 +8,9 @@ import { readAllPrefs } from './vam-prefs.js'
 import { registerAllHandlers } from './ipc/index.js'
 import { initDownloadManager, onNetworkOnline } from './downloads/manager.js'
 import { startWatcher, stopWatcher } from './watcher.js'
+import { warmFileWatcherBackend } from './watcher-warm.js'
 import { resolvePackageThumbnails } from './thumb-resolver.js'
+import { runStartupMigrations } from './startup-migrations.js'
 import { initNotify, notify } from './notify.js'
 import { initLogForward, forwardLogToRenderer, flushBufferedLogs } from './log-forward.js'
 import { runScan } from './scanner/index.js'
@@ -18,7 +20,12 @@ import { fetchPackagesJson, loadPackagesJsonFromCache } from './hub/packages-jso
 import { scanHubDetails } from './hub/scanner.js'
 import { initHubAuthWatch } from './hub/interactions.js'
 import { initAutoUpdater } from './updater.js'
-import { loadBrowserAssistDerivedHiddenRules } from './browser-assist.js'
+import { installRegistry } from './remote/registry.js'
+import { startServer, stopServer } from './remote/server.js'
+import { getServePort, getConnectUrl } from './remote/cli.js'
+import { initAutostart, readAutostartUrl } from './remote/autostart.js'
+import { DEFAULT_REMOTE_PORT } from '@shared/remote-config.js'
+import { HUB_HTTP_USER_AGENT } from '@shared/hub-http.js'
 import {
   attachMainWindowStatePersistence,
   loadMainWindowState,
@@ -71,12 +78,55 @@ import {
 let mainWindow = null
 
 const HUB_ORIGIN = new URL('https://hub.virtamate.com').origin
-const PAGE_APP_COMMANDS = new Set(['browser-backward', 'browser-forward'])
 
-function sendPageAppCommand(command) {
-  if (!PAGE_APP_COMMANDS.has(command) || !mainWindow || mainWindow.isDestroyed()) return false
-  mainWindow.webContents.send('app-command', command)
-  return true
+// `npm run dev` sets VAM_DEV_USERDATA to isolate dev in a `-dev` userData;
+// `dev:installed` leaves it unset to attach to the installed data. Must run
+// before initAutostart and the `-client` swap so both inherit the dev root.
+if (process.env.VAM_DEV_USERDATA) {
+  app.setPath('userData', app.getPath('userData') + '-dev')
+}
+
+// Bind the client-autostart file to the BASE userData dir now, before the
+// `-client` swap below — both instances must resolve the same path.
+initAutostart(app.getPath('userData'))
+
+// Remote-mode switches, resolved once at startup from argv. `CONNECT_URL` set =
+// this instance is a pure client head (backend suppressed, UI points at a
+// remote server). `SERVE_PORT` set = expose the backend over the LAN.
+//
+// Connect resolution order: explicit CLI/env `--connect` wins; otherwise, when
+// we're not being told to host (`--serve`), fall back to the persisted
+// client-autostart URL. This is what makes a saved client head come up on a
+// plain launch — no relaunch needed, since the connect URL is forwarded to the
+// preload via additionalArguments in createWindow.
+const SERVE_PORT = getServePort()
+const CONNECT_URL = getConnectUrl() || (SERVE_PORT == null ? readAutostartUrl() : null)
+const IS_CLIENT = !!CONNECT_URL
+// Serving without a local window: headless host.
+const HEADLESS_SERVE = SERVE_PORT != null && !IS_CLIENT
+
+// A client and a server may run on the same machine; keep the client's
+// userData (DB is unused, but window-state + persist:hub cookies are not) in a
+// separate dir so the two instances don't clobber each other.
+if (IS_CLIENT) {
+  app.setPath('userData', app.getPath('userData') + '-client')
+}
+
+// Single-instance guard. After the client userData swap on purpose: the lock is
+// keyed on the userData dir, so a client head and the normal/serve backend (which
+// use different dirs) coexist, while two of the same kind don't — a duplicate
+// backend against the shared backstage.db + Chromium profile causes IO errors and
+// racing writers. The loser quits before opening anything (whenReady early-returns).
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
+if (!gotSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (!mainWindow) return
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    if (!mainWindow.isVisible()) mainWindow.show()
+    mainWindow.focus()
+  })
 }
 
 /**
@@ -108,6 +158,44 @@ function attachNativeTextContextMenu(webContents, popupHostWindow) {
   })
 }
 
+/** DevTools hotkeys are live whenever a dev build is running or the 7-tap unlock is set. */
+function devHotkeysEnabled() {
+  if (is.dev) return true
+  try {
+    return getSetting('developer_options_unlocked') === '1'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Reload (Cmd/Ctrl+R, Shift for force) and DevTools (F12 / Ctrl+Shift+I /
+ * Cmd+Alt+I) hotkeys match default app-menu accelerators that target the
+ * *top-level* window — so pressing them while the Hub <webview> guest is focused
+ * blows away the whole renderer / opens the host's DevTools instead of acting on
+ * the page you're looking at. Intercept at the guest: preventDefault also cancels
+ * the menu shortcut (per Electron's before-input-event contract), so these act on
+ * just the guest. Host-focused presses keep the default behavior. DevTools runs in
+ * dev too since `optimizer.watchWindowShortcuts` only wires the host window.
+ */
+function attachWebviewShortcuts(contents) {
+  contents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return
+    if (input.code === 'KeyR' && (input.meta || input.control) && !input.alt) {
+      event.preventDefault()
+      if (input.shift) contents.reloadIgnoringCache()
+      else contents.reload()
+      return
+    }
+    const isF12 = input.code === 'F12'
+    const isInspector = input.code === 'KeyI' && input.shift && (input.control || input.meta || input.alt)
+    if ((isF12 || isInspector) && devHotkeysEnabled()) {
+      event.preventDefault()
+      contents.toggleDevTools()
+    }
+  })
+}
+
 /** Deny all popup windows from <webview> guests; open non-hub URLs externally. */
 function registerWebviewWindowOpenHandler() {
   app.on('web-contents-created', (_event, contents) => {
@@ -115,6 +203,7 @@ function registerWebviewWindowOpenHandler() {
     if (mainWindow) {
       attachNativeTextContextMenu(contents, mainWindow)
     }
+    attachWebviewShortcuts(contents)
     contents.setWindowOpenHandler(({ url }) => {
       if (url && url !== 'about:blank') {
         try {
@@ -151,15 +240,10 @@ function attachDevToolsHotkeys(window) {
   })
 }
 
-function attachAppCommandBridge(window) {
-  window.on('app-command', (event, command) => {
-    if (!sendPageAppCommand(command)) return
-    event.preventDefault()
-  })
-}
-
 function createWindow() {
-  const saved = loadMainWindowState()
+  // Client head has no DB, so window-state read/persist (both go through the
+  // settings table) is skipped — fall back to default geometry.
+  const saved = IS_CLIENT ? null : loadMainWindowState()
   mainWindow = new BrowserWindow({
     title: 'VaM Backstage',
     width: saved?.width ?? DEFAULT_WIDTH,
@@ -175,9 +259,13 @@ function createWindow() {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
       webviewTag: true,
+      // The preload needs the connect URL synchronously (before any async IPC)
+      // to decide which transport to build. It's the only value forwarded;
+      // version/dev flags come from the client's own local IPC handlers.
+      ...(CONNECT_URL ? { additionalArguments: [`--connect=${CONNECT_URL}`] } : {}),
     },
   })
-  attachMainWindowStatePersistence(mainWindow)
+  if (!IS_CLIENT) attachMainWindowStatePersistence(mainWindow)
 
   mainWindow.on('ready-to-show', () => {
     if (saved?.isMaximized) mainWindow.maximize()
@@ -189,9 +277,18 @@ function createWindow() {
     return { action: 'deny' }
   })
 
+  // Defense-in-depth against file drag-and-drop: if a `.var` is dropped onto the
+  // window at a moment the renderer's DropImport handler isn't mounted (e.g.
+  // during the first-run wizard, or before React hydrates), Electron would
+  // otherwise navigate the top frame to the dropped `file://` URL and blow away
+  // the app. Block any top-frame navigation away from the app's own document.
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const current = mainWindow.webContents.getURL()
+    if (url !== current) event.preventDefault()
+  })
+
   attachNativeTextContextMenu(mainWindow.webContents, mainWindow)
   attachDevToolsHotkeys(mainWindow)
-  attachAppCommandBridge(mainWindow)
 
   mainWindow.webContents.on('did-finish-load', () => flushBufferedLogs())
 
@@ -200,6 +297,49 @@ function createWindow() {
   } else {
     mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
+}
+
+/**
+ * Identify programmatic Hub / CDN traffic as VaM Backstage. Applies to
+ * `net.fetch` and anything else on defaultSession. Leave `persist:hub` alone —
+ * the Hub webview and cookie-bound scrape requests must keep Electron's UA so
+ * Cloudflare's `cf_clearance` still matches.
+ */
+function installDefaultSessionUserAgent(ses = session.defaultSession) {
+  ses.setUserAgent(HUB_HTTP_USER_AGENT)
+}
+
+/**
+ * The Hub serves .var downloads with a `content-disposition: attachment;
+ * filename="<pkg>.var"` header, and package names can contain non-ASCII
+ * characters (e.g. Chinese: `Qing.黑色符文（免费版）.1.var`). Electron's
+ * `net.fetch` throws an uncatchable error when a response header carries
+ * non-ASCII bytes (electron/electron#42244), which kills the download before
+ * our own try/catch ever runs.
+ *
+ * We never read `content-disposition` — filenames come from the Hub metadata —
+ * so we just url-encode the value into valid ASCII so the parser stops choking.
+ * Only this header can carry a user-supplied filename; every other header (and
+ * every already-ASCII value) is passed through byte-identical, so unrelated
+ * default-session traffic (thumbnails, avatars, the JSON API) is untouched.
+ *
+ * Must be a session-level hook: net.fetch throws while constructing the
+ * Response, so there is no per-call header interception point.
+ */
+function installDownloadHeaderSanitizer(ses = session.defaultSession) {
+  ses.webRequest.onHeadersReceived((details, callback) => {
+    const headers = details.responseHeaders || {}
+    let changed = false
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() !== 'content-disposition') continue
+      headers[key] = headers[key].map((v) => {
+        if (!/[^\u0020-\u007e]/.test(v)) return v
+        changed = true
+        return encodeURIComponent(v)
+      })
+    }
+    callback(changed ? { responseHeaders: headers } : {})
+  })
 }
 
 async function setupHubConsent() {
@@ -211,19 +351,25 @@ async function setupHubConsent() {
   })
 }
 
-async function loadBrowserAssistRulesForIndexes(vamDir) {
-  try {
-    await loadBrowserAssistDerivedHiddenRules(vamDir)
-  } catch (err) {
-    console.warn('[browser-assist] hidden rules load failed:', err.message)
-  }
-}
-
-async function initBackend() {
+function initBackend() {
+  // Capture handler registrations into the remote registry BEFORE registering
+  // them, so hot-starting the server later can dispatch to every channel.
+  installRegistry()
   // Register IPC before DB open so a failed migration/open still exposes handlers
   // (renderer otherwise gets "No handler registered" for every channel).
   registerAllHandlers()
+  initNotify(() => mainWindow)
+  initLogForward(() => mainWindow)
+  setupHubConsent()
+  initHubAuthWatch()
+  installDefaultSessionUserAgent()
+
+  // Client head: no local DB / scan / watcher / downloads. Everything data-side
+  // is served by the remote instance over the transport.
+  if (IS_CLIENT) return
+
   openDatabase()
+  runStartupMigrations()
   try {
     const removed = gcOrphanLabels()
     if (removed > 0) console.info(`[labels] gc removed ${removed} orphan label${removed === 1 ? '' : 's'} at startup`)
@@ -231,10 +377,7 @@ async function initBackend() {
     console.warn('[labels] startup gc failed:', err.message)
   }
   loadPackagesJsonFromCache()
-  initNotify(() => mainWindow)
-  initLogForward(() => mainWindow)
-  setupHubConsent()
-  initHubAuthWatch()
+  installDownloadHeaderSanitizer()
   initDownloadManager()
 
   refreshLibraryDirs()
@@ -245,7 +388,6 @@ async function initBackend() {
   if (vamDir && scanDone) {
     try {
       buildFromDb()
-      await loadBrowserAssistRulesForIndexes(vamDir)
     } catch {}
     // startWatcher runs after startupScan (see startupScan finally) — starting the
     // FS watcher before the full library scan contends on the same volume and can
@@ -254,6 +396,7 @@ async function initBackend() {
 }
 
 async function startupScan() {
+  if (IS_CLIENT) return
   const vamDir = getSetting('vam_dir')
   const scanDone = getSetting('initial_scan_done')
   if (!vamDir || !scanDone) return
@@ -276,7 +419,6 @@ async function startupScan() {
         setPrefsMap(prefs)
       } catch {}
       buildFromDb()
-      await loadBrowserAssistRulesForIndexes(vamDir)
     }
 
     notify('packages:updated')
@@ -318,6 +460,15 @@ async function startupScan() {
 }
 
 app.whenReady().then(async () => {
+  // Lost the single-instance lock: quit is in flight, don't touch DB/profile.
+  if (!gotSingleInstanceLock) return
+
+  // Warm @parcel/watcher's native backend on a worker thread, before the heavy startup scan
+  // and window creation, so the real (main-thread) watchers attach without the ~5s
+  // Explorer-launch stall. Fire-and-forget; startWatcher awaits it. See watcher-warm.js.
+  // Client head has no watcher, so skip it.
+  if (!IS_CLIENT) warmFileWatcherBackend()
+
   electronApp.setAppUserModelId('com.cyberpunk2073.vam-backstage')
 
   app.on('browser-window-created', (_, window) => {
@@ -325,18 +476,44 @@ app.whenReady().then(async () => {
   })
 
   try {
-    await initBackend()
+    initBackend()
   } catch (err) {
     console.error('Backend init failed:', err)
   }
-  powerMonitor.on('resume', onNetworkOnline)
+  // Download manager only exists on the data-side instance.
+  if (!IS_CLIENT) powerMonitor.on('resume', onNetworkOnline)
   registerWebviewWindowOpenHandler()
-  createWindow()
-  initAutoUpdater()
+
+  // Headless host: no local window, and no auto-updater (nothing to surface the
+  // install prompt to). The process stays alive because `window-all-closed`
+  // never fires with zero windows.
+  if (!HEADLESS_SERVE) {
+    createWindow()
+    initAutoUpdater()
+  }
+
   startupScan()
 
+  // Auto-start the LAN server when requested via CLI/env (headless, handled
+  // above via HEADLESS_SERVE) or via the persisted "start on launch" preference
+  // (windowed). CLI/env wins on port; the setting falls back to the last-used
+  // port. Client heads never host. The setting lives in the local DB, so it is
+  // never read in client mode (no DB there) — another reason client auto-connect
+  // isn't a persisted flag.
+  if (!IS_CLIENT) {
+    let servePort = SERVE_PORT
+    const autoStart = getSetting('remote_mode_enabled') === '1' && getSetting('remote_serve_on_launch') === '1'
+    if (servePort == null && autoStart) {
+      servePort = parseInt(getSetting('remote_serve_port'), 10) || DEFAULT_REMOTE_PORT
+    }
+    if (servePort != null) {
+      const res = await startServer(servePort)
+      if (!res.ok) console.error(`[remote] server did not start: ${res.error}`)
+    }
+  }
+
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    if (!HEADLESS_SERVE && BrowserWindow.getAllWindows().length === 0) createWindow()
   })
 })
 
@@ -346,24 +523,33 @@ app.on('window-all-closed', () => {
   }
 })
 
-// One-shot async shutdown: stopWatcher awaits parcel's native unsubscribe,
-// which detaches the watcher thread's N-API threadsafe-function refs. If we
-// don't await it before the env tears down, parcel's worker dispatches back
-// into a freed env and triggers `napi_fatal_error` (visible as the harmless-
-// looking native stack trace on close). We intercept the first will-quit,
-// drain cleanup, then re-quit — second pass falls through.
-let cleanedUp = false
+// Async shutdown drain. stopWatcher awaits parcel's native unsubscribe, which
+// detaches the watcher thread's N-API threadsafe-function refs. If we don't
+// await it before the env tears down, parcel's worker dispatches back into a
+// freed env and triggers `napi_fatal_error` (the harmless-looking native stack
+// trace on close). We intercept will-quit, drain cleanup, then force-exit.
+//
+// Force-exit with `app.exit(0)` (not `app.quit()`): a signal-initiated quit
+// (Ctrl-C/SIGINT, which Electron consumes natively) reaches here already inside
+// a quit cycle we just preventDefault'd, and calling `app.quit()` from that same
+// tick is swallowed — the quit never restarts and the process hangs (on macOS it
+// then orphans in the dock, since window-all-closed doesn't quit on darwin).
+// `app.exit(0)` terminates unconditionally once our cleanup has run.
+let draining = false
 app.on('will-quit', (event) => {
-  if (cleanedUp) return
   event.preventDefault()
+  if (draining) return
+  draining = true
   ;(async () => {
+    try {
+      await stopServer()
+    } catch {}
     try {
       await stopWatcher()
     } catch {}
     try {
       closeDatabase()
     } catch {}
-    cleanedUp = true
-    app.quit()
+    app.exit(0)
   })()
 })

@@ -123,7 +123,8 @@ describe('formatDate', () => {
   })
 
   it('formats unix timestamp to readable date', () => {
-    // 1704110400 = Jan 1, 2024 12:00:00 UTC; stable as January across timezones.
+    // Noon UTC so the local-time render stays on Jan 1 across timezones.
+    // 1704110400 = Jan 1, 2024 12:00:00 UTC
     const result = formatDate(1704110400)
     expect(result).toMatch(/Jan/)
     expect(result).toMatch(/2024/)
@@ -165,6 +166,10 @@ describe('displayName', () => {
 
   it('returns full name when no dot present', () => {
     expect(displayName({ packageName: 'NoDot' })).toBe('NoDot')
+  })
+
+  it('returns a friendly label for the local content sentinel', () => {
+    expect(displayName({ filename: '__local__' })).toBe('Local content')
   })
 })
 

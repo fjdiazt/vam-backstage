@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkTempVamDir, openTestDatabase } from '../../test/fixtures/index.js'
 import { closeDatabase, getDb } from './db.js'
-import { applyLabelToContents, findOrCreateLabel, LABEL_SOURCE_BROWSERASSIST, setLabelContentSource } from './db.js'
 import {
   buildFromDb,
   effectivePackageType,
@@ -15,8 +14,10 @@ import {
   getTagCounts,
   getAuthorCounts,
   getStats,
-  setContentDerivedHiddenRules,
-  setPackageDerivedHiddenMap,
+  isRealUrl,
+  resolveHubDownloadUrl,
+  setPrefsMap,
+  packageHasNoLookPresetTag,
 } from './store.js'
 import { setPackagesIndexForTests } from './hub/packages-json.js'
 
@@ -34,8 +35,6 @@ let tmp
 beforeEach(async () => {
   tmp = await mkTempVamDir()
   await openTestDatabase(tmp.dbPath)
-  setPackageDerivedHiddenMap(new Map())
-  setContentDerivedHiddenRules({ hiddenTagsByResourceType: new Map(), hiddenCreatorsByResourceType: new Map() })
 })
 
 afterEach(async () => {
@@ -348,6 +347,48 @@ describe('buildFromDb — graph aggregates', () => {
     expect(getPackageDetail('Top.P.1.var').missingDepsTotal).toBeGreaterThanOrEqual(1)
   })
 
+  it('transitiveInactiveMap: counts disabled/offloaded resolved deps down the subtree', async () => {
+    const db = getDb()
+    seedPackage(db, {
+      filename: 'Leaf.I.1.var',
+      package_name: 'Leaf.I',
+      version: '1',
+      is_direct: 0,
+      storage_state: 'disabled',
+      dep_refs: '[]',
+    })
+    seedPackage(db, {
+      filename: 'Mid.I.1.var',
+      package_name: 'Mid.I',
+      version: '1',
+      is_direct: 0,
+      storage_state: 'offloaded',
+      dep_refs: JSON.stringify(['Leaf.I.1']),
+    })
+    seedPackage(db, {
+      filename: 'Active.I.1.var',
+      package_name: 'Active.I',
+      version: '1',
+      is_direct: 0,
+      storage_state: 'enabled',
+      dep_refs: '[]',
+    })
+    seedPackage(db, {
+      filename: 'Top.I.1.var',
+      package_name: 'Top.I',
+      version: '1',
+      is_direct: 1,
+      storage_state: 'enabled',
+      dep_refs: JSON.stringify(['Mid.I.1', 'Active.I.1']),
+    })
+    buildFromDb()
+    const byName = new Map(getFilteredPackages().map((p) => [p.filename, p]))
+    expect(byName.get('Top.I.1.var').inactiveDeps).toBe(2)
+    expect(byName.get('Mid.I.1.var').inactiveDeps).toBe(1)
+    expect(byName.get('Leaf.I.1.var').inactiveDeps).toBe(0)
+    expect(byName.get('Active.I.1.var').inactiveDeps).toBe(0)
+  })
+
   it('orphanSet and orphan totalSize', async () => {
     const db = getDb()
     seedPackage(db, {
@@ -450,6 +491,74 @@ describe('buildFromDb — counts / filters', () => {
     })
     buildFromDb()
     expect(getStatusCounts().broken).toBeGreaterThanOrEqual(1)
+  })
+
+  it('broken counts an active package with a disabled dep, but not an inactive one', async () => {
+    const db = getDb()
+    seedPackage(db, {
+      filename: 'Dis.D.1.var',
+      package_name: 'Dis.D',
+      version: '1',
+      is_direct: 0,
+      storage_state: 'disabled',
+      dep_refs: '[]',
+    })
+    seedPackage(db, {
+      filename: 'ActiveRoot.A.1.var',
+      package_name: 'ActiveRoot.A',
+      version: '1',
+      is_direct: 1,
+      storage_state: 'enabled',
+      dep_refs: JSON.stringify(['Dis.D.1']),
+    })
+    seedPackage(db, {
+      filename: 'DisabledRoot.R.1.var',
+      package_name: 'DisabledRoot.R',
+      version: '1',
+      is_direct: 1,
+      storage_state: 'disabled',
+      dep_refs: JSON.stringify(['Dis.D.1']),
+    })
+    buildFromDb()
+    const byName = new Map(getFilteredPackages().map((p) => [p.filename, p]))
+    expect(byName.get('ActiveRoot.A.1.var').inactiveDeps).toBe(1)
+    expect(byName.get('DisabledRoot.R.1.var').inactiveDeps).toBe(1)
+    // Only the active root is broken; the disabled root's inactive deps are expected.
+    expect(getStatusCounts().broken).toBe(1)
+    expect(getStats().brokenCount).toBe(1)
+  })
+
+  it('getPackageDetail.dependents include storageState for disable-break filtering', async () => {
+    const db = getDb()
+    seedPackage(db, {
+      filename: 'Shared.Dep.1.var',
+      package_name: 'Shared.Dep',
+      version: '1',
+      is_direct: 0,
+      storage_state: 'enabled',
+      dep_refs: '[]',
+    })
+    seedPackage(db, {
+      filename: 'Active.User.1.var',
+      package_name: 'Active.User',
+      version: '1',
+      is_direct: 1,
+      storage_state: 'enabled',
+      dep_refs: JSON.stringify(['Shared.Dep.1']),
+    })
+    seedPackage(db, {
+      filename: 'Disabled.User.1.var',
+      package_name: 'Disabled.User',
+      version: '1',
+      is_direct: 1,
+      storage_state: 'disabled',
+      dep_refs: JSON.stringify(['Shared.Dep.1']),
+    })
+    buildFromDb()
+    const detail = getPackageDetail('Shared.Dep.1.var')
+    const byFn = new Map(detail.dependents.map((d) => [d.filename, d]))
+    expect(byFn.get('Active.User.1.var').storageState).toBe('enabled')
+    expect(byFn.get('Disabled.User.1.var').storageState).toBe('disabled')
   })
 
   it('getStatusCounts.missingUnique groups missing dep refs by packageName', async () => {
@@ -575,140 +684,105 @@ describe('buildFromDb — counts / filters', () => {
   })
 })
 
+describe('buildFromDb — extracted-preset ownership', () => {
+  const EXTRACTED_DIR = 'Custom/Atom/Person/Appearance/extracted'
+
+  function seedSceneWithPerson(db, filename, { version = '1', scene = 'Demo' } = {}) {
+    seedPackage(db, { filename, creator: 'Author', package_name: 'Author.Pkg', version, is_direct: 1 })
+    seedContent(db, {
+      package_filename: filename,
+      internal_path: `Saves/scene/${scene}.json`,
+      display_name: scene,
+      type: 'scene',
+      person_atom_ids: '["Person"]',
+    })
+  }
+
+  function seedLocalLook(db, internalPath) {
+    seedContent(db, {
+      package_filename: '__local__',
+      internal_path: internalPath,
+      display_name: 'Demo',
+      type: 'look',
+    })
+  }
+
+  it('attributes a local extracted look to the source package that produced it', async () => {
+    const db = getDb()
+    seedSceneWithPerson(db, 'Author.Pkg.1.var')
+    seedLocalLook(db, `${EXTRACTED_DIR}/Preset_Author - Demo.vap`)
+    buildFromDb()
+
+    const local = getFilteredContents().find((c) => c.internalPath === `${EXTRACTED_DIR}/Preset_Author - Demo.vap`)
+    expect(local?.extractedFrom).toBe('Author.Pkg.1.var')
+    expect(local?.localDisabled).toBe(false)
+
+    const detail = getPackageDetail('Author.Pkg.1.var')
+    const ex = detail.contents.find((c) => c.extracted)
+    expect(ex?.internalPath).toBe(`${EXTRACTED_DIR}/Preset_Author - Demo.vap`)
+    expect(ex?.extractedFrom).toBe('Author.Pkg.1.var')
+  })
+
+  it('attributes to the highest installed version and lists it under every version', async () => {
+    const db = getDb()
+    seedSceneWithPerson(db, 'Author.Pkg.1.var', { version: '1' })
+    seedSceneWithPerson(db, 'Author.Pkg.2.var', { version: '2' })
+    seedLocalLook(db, `${EXTRACTED_DIR}/Preset_Author - Demo.vap`)
+    buildFromDb()
+
+    const local = getFilteredContents().find((c) => c.internalPath === `${EXTRACTED_DIR}/Preset_Author - Demo.vap`)
+    expect(local?.extractedFrom).toBe('Author.Pkg.2.var')
+
+    // Indexed under both candidate versions' detail panels.
+    expect(getPackageDetail('Author.Pkg.1.var').contents.some((c) => c.extracted)).toBe(true)
+    expect(getPackageDetail('Author.Pkg.2.var').contents.some((c) => c.extracted)).toBe(true)
+  })
+
+  it('leaves an orphan extracted look unattributed (no matching scene)', async () => {
+    const db = getDb()
+    seedSceneWithPerson(db, 'Author.Pkg.1.var', { scene: 'Other' })
+    seedLocalLook(db, `${EXTRACTED_DIR}/Preset_Author - NoMatch.vap`)
+    buildFromDb()
+
+    const local = getFilteredContents().find((c) => c.internalPath === `${EXTRACTED_DIR}/Preset_Author - NoMatch.vap`)
+    expect(local?.extractedFrom).toBeNull()
+    expect(getPackageDetail('Author.Pkg.1.var').contents.some((c) => c.extracted)).toBe(false)
+  })
+
+  it("rolls a favorited extracted preset into the owner package's card aggregate", async () => {
+    const db = getDb()
+    seedSceneWithPerson(db, 'Author.Pkg.1.var')
+    const presetPath = `${EXTRACTED_DIR}/Preset_Author - Demo.vap`
+    seedLocalLook(db, presetPath)
+    try {
+      setPrefsMap(new Map([[`__local__/${presetPath}`, { hidden: false, favorite: true }]]))
+      buildFromDb()
+
+      // Extracted presets stay out of contentCount (they'd double-count across
+      // versions), but their favorite state surfaces on the owner card.
+      const pkg = getFilteredPackages().find((p) => p.filename === 'Author.Pkg.1.var')
+      expect(pkg?.favoriteContentCount).toBe(1)
+      expect(pkg?.contentCount).toBe(1) // just the scene, not the extracted preset
+    } finally {
+      setPrefsMap(new Map())
+    }
+  })
+
+  it('derives localDisabled and still attributes a `.vap.disabled` preset', async () => {
+    const db = getDb()
+    seedSceneWithPerson(db, 'Author.Pkg.1.var')
+    seedLocalLook(db, `${EXTRACTED_DIR}/Preset_Author - Demo.vap.disabled`)
+    buildFromDb()
+
+    const local = getFilteredContents().find(
+      (c) => c.internalPath === `${EXTRACTED_DIR}/Preset_Author - Demo.vap.disabled`,
+    )
+    expect(local?.localDisabled).toBe(true)
+    expect(local?.extractedFrom).toBe('Author.Pkg.1.var')
+  })
+})
+
 describe('buildFromDb — package summary enrichment', () => {
-  it('includes package hidden state on summaries and details', async () => {
-    const db = getDb()
-    seedPackage(db, {
-      filename: 'Hidden.Pkg.1.var',
-      creator: 'Hidden',
-      package_name: 'Hidden.Pkg',
-      version: '1',
-      is_direct: 1,
-    })
-    db.prepare('UPDATE packages SET hidden = 1 WHERE filename = ?').run('Hidden.Pkg.1.var')
-
-    buildFromDb()
-
-    expect(getFilteredPackages().find((p) => p.filename === 'Hidden.Pkg.1.var')?.hidden).toBe(true)
-    expect(getPackageDetail('Hidden.Pkg.1.var').hidden).toBe(true)
-  })
-
-  it('uses derived BrowserAssist hidden state as effective package hidden', async () => {
-    const db = getDb()
-    seedPackage(db, {
-      filename: 'Derived.Pkg.1.var',
-      creator: 'Derived',
-      package_name: 'Derived.Pkg',
-      version: '1',
-      is_direct: 1,
-    })
-    setPackageDerivedHiddenMap(new Map([['Derived.Pkg.1.var', { hiddenByTag: true, hiddenByCreator: false }]]))
-
-    buildFromDb()
-
-    const pkg = getFilteredPackages().find((p) => p.filename === 'Derived.Pkg.1.var')
-    expect(pkg).toMatchObject({
-      hidden: true,
-      hiddenDirect: false,
-      hiddenByTag: true,
-      hiddenByCreator: false,
-      hiddenReason: 'tag',
-    })
-  })
-
-  it('includes content labels on package summaries', async () => {
-    const db = getDb()
-    seedPackage(db, {
-      filename: 'Labels.P.1.var',
-      package_name: 'Labels.P',
-      version: '1',
-      is_direct: 1,
-    })
-    seedContent(db, {
-      package_filename: 'Labels.P.1.var',
-      internal_path: 'Saves/scene/look.json',
-      display_name: 'Look',
-      type: 'scene',
-    })
-    const label = findOrCreateLabel('look:vg')
-    const item = { packageFilename: 'Labels.P.1.var', internalPath: 'Saves/scene/look.json' }
-    applyLabelToContents(label.id, [item])
-    setLabelContentSource(label.id, item.packageFilename, item.internalPath, LABEL_SOURCE_BROWSERASSIST, 'Looks')
-
-    buildFromDb()
-
-    const p = getFilteredPackages().find((x) => x.filename === 'Labels.P.1.var')
-    expect(p?.contentLabelIds).toEqual([label.id])
-    expect(p?.contentLabelCategories[label.id]).toEqual(['Looks'])
-  })
-
-  it('uses BrowserAssist hidden labels as effective content hidden', async () => {
-    const db = getDb()
-    seedPackage(db, {
-      filename: 'Hidden.Content.1.var',
-      creator: 'Hidden',
-      package_name: 'Hidden.Content',
-      version: '1',
-      is_direct: 1,
-    })
-    seedContent(db, {
-      package_filename: 'Hidden.Content.1.var',
-      internal_path: 'Saves/scene/unwanted.json',
-      display_name: 'Unwanted',
-      type: 'scene',
-    })
-    const label = findOrCreateLabel('hidden:unwanted')
-    const item = { packageFilename: 'Hidden.Content.1.var', internalPath: 'Saves/scene/unwanted.json' }
-    applyLabelToContents(label.id, [item])
-    setLabelContentSource(label.id, item.packageFilename, item.internalPath, LABEL_SOURCE_BROWSERASSIST, 'Scenes')
-    setContentDerivedHiddenRules({
-      hiddenTagsByResourceType: new Map([['Scene', new Set(['hidden:unwanted'])]]),
-      hiddenCreatorsByResourceType: new Map(),
-    })
-
-    buildFromDb()
-
-    const content = getFilteredContents().find((c) => c.packageFilename === 'Hidden.Content.1.var')
-    expect(content).toMatchObject({
-      hidden: true,
-      hiddenDirect: false,
-      hiddenByTag: true,
-      hiddenByCreator: false,
-      hiddenReason: 'tag',
-    })
-  })
-
-  it('uses BrowserAssist Scene hidden labels for scene-look content', async () => {
-    const db = getDb()
-    seedPackage(db, {
-      filename: 'Hidden.LookScene.1.var',
-      creator: 'Hidden',
-      package_name: 'Hidden.LookScene',
-      version: '1',
-      is_direct: 1,
-    })
-    seedContent(db, {
-      package_filename: 'Hidden.LookScene.1.var',
-      internal_path: 'Saves/scene/look.json',
-      display_name: 'Look Scene',
-      type: 'scene',
-    })
-    const label = findOrCreateLabel('hidden:unwanted')
-    const item = { packageFilename: 'Hidden.LookScene.1.var', internalPath: 'Saves/scene/look.json' }
-    applyLabelToContents(label.id, [item])
-    setLabelContentSource(label.id, item.packageFilename, item.internalPath, LABEL_SOURCE_BROWSERASSIST, 'Looks')
-    setContentDerivedHiddenRules({
-      hiddenTagsByResourceType: new Map([['Scene', new Set(['hidden:unwanted'])]]),
-      hiddenCreatorsByResourceType: new Map(),
-    })
-
-    buildFromDb()
-
-    const content = getFilteredContents().find((c) => c.packageFilename === 'Hidden.LookScene.1.var')
-    expect(content).toMatchObject({ hidden: true, hiddenByTag: true, hiddenReason: 'tag' })
-    expect(content.labelSourceCategories[label.id]).toBe('Looks')
-  })
-
   it('noLookPresetTag when type is Looks but no look items', async () => {
     const db = getDb()
     seedPackage(db, {
@@ -721,6 +795,28 @@ describe('buildFromDb — package summary enrichment', () => {
     buildFromDb()
     const p = getFilteredPackages().find((x) => x.filename === 'LooksEmpty.L.1.var')
     expect(p?.noLookPresetTag).toBe(true)
+    expect(packageHasNoLookPresetTag('LooksEmpty.L.1.var')).toBe(true)
+  })
+
+  it('packageHasNoLookPresetTag is false when look items exist', async () => {
+    const db = getDb()
+    seedPackage(db, {
+      filename: 'LooksFull.L.1.var',
+      package_name: 'LooksFull.L',
+      version: '1',
+      is_direct: 1,
+      type: 'Looks',
+    })
+    seedContent(db, {
+      package_filename: 'LooksFull.L.1.var',
+      internal_path: 'Custom/Atom/Person/Appearance/Preset.vap',
+      display_name: 'Preset',
+      type: 'look',
+    })
+    buildFromDb()
+    expect(packageHasNoLookPresetTag('LooksFull.L.1.var')).toBe(false)
+    const p = getFilteredPackages().find((x) => x.filename === 'LooksFull.L.1.var')
+    expect(p?.noLookPresetTag).toBe(false)
   })
 
   it('isOrphan is true only for deps with no dependents', async () => {
@@ -759,5 +855,29 @@ describe('buildFromDb — package summary enrichment', () => {
     buildFromDb()
     const p = getFilteredPackages().find((x) => x.filename === 'Rem.A.1.var')
     expect(p?.removableSize).toBe(15)
+  })
+})
+
+describe('resolveHubDownloadUrl', () => {
+  it('rejects broken ?file= URLs on both downloadUrl and urlHosted', () => {
+    expect(isRealUrl('https://hub.virtamate.com/resources/66186/download?file=')).toBe(false)
+    expect(
+      resolveHubDownloadUrl({
+        downloadUrl: 'null',
+        urlHosted: 'https://hub.virtamate.com/resources/66186/download?file=',
+      }),
+    ).toBe(null)
+    expect(
+      resolveHubDownloadUrl({
+        downloadUrl: 'https://hub.virtamate.com/resources/66186/download?file=584887',
+        urlHosted: 'https://hub.virtamate.com/resources/66186/download?file=',
+      }),
+    ).toBe('https://hub.virtamate.com/resources/66186/download?file=584887')
+    expect(
+      resolveHubDownloadUrl({
+        downloadUrl: 'null',
+        urlHosted: 'https://cdn.example.com/pkg.var',
+      }),
+    ).toBe('https://cdn.example.com/pkg.var')
   })
 })

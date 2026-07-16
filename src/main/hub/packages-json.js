@@ -1,7 +1,6 @@
 import { net } from 'electron'
 import { randomUUID } from 'crypto'
 import { getSetting, setSetting } from '../db.js'
-import { HUB_HTTP_USER_AGENT } from '@shared/hub-http.js'
 
 const PACKAGES_JSON_URL = 'https://s3cdn.virtamate.com/data/packages.json'
 const DB_KEY_DATA = 'packages_json_data'
@@ -83,7 +82,7 @@ export async function fetchPackagesJson({ force = false } = {}) {
     try {
       const buster = randomUUID()
       const stored = getSetting(DB_KEY_ETAG)
-      const headers = { 'User-Agent': HUB_HTTP_USER_AGENT }
+      const headers = {}
       if (stored && !force && packagesIndex) headers['If-None-Match'] = stored
 
       const res = await net.fetch(`${PACKAGES_JSON_URL}?cb=${buster}`, { headers })
@@ -157,7 +156,16 @@ export function getPackagesIndexAge() {
 
 /**
  * Check for updates by comparing installed packages against the CDN index.
- * Returns { [localFilename]: { currentVersion, hubVersion, hubFilename, hubResourceId, downloadUrl, localNewerFilename?, isDepUpdate?, neededBy? } }
+ * Returns { [localFilename]: { currentVersion, hubVersion, hubFilename, hubResourceId, localNewerFilename?, isDepUpdate?, neededBy? } }
+ *
+ * `downloadUrl` / `fileSize` are intentionally absent here — they're populated
+ * later by the renderer-side `packages:enrich-from-hub` round-trip. Callers
+ * distinguish three states: `undefined` (not yet enriched), `null` (enrichment
+ * confirmed nothing directly downloadable: paid/external or hub error), and a
+ * string URL (available). Seeding `null` here would conflate "not yet checked"
+ * with "confirmed unavailable", which caused the Library/Updates button to
+ * briefly render as actionable during a re-enrichment cycle even when the
+ * prior check had marked the entry unavailable.
  *
  * When a newer version already exists locally (e.g. pulled in as a dependency),
  * `localNewerFilename` is set so the UI can navigate to it instead of downloading.
@@ -205,7 +213,6 @@ export function checkUpdatesFromIndex(packageIndex, groupIndex, forwardDeps) {
       hubFilename: hubEntry.filename,
       hubResourceId: String(hubEntry.resourceId),
       packageName,
-      downloadUrl: null,
       localNewerFilename,
     }
   }
@@ -257,7 +264,6 @@ export function checkUpdatesFromIndex(packageIndex, groupIndex, forwardDeps) {
         hubFilename: hubEntry.filename,
         hubResourceId: String(hubEntry.resourceId),
         packageName: depName,
-        downloadUrl: null,
         localNewerFilename,
         isDepUpdate: true,
         neededBy: [...depInfo.neededBy],

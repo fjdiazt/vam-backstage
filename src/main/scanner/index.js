@@ -1,13 +1,15 @@
 import { readdir, stat } from 'fs/promises'
-import { join } from 'path'
+import { join, dirname } from 'path'
 import { isVarFilename, canonicalVarFilename } from './var-reader.js'
 import { detectLeaves } from './graph.js'
 import { scanAndUpsert } from './ingest.js'
 import { inheritFromOlderVersion } from './inherit.js'
+import { refreshExtractedPresetsForUpdates } from '../scenes/extract-refresh.js'
+import { reconcileExtractedLifecycleAndResync } from '../scenes/extracted-reconcile.js'
 import {
-  getPackageCacheInfo,
+  getPackageReconcileInfo,
   getAllDbFilenamesWithDir,
-  deletePackages,
+  markPackagesMissing,
   batchSetDirect,
   setStorageState,
   getSetting,
@@ -27,7 +29,7 @@ import {
   effectivePackageType,
 } from '../store.js'
 import { isLocalPackage } from '@shared/local-package.js'
-import { refreshLibraryDirs, getAllLibraryDirs } from '../library-dirs.js'
+import { refreshLibraryDirs, getAllLibraryDirs, libraryRelSubpath, classifyMainVarOnDisk } from '../library-dirs.js'
 import { normalizeAuxDisabled } from '../watcher.js'
 import { loadBrowserAssistDerivedHiddenRules } from '../browser-assist.js'
 
@@ -82,20 +84,45 @@ export async function runScan(vamDir, onProgress = () => {}) {
    * by the inheritance pass below, key membership by leaf detection downstream. */
   const newAdditions = new Map()
   const unreadable = []
+  // One discovery timestamp for the whole run: every package first seen in this
+  // scan shares an identical `first_seen_at`, so "Recently installed" sorts the
+  // batch by file mtime within the run, and the inheritance donor gate cleanly
+  // excludes same-run peers (see upsertPackage / getDonorVersionsByPackageName).
+  const scanStartedAt = Math.floor(Date.now() / 1000)
   for (let i = 0; i < varFiles.length; i++) {
-    const { filename, fullPath, mtime, size, storageState, libraryDirId } = varFiles[i]
+    const { filename, fullPath, mtime, size, storageState, libraryDirId, subpath } = varFiles[i]
     onProgress({ phase: 'reading', step: i + 1, total: varFiles.length, message: filename })
 
-    const cached = getPackageCacheInfo(filename)
+    const cached = getPackageReconcileInfo(filename)
     if (cached && cached.file_mtime === mtime && cached.size_bytes === size) {
-      if (cached.storage_state !== storageState || (cached.library_dir_id ?? null) !== (libraryDirId ?? null)) {
-        setStorageState(filename, storageState, libraryDirId)
+      // Cache hit (unchanged content bytes) still reconciles location: storage_state,
+      // the library dir, and the subfolder the file now lives in. Adding/removing an
+      // empty `.var.disabled` marker doesn't touch the bare file's mtime/size, so this
+      // is the path that picks up a VaM-side enable/disable done while we were running.
+      //
+      // A set `missing_since` means the row was tombstoned (e.g. a prior scan saw the
+      // dir but not this file, or the watcher unlinked it before an app restart) and
+      // the file is now back byte-identical — force the reconcile so setStorageState
+      // clears the tombstone and resurrects it, even when its location already matches.
+      if (
+        cached.storage_state !== storageState ||
+        (cached.library_dir_id ?? null) !== (libraryDirId ?? null) ||
+        (cached.subpath ?? '') !== subpath ||
+        cached.missing_since != null
+      ) {
+        setStorageState(filename, storageState, libraryDirId, subpath)
       }
       continue // scan cache hit
     }
 
     try {
-      const result = await scanAndUpsert(fullPath, { storageState, libraryDirId, isDirect: 0 })
+      const result = await scanAndUpsert(fullPath, {
+        storageState,
+        libraryDirId,
+        subpath,
+        isDirect: 0,
+        firstSeenAt: scanStartedAt,
+      })
       if (!result) continue
       scanned++
       if (!cached) {
@@ -118,34 +145,42 @@ export async function runScan(vamDir, onProgress = () => {}) {
   // intentionally curated per stem. The `first_seen_at` gate inside
   // `inheritFromOlderVersion` keeps mass-additions (multiple new versions in
   // one scan) from picking one of the other still-empty new peers as a donor.
+  const extractRefreshAdditions = []
   if (!isInitialScan && newAdditions.size > 0) {
     for (const [filename, info] of newAdditions) {
       try {
-        await inheritFromOlderVersion({
+        const inherited = await inheritFromOlderVersion({
           filename,
           packageName: info.packageName,
           contentItems: info.contentItems,
           vamDir,
         })
+        if (inherited?.donor) {
+          extractRefreshAdditions.push({ filename, donorFilename: inherited.donor, contentItems: info.contentItems })
+        }
       } catch (err) {
         console.warn(`Inherit from older version failed for ${filename}:`, err.message)
       }
     }
   }
 
-  // Phase 3: Build dependency graph — remove stale packages, classify direct vs dependency
+  // Phase 3: Build dependency graph — tombstone stale packages, classify direct vs dependency
   onProgress({ phase: 'graph', step: 0, total: 1, message: 'Detecting removed packages…' })
   const diskFilenames = new Set(varFiles.map((v) => v.filename))
-  // Removed = rows whose home dir we successfully scanned AND whose canonical filename
-  // wasn't seen on disk. Offline-aux protection (skip prune for packages whose dir
-  // failed to enumerate) AND `__local__` sentinel exclusion (it's never on disk).
+  // Removed = present rows whose home dir we successfully scanned AND whose canonical
+  // filename wasn't seen on disk. `getAllDbFilenamesWithDir` already excludes existing
+  // tombstones, so this only catches newly-missing files. Offline-aux protection (skip
+  // prune for packages whose dir failed to enumerate) AND `__local__` sentinel exclusion
+  // (it's never on disk). We soft-delete (tombstone) rather than DELETE so a package the
+  // user relocated or unplugged keeps its identity/settings for when it reappears; a
+  // reappearance clears the tombstone via scanAndUpsert/setStorageState.
   const removed = getAllDbFilenamesWithDir()
     .filter(
       (r) =>
         !isLocalPackage(r.filename) && reachableDirIds.has(r.library_dir_id ?? null) && !diskFilenames.has(r.filename),
     )
     .map((r) => r.filename)
-  if (removed.length > 0) deletePackages(removed)
+  if (removed.length > 0) markPackagesMissing(removed)
 
   const needsLeafDetection = isInitialScan || newAdditions.size > 0 || removed.length > 0
   if (needsLeafDetection && varFiles.length > 0) {
@@ -186,7 +221,7 @@ export async function runScan(vamDir, onProgress = () => {}) {
   const prefs = await readAllPrefs(vamDir)
   setPrefsMap(prefs)
 
-  onProgress({ phase: 'finalizing', step: 1, total: 1, message: 'Building indexes…' })
+  onProgress({ phase: 'finalizing', step: 0, total: 1, message: 'Building indexes…' })
   buildFromDb()
   try {
     await loadBrowserAssistDerivedHiddenRules(vamDir)
@@ -194,9 +229,32 @@ export async function runScan(vamDir, onProgress = () => {}) {
     console.warn('[browser-assist] hidden rules load failed:', err.message)
   }
 
+  // Auto-refresh extracted presets from newly-installed higher versions (runs
+  // after the store rebuild so readScene can resolve the new .var files).
+  await refreshExtractedPresetsForUpdates(extractRefreshAdditions, vamDir)
+
+  // Reconcile extracted-preset enable/disable state against current package
+  // activeness — heals drift from enable/disable/remove done by external tools
+  // (VaM, sync utilities) while the app was closed. Full sweep (no `filenames`),
+  // idempotent: it's an in-memory pass and only out-of-sync presets are renamed,
+  // so a clean library is a fast no-op (no fs/DB, then a rescan only if something
+  // moved). A full sweep is required here — startup can't know what changed while
+  // closed. Emits a phase so the status bar's 1s-delayed bar covers a slow one.
+  onProgress({ phase: 'extracted', step: 0, total: 1, message: 'Reconciling extracted presets…' })
+  try {
+    await reconcileExtractedLifecycleAndResync({ vamDir })
+  } catch (err) {
+    console.warn('Extracted-preset reconcile failed:', err.message)
+  }
+  onProgress({ phase: 'extracted', step: 1, total: 1, message: 'Extracted presets reconciled' })
+
   if (isInitialScan) {
     setSetting('initial_scan_done', '1')
   }
+
+  // Final clearing event — the status bar hides on finalizing/step===total, so
+  // this must be the last progress emit (after the reconcile above).
+  onProgress({ phase: 'finalizing', step: 1, total: 1, message: 'Done' })
 
   return { scanned, added, removed: removed.length, unreadable }
 }
@@ -215,8 +273,10 @@ const VAR_STAT_CONCURRENCY = 8
  *    missing path); caller uses this to skip pruning packages that may still live there.
  *  - Unreadable subdirectories are silently skipped without flipping `ok`.
  *
- * `filename` is always the canonical `.var` form. Within one directory the suffix-less
- * `.var` wins if both variants are present.
+ * `filename` is always the canonical `.var` form. Within one directory the bare
+ * `.var` and its disabled sibling (VaM `.var.disabled` or a Qvaro `.DISABLED`
+ * rename) are classified together (`classifyMainVar`): a disabled sibling present
+ * ⇒ disabled, content read from whichever file holds the bytes.
  *
  * Aux dirs (`libraryDirId != null`) are always suffix-less in our model. Stray
  * `.var.disabled` files from external tooling are normalized via `normalizeAuxDisabled`
@@ -238,26 +298,51 @@ async function walkForVars(dir, libraryDirId) {
   const records = await Promise.all(
     candidates.map((c) =>
       limit(async () => {
-        let { fullPath, isDisabled, canonical } = c
-        if (libraryDirId != null && isDisabled) {
-          const bare = await normalizeAuxDisabled(fullPath)
-          if (!bare) return null
-          fullPath = bare
-          isDisabled = false
-        }
-        try {
-          const s = await stat(fullPath)
-          const storageState = libraryDirId != null ? 'offloaded' : isDisabled ? 'disabled' : 'enabled'
+        const { canonical, barePath, disabledPath } = c
+
+        // Aux dirs are always suffix-less in our model (offloaded == active). A
+        // `.var.disabled` (or Qvaro `.DISABLED`) there is external tooling residue:
+        // normalize it to bare (or drop an empty/duplicate marker) and index the
+        // bare content.
+        if (libraryDirId != null) {
+          let contentPath = barePath
+          if (disabledPath) {
+            const bare = await normalizeAuxDisabled(disabledPath)
+            if (!contentPath) contentPath = bare
+          }
+          if (!contentPath) return null
+          const s = await stat(contentPath).catch(() => null)
+          if (!s) return null
           return {
             filename: canonical,
-            fullPath,
+            fullPath: contentPath,
             mtime: s.mtimeMs / 1000,
             size: s.size,
-            storageState,
+            storageState: 'offloaded',
             libraryDirId,
+            subpath: libraryRelSubpath(dir, contentPath),
           }
-        } catch {
-          return null
+        }
+
+        // Main dir: classify the canonical's bare + `.disabled` footprint. Marker
+        // presence ⇒ disabled; content is read from the bare file when it holds
+        // bytes, else from the disabled sibling (legacy `.var.disabled` or Qvaro
+        // `.DISABLED` rename — resolved by spelling in `classifyMainVarOnDisk`).
+        // Empty-marker-only ⇒ skip. The dirent walk already proved whether a
+        // disabled sibling exists, so the common no-sibling case skips its stat —
+        // one syscall per package on the full-scan hot path.
+        const cls = await classifyMainVarOnDisk(barePath ?? join(dirname(disabledPath), canonical), {
+          disabledKnownAbsent: !disabledPath,
+        })
+        if (!cls.present) return null
+        return {
+          filename: canonical,
+          fullPath: cls.contentPath,
+          mtime: cls.contentStat.mtimeMs / 1000,
+          size: cls.contentStat.size,
+          storageState: cls.storageState,
+          libraryDirId,
+          subpath: libraryRelSubpath(dir, cls.contentPath),
         }
       }),
     ),
@@ -270,10 +355,14 @@ async function walkForVars(dir, libraryDirId) {
 }
 
 /**
- * Recursive dirent walk that pushes `{canonical, fullPath, isDisabled}` candidates
- * into `out`. Returns false only when the **root** `dir` is unreachable so the
- * caller can distinguish "nothing here" from "couldn't read here". Sub-directory
- * read failures are silently skipped (matches today's silent-skip semantics).
+ * Recursive dirent walk that pushes one `{canonical, barePath, disabledPath}`
+ * candidate per canonical into `out` (either path is null when that variant is
+ * absent in the folder). The disabled sibling covers both VaM's `.var.disabled`
+ * and a Qvaro `.DISABLED` rename. Keeping *both* siblings — rather than collapsing
+ * to one — lets `walkForVars` classify the marker vs suffix disable layout from
+ * their sizes. Returns false only when the **root** `dir` is unreachable so the caller
+ * can distinguish "nothing here" from "couldn't read here"; sub-directory read
+ * failures are silently skipped (matches today's silent-skip semantics).
  */
 export async function collectVarCandidates(dir, out, isRoot) {
   let entries
@@ -293,15 +382,22 @@ export async function collectVarCandidates(dir, out, isRoot) {
     } else if (entry.isDirectory()) {
       await collectVarCandidates(fullPath, out, false)
     } else if (entry.isFile() && isVarFilename(entry.name)) {
+      // Any disabled spelling — VaM's `.var.disabled` or a Qvaro `.DISABLED`
+      // rename — is the "disabled sibling"; `canonicalVarFilename` maps either
+      // back to the bare `X.var` it stands in for.
       const isDisabled = /\.disabled$/i.test(entry.name)
       const canonical = isDisabled ? canonicalVarFilename(entry.name) : entry.name
-      const existing = localFiles.get(canonical)
-      if (existing && !existing.isDisabled) continue // .var already found, skip .var.disabled
-      localFiles.set(canonical, { fullPath, isDisabled })
+      let group = localFiles.get(canonical)
+      if (!group) {
+        group = { barePath: null, disabledPath: null }
+        localFiles.set(canonical, group)
+      }
+      if (isDisabled) group.disabledPath = fullPath
+      else group.barePath = fullPath
     }
   }
-  for (const [canonical, { fullPath, isDisabled }] of localFiles) {
-    out.push({ canonical, fullPath, isDisabled })
+  for (const [canonical, { barePath, disabledPath }] of localFiles) {
+    out.push({ canonical, barePath, disabledPath })
   }
   return true
 }

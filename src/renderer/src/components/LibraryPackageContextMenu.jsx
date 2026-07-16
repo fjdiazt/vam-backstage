@@ -4,7 +4,6 @@ import {
   Compass,
   Download,
   Eye,
-  EyeOff,
   Power,
   FolderTree,
   Heart,
@@ -26,8 +25,7 @@ import {
   ContextMenuTrigger,
 } from '@/components/ui/context-menu'
 import { LabelsApplyMenuItems } from '@/components/labels/LabelsApplyMenuItems'
-import { singleTargetStateMap, bulkStateMap } from '@/components/labels/labelApplyState'
-import { applyLabelToFilenames } from '@/components/labels/labelActions'
+import { singleTargetStateMap, bulkStateMap, applyLabelToFilenames } from '@/components/labels/labelHelpers'
 import { AlertDialog } from '@/components/ui/alert-dialog'
 import {
   DisablePackageDialogContent,
@@ -36,7 +34,7 @@ import {
 } from '@/components/package-action-dialogs'
 import FileTreeDialog from '@/components/FileTreeDialog'
 import LinkHubDialog from '@/components/LinkHubDialog'
-import { displayName } from '@/lib/utils'
+import { displayName, isPromotionalLink, openExternalLink } from '@/lib/utils'
 import { toastIfBulkToggleFailures, toastIfSingleToggleFailed } from '@/lib/packageStorageToggleResults'
 import { packageNeedsDisableConfirmation } from '@/lib/package-disable-confirm'
 import { isPackageActive } from '@shared/storage-state-predicates.js'
@@ -44,10 +42,14 @@ import { useDownloadStore } from '@/stores/useDownloadStore'
 import { useLibraryStore } from '@/stores/useLibraryStore'
 import { useLabelsStore } from '@/stores/useLabelsStore'
 
+function bulkSelectedPackagesFromStore() {
+  const { bulkSelectedFilenames, packageByFilename } = useLibraryStore.getState()
+  return bulkSelectedFilenames.map((fn) => packageByFilename.get(fn)).filter(Boolean)
+}
+
 async function runLibraryBulkToggleEnabledFromStore() {
   if (useLibraryStore.getState().bulkToggleIntent) return
-  const { packages, bulkSelectedFilenames } = useLibraryStore.getState()
-  const items = packages.filter((p) => bulkSelectedFilenames.includes(p.filename))
+  const items = bulkSelectedPackagesFromStore()
   if (!items.length) return
   const nEnabled = items.filter((p) => isPackageActive(p.storageState)).length
   const allEnabled = nEnabled === items.length
@@ -72,8 +74,7 @@ async function runLibraryBulkToggleEnabledFromStore() {
 }
 
 async function runLibraryBulkRemoveFromStore() {
-  const { packages, bulkSelectedFilenames } = useLibraryStore.getState()
-  const items = packages.filter((p) => bulkSelectedFilenames.includes(p.filename))
+  const items = bulkSelectedPackagesFromStore()
   const direct = items.filter((p) => p.isDirect)
   const dep = items.filter((p) => !p.isDirect)
   try {
@@ -118,34 +119,32 @@ async function runExtractAndToast(actionLabel, payload) {
 }
 
 async function runLibraryBulkExtract({ kind, sources, sourceNoun, actionLabel }) {
-  const { packages, bulkSelectedFilenames } = useLibraryStore.getState()
-  const selected = packages.filter((p) => bulkSelectedFilenames.includes(p.filename))
-  if (!selected.length) return
+  const { bulkSelectedFilenames } = useLibraryStore.getState()
+  if (!bulkSelectedFilenames.length) return
   try {
-    const details = await Promise.all(selected.map((p) => window.api.packages.detail(p.filename).catch(() => null)))
-    const items = []
-    for (const d of details) {
-      if (!d?.contents) continue
-      for (const c of d.contents) {
-        if (sources.has(c.type)) {
-          items.push({ packageFilename: c.packageFilename, internalPath: c.internalPath })
-        }
-      }
-    }
-    if (!items.length) {
-      toast(`No ${sourceNoun} in selected package${selected.length === 1 ? '' : 's'}`, 'info')
+    const r = await window.api.extract.runForPackages({
+      filenames: bulkSelectedFilenames,
+      kind,
+      sourceTypes: [...sources],
+    })
+    const w = r.written?.length ?? 0
+    const s = r.skipped?.length ?? 0
+    if (w === 0 && s === 0 && !(r.errors?.length ?? 0)) {
+      toast(
+        `No ${sourceNoun} to ${actionLabel.toLowerCase()} in selected package${bulkSelectedFilenames.length === 1 ? '' : 's'}`,
+        'info',
+      )
       return
     }
-    await runExtractAndToast(actionLabel, { items, kind })
+    toastExtractResult(`${actionLabel} presets`, r)
   } catch (err) {
     toast(`${actionLabel} failed: ${err.message}`)
   }
 }
 
 async function runLibraryBulkPromoteFromStore() {
-  const { packages, bulkSelectedFilenames } = useLibraryStore.getState()
-  const fnames = packages
-    .filter((p) => bulkSelectedFilenames.includes(p.filename) && !p.isDirect)
+  const fnames = bulkSelectedPackagesFromStore()
+    .filter((p) => !p.isDirect)
     .map((p) => p.filename)
   if (!fnames.length) return
   try {
@@ -157,12 +156,20 @@ async function runLibraryBulkPromoteFromStore() {
   }
 }
 
+function formatDependentNames(dependents) {
+  if (!dependents?.length) return ''
+  const names = dependents
+    .slice(0, 2)
+    .map((d) => d.packageName?.split('.').pop() || d.filename)
+    .join(', ')
+  return names + (dependents.length > 2 ? ` +${dependents.length - 2}` : '')
+}
+
 export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, children }) {
   const selectedDetail = useLibraryStore((s) => s.selectedDetail)
   const bulkSelectedFilenames = useLibraryStore((s) => s.bulkSelectedFilenames)
   const packages = useLibraryStore((s) => s.packages)
   const labels = useLabelsStore((s) => s.labels)
-  const updateDetailsLoading = useLibraryStore((s) => s.updateDetailsLoading)
   const [detail, setDetail] = useState(null)
   const [probe, setProbe] = useState(null)
   const [fileTreeOpen, setFileTreeOpen] = useState(false)
@@ -170,6 +177,29 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
   const [uninstallOpen, setUninstallOpen] = useState(false)
   const [disableOpen, setDisableOpen] = useState(false)
   const [forceRemoveOpen, setForceRemoveOpen] = useState(false)
+  // Snapshot of `detail` taken when a confirm dialog opens. The context menu
+  // clears `detail` on close, so gating the dialog on the live `detail` would
+  // unmount its content while the dialog is still open — which tears down
+  // Radix's modal layer mid-flight and freezes the app. Keep our own copy.
+  const [confirmDetail, setConfirmDetail] = useState(null)
+
+  const openConfirm = useCallback(
+    (setOpen) => {
+      const snapshot = detail || (selectedDetail?.filename === pkg.filename ? selectedDetail : null)
+      if (!snapshot) return
+      setConfirmDetail(snapshot)
+      setOpen(true)
+    },
+    [detail, selectedDetail, pkg.filename],
+  )
+
+  const closeConfirm = useCallback(
+    (setOpen) => (open) => {
+      setOpen(open)
+      if (!open) setConfirmDetail(null)
+    },
+    [],
+  )
 
   const onOpenChange = useCallback(
     async (open) => {
@@ -197,16 +227,9 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
   )
 
   const p = detail || pkg
-  const name = displayName(p)
   const hasDependents = (p.dependents?.length ?? 0) > 0
   const suppressDisablePackageWarning = useLibraryStore((s) => s.suppressDisablePackageWarning)
   const showDisableDialog = packageNeedsDisableConfirmation(p, suppressDisablePackageWarning)
-  const dependentNames = hasDependents
-    ? p.dependents
-        .slice(0, 2)
-        .map((d) => d.packageName?.split('.').pop() || d.filename)
-        .join(', ') + (p.dependents.length > 2 ? ` +${p.dependents.length - 2}` : '')
-    : ''
 
   const handleToggleEnabled = async () => {
     try {
@@ -216,15 +239,12 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
       toast(`Failed to toggle package: ${err.message}`)
     }
   }
-  const handleToggleHidden = async () => {
-    if (p.hidden && !p.hiddenDirect) {
-      toast(`Package is hidden by BrowserAssist ${p.hiddenReason === 'creator' ? 'creator' : 'tag'} rule`)
-      return
-    }
+  const handleEnableInactiveDeps = async () => {
     try {
-      await useLibraryStore.getState().setPackageHidden(p.filename, !p.hiddenDirect)
+      const res = await window.api.packages.enableDeps(p.filename)
+      if (res?.count > 0) toast(`Enabled ${res.count} dependenc${res.count === 1 ? 'y' : 'ies'}`, 'success')
     } catch (err) {
-      toast(`Failed to toggle hidden: ${err.message}`)
+      toast(`Failed to enable dependencies: ${err.message}`)
     }
   }
   const handlePromote = async () => {
@@ -537,9 +557,14 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
                     Go to v{updateInfo.hubVersion}
                   </ContextMenuItem>
                 </>
-              ) : updateInfo && updateInfo.downloadUrl === null && !updateDetailsLoading ? (
+              ) : updateInfo && updateInfo.downloadUrl === null ? (
                 <ContextMenuItem disabled title="Listed on the hub but not directly downloadable (paid or external)">
                   <ArrowUpCircle size={12} className="shrink-0" />v{updateInfo.hubVersion} unavailable
+                </ContextMenuItem>
+              ) : updateInfo && updateInfo.downloadUrl === undefined ? (
+                <ContextMenuItem disabled title="Verifying availability with the hub…">
+                  <ArrowUpCircle size={12} className="shrink-0" />
+                  Checking v{updateInfo.hubVersion}…
                 </ContextMenuItem>
               ) : (
                 (updateInfo?.hubResourceId || updateInfo?.packageName) && (
@@ -576,10 +601,10 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
                   Link to Hub…
                 </ContextMenuItem>
               )}
-              {p.promotionalLink && (
+              {isPromotionalLink(p.promotionalLink) && (
                 <ContextMenuItem
                   onSelect={() => {
-                    void window.api.shell.openExternal(p.promotionalLink)
+                    void openExternalLink(p.promotionalLink)
                   }}
                 >
                   <Heart size={12} className="shrink-0 text-accent-blue" />
@@ -594,6 +619,12 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
                 >
                   <Download size={12} className="shrink-0" />
                   Install missing dependencies
+                </ContextMenuItem>
+              )}
+              {isPackageActive(p.storageState ?? 'enabled') && p.inactiveDeps > 0 && (
+                <ContextMenuItem onSelect={() => void handleEnableInactiveDeps()}>
+                  <Power size={12} className="shrink-0" />
+                  Enable disabled dependencies
                 </ContextMenuItem>
               )}
               {p.isCorrupted && !p.isLocalOnly && (
@@ -636,22 +667,8 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
                 </>
               )}
               <ContextMenuSeparator />
-              <ContextMenuItem onSelect={() => void handleToggleHidden()}>
-                {p.hiddenDirect ? (
-                  <Eye size={12} className="shrink-0 text-text-secondary" />
-                ) : (
-                  <EyeOff size={12} className="shrink-0 text-text-secondary" />
-                )}
-                {p.hidden && !p.hiddenDirect
-                  ? p.hiddenReason === 'creator'
-                    ? 'Hidden by creator'
-                    : 'Hidden by tag'
-                  : p.hiddenDirect
-                    ? 'Unhide'
-                    : 'Hide'}
-              </ContextMenuItem>
               {showDisableDialog ? (
-                <ContextMenuItem onSelect={() => setDisableOpen(true)} disabled={!detail}>
+                <ContextMenuItem onSelect={() => openConfirm(setDisableOpen)} disabled={!detail}>
                   <Power size={12} className="shrink-0" />
                   Disable…
                 </ContextMenuItem>
@@ -665,12 +682,20 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
                 </ContextMenuItem>
               )}
               {p.isDirect ? (
-                <ContextMenuItem variant="destructive" onSelect={() => setUninstallOpen(true)} disabled={!detail}>
+                <ContextMenuItem
+                  variant="destructive"
+                  onSelect={() => openConfirm(setUninstallOpen)}
+                  disabled={!detail}
+                >
                   <Trash2 size={12} className="shrink-0" />
                   {hasDependents ? 'Remove…' : 'Uninstall…'}
                 </ContextMenuItem>
               ) : (
-                <ContextMenuItem variant="destructive" onSelect={() => setForceRemoveOpen(true)} disabled={!detail}>
+                <ContextMenuItem
+                  variant="destructive"
+                  onSelect={() => openConfirm(setForceRemoveOpen)}
+                  disabled={!detail}
+                >
                   <Trash2 size={12} className="shrink-0" />
                   {hasDependents ? 'Force remove…' : 'Remove…'}
                 </ContextMenuItem>
@@ -684,30 +709,34 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
 
       {linkHubOpen && <LinkHubDialog pkg={pkg} open={linkHubOpen} onOpenChange={setLinkHubOpen} />}
 
-      <AlertDialog open={uninstallOpen} onOpenChange={setUninstallOpen}>
-        {uninstallOpen && detail ? (
+      <AlertDialog open={uninstallOpen} onOpenChange={closeConfirm(setUninstallOpen)}>
+        {uninstallOpen && confirmDetail ? (
           <UninstallDialogContent
-            pkg={detail}
-            name={name}
-            hasDependents={hasDependents}
-            dependentNames={dependentNames}
+            pkg={confirmDetail}
+            name={displayName(confirmDetail)}
+            hasDependents={(confirmDetail.dependents?.length ?? 0) > 0}
+            dependentNames={formatDependentNames(confirmDetail.dependents)}
             onConfirm={handleUninstall}
           />
         ) : null}
       </AlertDialog>
 
-      <AlertDialog open={disableOpen} onOpenChange={setDisableOpen}>
-        {disableOpen && detail ? (
-          <DisablePackageDialogContent pkg={detail} name={name} onConfirm={handleToggleEnabled} />
+      <AlertDialog open={disableOpen} onOpenChange={closeConfirm(setDisableOpen)}>
+        {disableOpen && confirmDetail ? (
+          <DisablePackageDialogContent
+            pkg={confirmDetail}
+            name={displayName(confirmDetail)}
+            onConfirm={handleToggleEnabled}
+          />
         ) : null}
       </AlertDialog>
 
-      <AlertDialog open={forceRemoveOpen} onOpenChange={setForceRemoveOpen}>
-        {forceRemoveOpen && detail ? (
+      <AlertDialog open={forceRemoveOpen} onOpenChange={closeConfirm(setForceRemoveOpen)}>
+        {forceRemoveOpen && confirmDetail ? (
           <ForceRemoveDialogContent
-            pkg={detail}
-            name={name}
-            hasDependents={hasDependents}
+            pkg={confirmDetail}
+            name={displayName(confirmDetail)}
+            hasDependents={(confirmDetail.dependents?.length ?? 0) > 0}
             onConfirm={handleForceRemove}
           />
         ) : null}

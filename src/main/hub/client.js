@@ -5,8 +5,10 @@ import {
   upsertHubResourceDetail,
   upsertHubResourceSearch,
   upsertHubResourceFind,
+  markWishlistItemUnavailable,
   transact,
 } from '../db.js'
+import { notify } from '../notify.js'
 import { invalidatePackagesJsonCache } from './packages-json.js'
 import {
   canonicalizeLicense,
@@ -16,7 +18,6 @@ import {
   isCommercialUseAllowed,
   isNonCommercialUseAllowed,
 } from '@shared/licenses.js'
-import { HUB_HTTP_USER_AGENT } from '@shared/hub-http.js'
 
 const API_URL = 'https://hub.virtamate.com/citizenx/api.php'
 
@@ -75,7 +76,6 @@ async function hubPost(body, { throwOnApiError = true } = {}) {
     headers: {
       'Content-Type': 'application/json',
       Accept: 'application/json',
-      'User-Agent': HUB_HTTP_USER_AGENT,
     },
     body: JSON.stringify(payload),
   })
@@ -93,16 +93,31 @@ async function hubPost(body, { throwOnApiError = true } = {}) {
   return data
 }
 
+/**
+ * A usable getInfo payload has at least the type + sort pickers populated. We
+ * gate caching on this so a malformed/partial response (e.g. a proxy error page
+ * that still parsed as JSON, or a truncated body) is never written to the memory
+ * or on-disk cache — otherwise both short-circuit forever and the filter sidebar
+ * stays stuck on the core-only fallback until an explicit cache bust.
+ */
+function isValidFilters(data) {
+  return !!data && Array.isArray(data.type) && data.type.length > 0 && Array.isArray(data.sort) && data.sort.length > 0
+}
+
 export async function getFilters() {
   if (cache.filters) return cache.filters
   const persisted = getSetting(FILTERS_SETTINGS_KEY)
   if (persisted) {
     try {
-      cache.filters = JSON.parse(persisted)
-      return cache.filters
+      const parsed = JSON.parse(persisted)
+      if (isValidFilters(parsed)) {
+        cache.filters = parsed
+        return cache.filters
+      }
     } catch {}
   }
   const data = await hubPost({ action: 'getInfo' })
+  if (!isValidFilters(data)) throw new Error('Hub getInfo returned an unexpected shape')
   cache.filters = data
   setSetting(FILTERS_SETTINGS_KEY, JSON.stringify(data))
   return data
@@ -111,6 +126,7 @@ export async function getFilters() {
 /** Force-fetch fresh filters from Hub (bypasses memory + DB cache). */
 export async function refreshFilters() {
   const data = await hubPost({ action: 'getInfo' })
+  if (!isValidFilters(data)) throw new Error('Hub getInfo returned an unexpected shape')
   cache.filters = data
   setSetting(FILTERS_SETTINGS_KEY, JSON.stringify(data))
   return data
@@ -181,14 +197,29 @@ export async function getResourceDetail(resourceId) {
   const cached = lruGet(cache.details, key)
   if (cached) return cached
 
-  const data = await hubPost({
-    action: 'getResourceDetail',
-    latest_image: 'Y',
-    resource_id: key,
-  })
+  let data
+  try {
+    data = await hubPost({
+      action: 'getResourceDetail',
+      latest_image: 'Y',
+      resource_id: key,
+    })
+  } catch (err) {
+    // The Hub returns `{status:'error', error:'Resource not found.'}` for a gone
+    // resource (see docs/API.md) — hubPost rethrows that as the error message.
+    // That's distinct from a transient network/HTTP failure ("Hub API <status>"),
+    // so only the definitive not-found stamps a wishlisted item unavailable; a
+    // later successful fetch clears the flag via the refresh hook.
+    if (/resource not found/i.test(err.message)) {
+      try {
+        if (markWishlistItemUnavailable(key)) notify('wishlist:updated')
+      } catch {}
+    }
+    throw err
+  }
 
   try {
-    upsertHubResourceDetail(key, data)
+    if (upsertHubResourceDetail(key, data)) notify('wishlist:updated')
   } catch {}
   lruSet(cache.details, key, data, MAX_DETAILS)
   return data
@@ -216,7 +247,7 @@ export async function getResourceDetailByName(packageName) {
   )
 
   try {
-    if (data?.resource_id) upsertHubResourceDetail(String(data.resource_id), data)
+    if (data?.resource_id && upsertHubResourceDetail(String(data.resource_id), data)) notify('wishlist:updated')
   } catch {}
   lruSet(cache.details, key, data, MAX_DETAILS)
   if (data?.resource_id) lruSet(cache.details, String(data.resource_id), data, MAX_DETAILS)

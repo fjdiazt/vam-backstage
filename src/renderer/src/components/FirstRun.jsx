@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import {
   Zap,
   Folder,
+  Check,
   CheckCircle2,
   Package,
   Eye,
@@ -10,6 +11,9 @@ import {
   Loader2,
   AlertTriangle,
   ShieldAlert,
+  ShieldCheck,
+  RotateCcw,
+  Plus,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogOverlay, DialogPortal } from '@/components/ui/dialog'
@@ -52,6 +56,9 @@ export default function FirstRun({ onDone }) {
   const [applying, setApplying] = useState(false)
   const [hideProgress, setHideProgress] = useState(null)
   const [detectSource, setDetectSource] = useState(null)
+  const [offloadSuggestions, setOffloadSuggestions] = useState([])
+  const [selectedOffload, setSelectedOffload] = useState(() => new Set())
+  const [registeringOffload, setRegisteringOffload] = useState(false)
 
   useEffect(() => {
     window.api.wizard.detectVamDir().then(({ path, varCount: count, source }) => {
@@ -79,7 +86,7 @@ export default function FirstRun({ onDone }) {
     }
   }, [vamDir])
 
-  const handleScan = useCallback(async () => {
+  const runScanFlow = useCallback(async () => {
     if (!vamDir) return
     setStep('scanning')
     setActivePhaseIdx(0)
@@ -95,7 +102,6 @@ export default function FirstRun({ onDone }) {
     })
 
     try {
-      await window.api.settings.set('vam_dir', vamDir)
       const scanResult = await window.api.scan.start()
       cleanup()
 
@@ -153,6 +159,53 @@ export default function FirstRun({ onDone }) {
     }
   }, [vamDir])
 
+  // From the welcome step: persist the VaM dir, then offer any detected offload
+  // folders from known tools before scanning (so the single scan indexes them).
+  const handleProceed = useCallback(async () => {
+    if (!vamDir) return
+    setScanError(null)
+    await window.api.settings.set('vam_dir', vamDir)
+    let suggestions = []
+    try {
+      suggestions = await window.api.libraryDirs.suggest()
+    } catch (err) {
+      console.warn('Offload suggestion detection failed:', err.message)
+    }
+    if (suggestions.length > 0) {
+      setOffloadSuggestions(suggestions)
+      setSelectedOffload(new Set(suggestions.map((s) => s.id)))
+      setStep('offload')
+    } else {
+      runScanFlow()
+    }
+  }, [vamDir, runScanFlow])
+
+  const toggleOffload = useCallback((id) => {
+    setSelectedOffload((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
+
+  const handleOffloadContinue = useCallback(async () => {
+    setRegisteringOffload(true)
+    try {
+      for (const s of offloadSuggestions) {
+        if (!selectedOffload.has(s.id)) continue
+        try {
+          await window.api.libraryDirs.register(s.path)
+        } catch (err) {
+          console.warn(`Failed to register offload dir ${s.path}:`, err.message)
+        }
+      }
+    } finally {
+      setRegisteringOffload(false)
+    }
+    runScanFlow()
+  }, [offloadSuggestions, selectedOffload, runScanFlow])
+
   const handleApply = useCallback(async () => {
     setApplying(true)
     setHideProgress(null)
@@ -172,14 +225,14 @@ export default function FirstRun({ onDone }) {
       setApplying(false)
       setHideProgress(null)
     }
-    setStep('done')
+    setStep(hideDepContent ? 'applied' : 'done')
   }, [hideDepContent])
 
   return (
     <Dialog
       open
       onOpenChange={(open) => {
-        if (!open && step === 'done') onDone()
+        if (!open && (step === 'done' || step === 'applied')) onDone()
       }}
     >
       <DialogPortal>
@@ -187,13 +240,13 @@ export default function FirstRun({ onDone }) {
         <DialogPrimitive.Content
           className="fade-in fixed top-1/2 left-1/2 z-50 w-[480px] max-w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 rounded-2xl bg-[#13141e] border border-white/10 overflow-hidden shadow-[0_32px_80px_rgba(0,0,0,0.7),0_0_0_1px_rgba(58,124,244,0.1)] outline-none"
           onPointerDownOutside={(e) => {
-            if (step !== 'done') e.preventDefault()
+            if (step !== 'done' && step !== 'applied') e.preventDefault()
           }}
           onInteractOutside={(e) => {
-            if (step !== 'done') e.preventDefault()
+            if (step !== 'done' && step !== 'applied') e.preventDefault()
           }}
           onEscapeKeyDown={(e) => {
-            if (step !== 'done') e.preventDefault()
+            if (step !== 'done' && step !== 'applied') e.preventDefault()
           }}
         >
           <div className="h-[3px] bg-linear-to-r from-accent-blue to-[#c040ee]" />
@@ -208,7 +261,16 @@ export default function FirstRun({ onDone }) {
                 browseError={browseError}
                 scanError={scanError}
                 onBrowse={handleBrowse}
-                onScan={handleScan}
+                onScan={handleProceed}
+              />
+            )}
+            {step === 'offload' && (
+              <OffloadStep
+                suggestions={offloadSuggestions}
+                selected={selectedOffload}
+                onToggle={toggleOffload}
+                registering={registeringOffload}
+                onContinue={handleOffloadContinue}
               />
             )}
             {step === 'scanning' && <ScanningStep progress={scanProgress} activePhaseIdx={activePhaseIdx} />}
@@ -229,6 +291,7 @@ export default function FirstRun({ onDone }) {
                 onApply={handleApply}
               />
             )}
+            {step === 'applied' && <AppliedStep stats={stats} onDone={onDone} />}
             {step === 'done' && (
               <DoneStep
                 stats={stats}
@@ -252,12 +315,9 @@ function BetaWarningStep({ onContinue }) {
       </div>
 
       <p className="m-0 mb-4 text-[13px] text-white/50 leading-[1.7] text-left">
-        This is untested beta software. Before using, copy your <strong className="text-white/55">AddonPackages</strong>{' '}
-        and <strong className="text-white/55">AddonPackagesFilePrefs</strong> folders somewhere safe.
-      </p>
-
-      <p className="m-0 mb-7 text-[13px] text-white/45 leading-[1.7] text-left">
-        Like, seriously, you may lose all your shit. You&apos;ve been warned.
+        This is a beta software. Before using, we recommend to backup your{' '}
+        <strong className="text-white/55">AddonPackages</strong> and{' '}
+        <strong className="text-white/55">AddonPackagesFilePrefs</strong> folders.
       </p>
 
       <Button variant="gradient" size="lg" onClick={onContinue} className="w-full rounded-[10px] text-[13px]">
@@ -344,6 +404,86 @@ function WelcomeStep({ vamDir, varCount, detected, detectSource, browseError, sc
         className="w-full rounded-[10px] text-[13px]"
       >
         Scan library <ArrowRight size={15} />
+      </Button>
+    </div>
+  )
+}
+
+function OffloadStep({ suggestions, selected, onToggle, registering, onContinue }) {
+  return (
+    <div>
+      <div className="flex items-center gap-3 mb-5">
+        <div className="w-11 h-11 rounded-xl shrink-0 flex items-center justify-center bg-linear-to-br from-accent-blue to-accent-pink">
+          <Folder size={20} className="text-white" strokeWidth={2} />
+        </div>
+        <h2 className="m-0 text-xl font-semibold text-text-primary tracking-tight">Offload folders detected</h2>
+      </div>
+
+      <p className="text-[13px] leading-[1.7] text-white/55 mb-6">
+        You already use tools that move packages out of <strong className="text-white/70">AddonPackages</strong> to keep
+        VaM light. Add their folders and Backstage will index those packages as{' '}
+        <strong className="text-white/70">offloaded</strong> instead of reporting them missing.
+      </p>
+
+      <div className="flex flex-col gap-2.5 mb-7">
+        {suggestions.map((s) => {
+          const on = selected.has(s.id)
+          return (
+            <label
+              key={s.id}
+              className={`flex items-center gap-3.5 px-4 py-3.5 rounded-[10px] cursor-pointer text-left transition-colors duration-150 ${
+                on
+                  ? 'bg-[rgba(74,145,241,0.08)] border border-[rgba(74,145,241,0.35)]'
+                  : 'bg-white/4 border border-white/8 hover:bg-white/[0.07]'
+              }`}
+            >
+              <input
+                type="checkbox"
+                checked={on}
+                disabled={registering}
+                onChange={() => onToggle(s.id)}
+                className="sr-only"
+              />
+              <span
+                aria-hidden
+                className={`shrink-0 flex items-center justify-center w-[18px] h-[18px] rounded-[6px] border transition-colors ${
+                  on ? 'bg-accent-blue border-accent-blue text-white' : 'border-white/20 bg-white/5'
+                }`}
+              >
+                {on && <Check size={12} strokeWidth={3} />}
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className={`m-0 text-[13px] font-medium mb-1 ${on ? 'text-[#d0d1de]' : 'text-white/70'}`}>
+                  {s.label}
+                  <span className="ml-2 text-[11px] font-normal text-white/35">
+                    {s.varCount.toLocaleString()} var{s.varCount === 1 ? '' : 's'}
+                  </span>
+                </p>
+                <p className="m-0 text-[11px] font-mono text-white/35 leading-snug truncate select-text cursor-text">
+                  {s.path}
+                </p>
+              </div>
+            </label>
+          )
+        })}
+      </div>
+
+      <Button
+        variant="gradient"
+        size="lg"
+        onClick={onContinue}
+        disabled={registering}
+        className="w-full rounded-[10px] text-[13px]"
+      >
+        {registering ? (
+          <>
+            <Loader2 size={14} className="spin-slow" /> Adding folders…
+          </>
+        ) : (
+          <>
+            Scan library <ArrowRight size={15} />
+          </>
+        )}
       </Button>
     </div>
   )
@@ -484,7 +624,7 @@ function SetupStep({ stats, hideDepContent, setHideDepContent, applying, hidePro
         directly installed packages?
       </p>
 
-      <div className={`flex flex-col gap-2 ${showProgress ? 'mb-4' : 'mb-7'}`}>
+      <div className={`flex flex-col gap-2 ${showProgress ? 'mb-4' : 'mb-3'}`}>
         {[
           {
             id: true,
@@ -525,6 +665,16 @@ function SetupStep({ stats, hideDepContent, setHideDepContent, applying, hidePro
         ))}
       </div>
 
+      {!showProgress && (
+        <p className="flex items-start gap-1.5 text-[11px] leading-snug text-white/35 mb-6">
+          <ShieldCheck size={13} className="shrink-0 mt-px text-white/30" />
+          <span>
+            Non-destructive and reversible — hiding only changes what VaM shows. Nothing is deleted, and you can undo it
+            anytime in Settings.
+          </span>
+        </p>
+      )}
+
       {showProgress && (
         <div className="mb-5">
           <div className="flex justify-between mb-2 text-xs text-white/40">
@@ -558,6 +708,80 @@ function SetupStep({ stats, hideDepContent, setHideDepContent, applying, hidePro
             Apply & continue <ArrowRight size={15} />
           </>
         )}
+      </Button>
+    </div>
+  )
+}
+
+function AppliedStep({ stats, onDone }) {
+  const depContent = stats?.depContentCount || 0
+  const directCount = stats?.directCount || 0
+  return (
+    <div>
+      <div className="flex items-center gap-2.5 mb-2">
+        <EyeOff size={20} className="text-accent-blue" />
+        <h2 className="m-0 text-[17px] font-semibold text-text-primary">Dependency content hidden</h2>
+      </div>
+      <p className="text-xs leading-[1.7] text-white/50 mb-5">
+        {depContent > 0 ? (
+          <>
+            Hidden <strong className="text-white/75">{depContent.toLocaleString()} dependency items</strong>. Your VaM
+            library now shows only content from your{' '}
+            <strong className="text-white/75">{directCount.toLocaleString()} direct packages</strong>.
+          </>
+        ) : (
+          <>Auto-hide is on — dependency content will stay hidden in VaM.</>
+        )}
+      </p>
+
+      <div className="flex flex-col gap-2 mb-7">
+        {[
+          {
+            icon: ShieldCheck,
+            iconClass: 'text-success',
+            title: 'Nothing was deleted',
+            body: (
+              <>Hiding is non-destructive — it only tells VaM not to show this content. All your files stay on disk.</>
+            ),
+          },
+          {
+            icon: RotateCcw,
+            iconClass: 'text-accent-blue',
+            title: 'Undo anytime',
+            body: (
+              <>
+                Changed your mind? Turn this off in <strong className="text-white/60">Settings &rarr; Display</strong>{' '}
+                by unchecking <strong className="text-white/60">Auto-hide dependency content</strong> to bring
+                everything back.
+              </>
+            ),
+          },
+          {
+            icon: Plus,
+            iconClass: 'text-accent-blue',
+            title: 'Missing something you use?',
+            body: (
+              <>
+                A package you actually use may have been detected as a dependency. Open the{' '}
+                <strong className="text-white/60">Dependencies</strong> filter in your Library and click{' '}
+                <strong className="text-white/60">Add to Library</strong> to move it into your library and make its
+                content visible again.
+              </>
+            ),
+          },
+        ].map(({ icon: Icon, iconClass, title, body }) => (
+          <div key={title} className="flex gap-3 p-3.5 rounded-[10px] bg-white/4 border border-white/8 text-left">
+            <Icon size={16} className={`shrink-0 mt-0.5 ${iconClass}`} />
+            <div>
+              <p className="m-0 text-[13px] font-medium text-white/70 mb-0.5">{title}</p>
+              <p className="m-0 text-[11px] text-white/40 leading-snug">{body}</p>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <Button variant="gradient" size="lg" onClick={onDone} className="w-full rounded-[10px] text-[13px]">
+        Open VaM Backstage
       </Button>
     </div>
   )

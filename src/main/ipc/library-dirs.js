@@ -10,6 +10,11 @@
  * layer too); also resets the `disable_behavior` setting if it pointed at the
  * removed dir.
  * `library-dirs:browse` opens the OS folder picker.
+ * `library-dirs:set-browser-assist` toggles JayJayWon BrowserAssist sidecar mode on
+ * an offload dir. It only affects *future* offloads/restores into that dir — the
+ * flag is never retroactively applied, so toggling it never writes or deletes any
+ * `.var.json` on disk (a no-op the user expects). Users can regenerate sidecars for
+ * existing packages by enabling the mode and re-cycling enable/offload on them.
  */
 
 import { ipcMain, dialog } from 'electron'
@@ -18,13 +23,16 @@ import { join } from 'path'
 import {
   insertLibraryDir,
   deleteLibraryDir,
+  removeLibraryDirTombstoningPackages,
   getLibraryDirByPath,
   getLibraryDir,
   countPackagesInLibraryDir,
+  setLibraryDirBrowserAssist,
   getSetting,
   setSetting,
 } from '../db.js'
 import { getMainLibraryDirPath, getAuxLibraryDirs, validateNewAuxDirPath, refreshLibraryDirs } from '../library-dirs.js'
+import { detectOffloadSuggestions, matchOffloadToolId } from '../offload-suggestions.js'
 import { restartPackageWatcher } from '../watcher.js'
 import { runScan } from '../scanner/index.js'
 import { buildFromDb } from '../store.js'
@@ -78,15 +86,74 @@ async function probeSameFs(mainPath, auxPath) {
   return null
 }
 
+/**
+ * Validate → stat → dedupe → same-FS probe → insert a new offload dir row.
+ * Returns `{ id, path, browserAssist }`. Does NOT scan or restart the watcher —
+ * callers decide (Settings rescans immediately; the first-run wizard defers to its
+ * single scan). BrowserAssist's default offload folder is auto-detected and gets
+ * sidecar mode enabled so future offloads into it write sidecars and existing BA
+ * sidecars are honored on restore.
+ */
+async function registerAuxDir(path) {
+  refreshLibraryDirs()
+  const error = await validateNewAuxDirPath(path)
+  if (error) throw new Error(error)
+
+  try {
+    const s = await stat(path)
+    if (!s.isDirectory()) throw new Error('Path is not a directory')
+  } catch (err) {
+    if (err.code === 'ENOENT') throw new Error(`Directory does not exist: ${path}`)
+    throw err
+  }
+
+  const existing = getLibraryDirByPath(path)
+  if (existing) throw new Error('Directory already registered')
+
+  const mainPath = getMainLibraryDirPath()
+  if (!mainPath) throw new Error('Main library directory is not configured yet')
+  const probeError = await probeSameFs(mainPath, path)
+  if (probeError) throw new Error(probeError)
+
+  const id = insertLibraryDir(path)
+  const browserAssist = matchOffloadToolId(path, getSetting('vam_dir')) === 'browser-assist'
+  if (browserAssist) setLibraryDirBrowserAssist(id, true)
+  refreshLibraryDirs()
+  return { id, path, browserAssist }
+}
+
 export function registerLibraryDirHandlers() {
   ipcMain.handle('library-dirs:list', () => {
     refreshLibraryDirs()
     const main = getMainLibraryDirPath()
     const aux = getAuxLibraryDirs().map((d) => {
       const { n: packageCount, bytes } = countPackagesInLibraryDir(d.id)
-      return { id: d.id, path: d.path, created_at: d.created_at, packageCount, sizeBytes: Number(bytes) || 0 }
+      return {
+        id: d.id,
+        path: d.path,
+        created_at: d.created_at,
+        packageCount,
+        sizeBytes: Number(bytes) || 0,
+        browserAssist: !!d.browser_assist,
+      }
     })
     return { main, aux }
+  })
+
+  // Toggle JayJayWon BrowserAssist sidecar mode on an offload dir. This only flips
+  // the flag: it governs whether *future* offloads into this dir write a sidecar and
+  // whether restores from it read one. Existing on-disk files are intentionally left
+  // untouched — enabling doesn't back-fill sidecars (avoids littering the dir with
+  // now-stale JSON) and disabling doesn't delete any (avoids destroying the only
+  // record of a restore folder for packages BrowserAssist itself flattened to root).
+  // The `.var` bytes never move, so no rescan is needed.
+  ipcMain.handle('library-dirs:set-browser-assist', async (_, id, enabled) => {
+    const row = getLibraryDir(id)
+    if (!row) throw new Error('Library directory not found')
+    const on = !!enabled
+    setLibraryDirBrowserAssist(id, on)
+    refreshLibraryDirs()
+    return { ok: true, browserAssist: on }
   })
 
   ipcMain.handle('library-dirs:browse', async () => {
@@ -99,28 +166,7 @@ export function registerLibraryDirHandlers() {
   })
 
   ipcMain.handle('library-dirs:add', async (_, path) => {
-    refreshLibraryDirs()
-    const error = await validateNewAuxDirPath(path)
-    if (error) throw new Error(error)
-
-    try {
-      const s = await stat(path)
-      if (!s.isDirectory()) throw new Error('Path is not a directory')
-    } catch (err) {
-      if (err.code === 'ENOENT') throw new Error(`Directory does not exist: ${path}`)
-      throw err
-    }
-
-    const existing = getLibraryDirByPath(path)
-    if (existing) throw new Error('Directory already registered')
-
-    const mainPath = getMainLibraryDirPath()
-    if (!mainPath) throw new Error('Main library directory is not configured yet')
-    const probeError = await probeSameFs(mainPath, path)
-    if (probeError) throw new Error(probeError)
-
-    const id = insertLibraryDir(path)
-    refreshLibraryDirs()
+    const result = await registerAuxDir(path)
 
     const vamDir = getSetting('vam_dir')
     if (vamDir) {
@@ -130,18 +176,45 @@ export function registerLibraryDirHandlers() {
       notify('contents:updated')
     }
 
-    return { id, path }
+    return result
   })
 
-  ipcMain.handle('library-dirs:remove', async (_, id) => {
+  // Register an offload dir WITHOUT scanning — the first-run wizard registers
+  // detected dirs before its single library scan, which then indexes them and
+  // the watcher subscribes to them (both enumerate the library_dirs registry).
+  ipcMain.handle('library-dirs:register', async (_, path) => {
+    return await registerAuxDir(path)
+  })
+
+  // Detected default offload folders from known third-party tools (BrowserAssist,
+  // var_browser) that exist on disk and aren't registered yet.
+  ipcMain.handle('library-dirs:suggest', async () => {
+    refreshLibraryDirs()
+    return await detectOffloadSuggestions(getSetting('vam_dir'))
+  })
+
+  // `opts.force` un-registers a non-empty offload dir: its package rows are
+  // tombstoned (and detached from the dir so the FK RESTRICT lifts) rather than
+  // deleted. The on-disk `.var` files are left untouched, so re-adding + rescanning
+  // resurrects each row with its user-set metadata (labels, category overrides,
+  // content visibility) intact — the removal is recoverable.
+  ipcMain.handle('library-dirs:remove', async (_, id, opts) => {
     const row = getLibraryDir(id)
     if (!row) throw new Error('Library directory not found')
     const { n: count } = countPackagesInLibraryDir(id)
-    if (count > 0) {
-      throw new Error(`Cannot remove: ${count} package(s) are still stored in this directory. Move them first.`)
-    }
+    // If this was a known tool's default offload folder, tell the renderer so it
+    // can dismiss the re-suggestion — the folder still exists on disk after removal.
+    const matchedToolId = matchOffloadToolId(row.path, getSetting('vam_dir'))
 
-    deleteLibraryDir(id)
+    let forgotten = 0
+    if (count > 0) {
+      if (!opts?.force) {
+        throw new Error(`Cannot remove: ${count} package(s) are still stored in this directory. Move them first.`)
+      }
+      forgotten = removeLibraryDirTombstoningPackages(id)
+    } else {
+      deleteLibraryDir(id)
+    }
 
     if (getSetting('disable_behavior') === disableBehaviorMoveTo(id)) {
       setSetting('disable_behavior', DISABLE_BEHAVIOR_SUFFIX)
@@ -151,7 +224,8 @@ export function registerLibraryDirHandlers() {
     await restartPackageWatcher()
     buildFromDb()
     notify('packages:updated')
+    notify('contents:updated')
 
-    return { ok: true }
+    return { ok: true, forgotten, matchedToolId }
   })
 }

@@ -1,7 +1,7 @@
 import { app, net, session } from 'electron'
 import { notify } from '../notify.js'
 
-const HUB_ORIGIN = 'https://hub.virtamate.com'
+export const HUB_ORIGIN = 'https://hub.virtamate.com'
 
 /**
  * Match the User-Agent the persist:hub webview used to authenticate. Cloudflare
@@ -31,14 +31,17 @@ function getSession() {
   return session.fromPartition('persist:hub')
 }
 
-/** Neutral per-resource state: no personal flags, unknown favourite count. */
+/** Neutral per-resource state: no personal flags, unknown counts. */
 export function neutralResourceState(extra) {
   return {
     loggedIn: false,
     favorited: false,
     bookmarked: false,
+    // `rated`/`ratedDown`: the Hub thumbs up/down *rating* (its `/like/` endpoint).
+    rated: false,
+    ratedDown: false,
+    // `liked`: the visitor's emoji "Like" reaction (reaction id 1).
     liked: false,
-    disliked: false,
     favoriteCount: null,
     ...extra,
   }
@@ -55,7 +58,7 @@ export async function isLoggedIn() {
 }
 
 /** GET a Hub page through persist:hub cookies. Resolves { canonicalUrl, html }. */
-function hubGet(url, { maxRedirects = 5 } = {}) {
+export function hubGet(url, { maxRedirects = 5 } = {}) {
   return new Promise((resolve, reject) => {
     const request = net.request({
       method: 'GET',
@@ -90,11 +93,11 @@ function hubGet(url, { maxRedirects = 5 } = {}) {
   })
 }
 
-/** POST urlencoded body through persist:hub cookies. Resolves parsed JSON. */
-function hubPost(url, bodyParams, { referer }) {
+/** JSON XHR through persist:hub cookies. Resolves parsed JSON. */
+function hubJsonRequest(method, url, { body, referer } = {}) {
   return new Promise((resolve, reject) => {
     const request = net.request({
-      method: 'POST',
+      method,
       url,
       session: getSession(),
       useSessionCookies: true,
@@ -105,7 +108,7 @@ function hubPost(url, bodyParams, { referer }) {
     request.setHeader('X-Requested-With', 'XMLHttpRequest')
     request.setHeader('Origin', HUB_ORIGIN)
     request.setHeader('Referer', referer || HUB_ORIGIN)
-    request.setHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8')
+    if (body != null) request.setHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8')
 
     request.on('response', (response) => {
       const chunks = []
@@ -121,14 +124,73 @@ function hubPost(url, bodyParams, { referer }) {
       response.on('error', reject)
     })
     request.on('error', reject)
-    request.end(encodeBody(bodyParams))
+    if (body != null) request.end(body)
+    else request.end()
   })
+}
+
+/** POST urlencoded body through persist:hub cookies. Resolves parsed JSON. */
+function hubPost(url, bodyParams, { referer }) {
+  return hubJsonRequest('POST', url, { body: encodeBody(bodyParams), referer })
+}
+
+/** GET with XenForo ajax query params; resolves parsed JSON. */
+export function hubXfGet(path, { xfToken, xfRequestUri, params = {}, referer } = {}) {
+  const url = new URL(path, HUB_ORIGIN)
+  url.searchParams.set('_xfWithData', '1')
+  url.searchParams.set('_xfResponseType', 'json')
+  if (xfToken != null) url.searchParams.set('_xfToken', xfToken)
+  url.searchParams.set('_xfRequestUri', xfRequestUri)
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v))
+  return hubJsonRequest('GET', url.toString(), { referer: referer || `${HUB_ORIGIN}${xfRequestUri}` })
 }
 
 function encodeBody(params) {
   return Object.entries(params)
     .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
     .join('&')
+}
+
+export function parseCsrfToken(html) {
+  const csrf = html.match(/data-csrf=(["'])(.*?)\1/)
+  if (csrf) return csrf[2]
+  const tok = html.match(/name="_xfToken"\s+value="([^"]+)"/)
+  if (tok) return tok[1]
+  const cfg = html.match(/["']csrf["']\s*:\s*["']([^"']+)["']/)
+  if (cfg) return cfg[1]
+  return null
+}
+
+export function parseLoggedInUserId(html) {
+  const m = html.match(/\buserId:\s*(\d+)\s*,/)
+  return m ? m[1] : null
+}
+
+/** Profile slug from account nav, e.g. `boss.23453`. */
+export function parseMemberSlug(html) {
+  const patterns = [
+    /blockLink"\s+href="\/members\/([^"/]+)\/"[^>]*>[\s\S]*?navMenuTitle">(?:Your )?Profile/i,
+    /menu-linkRow[^>]*href="\/members\/([^"/]+)\/#favorites"/i,
+  ]
+  for (const re of patterns) {
+    const m = html.match(re)
+    if (m) return m[1]
+  }
+  return null
+}
+
+/** True if an XenForo json error payload signals a logged-out session. */
+function isXfAuthError(json) {
+  const first = (json?.errors && json.errors[0]) || ''
+  const title = json?.errorHtml?.title || ''
+  return title === 'Log in' || /logged-in/i.test(first) || /logged-in/i.test(title)
+}
+
+export function assertXfOk(json) {
+  if (!json || json.status === 'ok') return
+  const first = (json.errors && json.errors[0]) || json.errorHtml?.title || ''
+  if (isXfAuthError(json)) throw new HubAuthError(first || undefined)
+  throw new Error(first || 'Hub request failed')
 }
 
 /** Scoped regex parse of a resource page — no DOM parser. */
@@ -147,17 +209,7 @@ function parseResourcePage(html, finalUrl) {
     }
   }
 
-  let token = null
-  const csrf = html.match(/data-csrf=(["'])(.*?)\1/)
-  if (csrf) token = csrf[2]
-  if (!token) {
-    const tok = html.match(/name="_xfToken"\s+value="([^"]+)"/)
-    if (tok) token = tok[1]
-  }
-  if (!token) {
-    const cfg = html.match(/["']csrf["']\s*:\s*["']([^"']+)["']/)
-    if (cfg) token = cfg[1]
-  }
+  const token = parseCsrfToken(html)
 
   // User's own favorite/bookmark state comes from the action buttons. Test the
   // state class only inside the element's `class` attribute — the toggle markup
@@ -166,15 +218,58 @@ function parseResourcePage(html, finalUrl) {
   const favorited = elementClassHas(html, 'button--favorite', 'is-favorited')
   const bookmarked = elementClassHas(html, 'button--icon--bookmark', 'is-bookmarked')
 
-  // The resource thumbs up/down rating: the two buttons gain `is-active-like` on
-  // the side the visitor picked (and lose the `add-like` affordance class).
-  const liked = elementClassHas(html, 'button--like', 'is-active-like')
-  const disliked = elementClassHas(html, 'button--unlike', 'is-active-like')
+  // The resource thumbs up/down *rating*: the two buttons gain `is-active-like` on
+  // the side the visitor picked (and lose the `add-like` affordance class). The
+  // Hub calls this endpoint "like", but it is a positive/negative rating distinct
+  // from the emoji reaction below — surfaced here as `rated` / `ratedDown`.
+  const rated = elementClassHas(html, 'button--like', 'is-active-like')
+  const ratedDown = elementClassHas(html, 'button--unlike', 'is-active-like')
 
-  // ...while the public favourite count lives in the sidebar stats (not in api.php).
+  // The emoji reaction bar (SV ContentRatings). The visitor "liked" it if they
+  // left ANY reaction — not just the default thumbs-up (id 1) — so we keep the
+  // actual id: un-liking must re-post that same id (XenForo only toggles a
+  // reaction off when re-posted). Reactions are scoped to a resource *update*, so
+  // capture the update id the bar targets — the emoji-like toggle POSTs against it.
+  const reactionUpdateId = parseReactionUpdateId(html)
+  const visitorReactionId = parseVisitorReactionId(html)
+  const liked = visitorReactionId != null
+
+  // The sidebar stats block carries fresh, reliably-placed counts (none are in
+  // api.php): `favorites` and `reactions` (the emoji total, == the API's
+  // `reaction_score`). We prefer the page's `reactions` over the API's cached
+  // `reaction_score` so the like button's base number can't lag the visitor's own
+  // just-made reaction. Each is null when its row is absent.
   const favoriteCount = parseSidebarStat(html, 'favorites')
+  const reactionScore = parseSidebarStat(html, 'reactions')
 
-  return { canonicalPath, token, favorited, favoriteCount, bookmarked, liked, disliked }
+  return {
+    canonicalPath,
+    token,
+    favorited,
+    favoriteCount,
+    bookmarked,
+    rated,
+    ratedDown,
+    liked,
+    visitorReactionId,
+    reactionUpdateId,
+    reactionScore,
+  }
+}
+
+/** Update id the emoji reaction bar targets, from `js-ratingBar-resource_update{id}`. */
+function parseReactionUpdateId(html) {
+  const m = html.match(/js-ratingBar-resource_update(\d+)/) || html.match(/\/update\/(\d+)\/react/)
+  return m ? m[1] : null
+}
+
+/**
+ * The visitor's own emoji reaction id, or null. Once reacted, the rate trigger's
+ * text becomes "Remove" and its href carries the chosen reaction id.
+ */
+function parseVisitorReactionId(html) {
+  const m = html.match(/react\?reaction_id=(\d+)"[^>]*\bbutton--sv-rate\b[^>]*>\s*<span[^>]*>\s*Remove/i)
+  return m ? parseInt(m[1], 10) : null
 }
 
 /** True if the element whose class list contains `marker` also contains `stateClass`. */
@@ -211,16 +306,21 @@ export async function getResourceUserState(id) {
       canonicalPath: parsed.canonicalPath || `/resources/${id}/`,
       favorited: parsed.favorited,
       bookmarked: parsed.bookmarked,
+      rated: parsed.rated,
+      ratedDown: parsed.ratedDown,
       liked: parsed.liked,
-      disliked: parsed.disliked,
+      reactionId: parsed.visitorReactionId,
+      reactionUpdateId: parsed.reactionUpdateId,
     })
     return {
       loggedIn,
       favorited: parsed.favorited,
       favoriteCount: parsed.favoriteCount,
       bookmarked: parsed.bookmarked,
+      rated: parsed.rated,
+      ratedDown: parsed.ratedDown,
       liked: parsed.liked,
-      disliked: parsed.disliked,
+      reactionScore: parsed.reactionScore,
     }
   } catch {
     // Page fetch failed: keep the cookie-derived login state with neutral
@@ -232,9 +332,8 @@ export async function getResourceUserState(id) {
 /** @returns {'auth'|'security'|'generic'|null} */
 function classifyError(json) {
   if (!json || json.status !== 'error') return null
+  if (isXfAuthError(json)) return 'auth'
   const first = (json.errors && json.errors[0]) || ''
-  const title = json.errorHtml?.title || ''
-  if (title === 'Log in' || /logged-in/i.test(first)) return 'auth'
   if (/security error/i.test(first)) return 'security'
   return 'generic'
 }
@@ -307,19 +406,24 @@ export async function toggleBookmark(id, currentlyBookmarked) {
 }
 
 /**
- * Toggle the visitor's resource "like" (thumbs up). The endpoint's JSON only
- * reports `success` — it never echoes the new state — so we derive it: liking
- * sends `liked=1` (which also clears any prior dislike), un-liking sends both
- * flags 0. We never set the dislike here; the UI only offers a like action and
- * merely surfaces an existing dislike made on the Hub.
+ * Toggle the visitor's resource *rating* (the Hub thumbs up/down, served by the
+ * `/like/` endpoint). The endpoint never echoes the new state — so we derive it:
+ * rating up sends `liked=1` (which also clears any prior down-rating), un-rating
+ * sends both flags 0. We never set a down-rating here; the UI only offers the
+ * positive rating and merely surfaces an existing down-rating made on the Hub.
+ *
+ * Un-rating a rating that still has a review returns `{ success: true,
+ * needsConfirmation: true }` without clearing it. The Hub would accept a force
+ * via `proceed=1` in the body; we don't send that — surface the failure so the
+ * user can remove the review on the Hub first.
  */
-export async function toggleLike(id, currentlyLiked) {
+export async function toggleRate(id, currentlyRated) {
   if (!(await isLoggedIn())) throw new HubAuthError()
-  const like = currentlyLiked ? 0 : 1
-  await postWithRecovery(id, () => ({
+  const rate = currentlyRated ? 0 : 1
+  const json = await postWithRecovery(id, () => ({
     url: `${HUB_ORIGIN}/resources/${id}/like/`,
     body: {
-      liked: like,
+      liked: rate,
       unliked: 0,
       resource_id: id,
       _xfRequestUri: canonicalPathFor(id),
@@ -328,14 +432,58 @@ export async function toggleLike(id, currentlyLiked) {
       _xfResponseType: 'json',
     },
   }))
-  const liked = !!like
-  updateSnapshot(id, { liked, disliked: false })
-  return { liked, disliked: false }
+  // Unrate refused: rating has a review. Do not update snapshot / pretend success.
+  if (!rate && json?.needsConfirmation) {
+    throw new Error('This rating has a review. Remove the review on the Hub before unrating.')
+  }
+  const rated = !!rate
+  updateSnapshot(id, { rated, ratedDown: false })
+  return { rated, ratedDown: false }
+}
+
+/**
+ * Toggle the visitor's reaction on the resource's update. Any existing reaction
+ * counts as "liked", not just the default thumbs-up (id 1). Un-liking re-posts the
+ * visitor's *current* id, since XenForo only toggles a reaction off when re-posted;
+ * liking from scratch posts the default Like (id 1). The response echoes the new
+ * reaction id (null once cleared) which we cache — so, e.g., un-liking a Starstruck
+ * (8), re-liking (now 1), then un-liking again correctly posts 1 the second time.
+ * Reactions are scoped to a resource *update*, so we need the update id from the page.
+ */
+export async function toggleLike(id) {
+  if (!(await isLoggedIn())) throw new HubAuthError()
+  if (!reactionUpdateIdFor(id)) await getResourceUserState(id)
+  const updateId = reactionUpdateIdFor(id)
+  if (!updateId) throw new Error('Could not find this resource’s reaction target')
+  const currentReactionId = reactionIdFor(id)
+  const targetReactionId = currentReactionId ?? 1
+  const json = await postWithRecovery(id, () => ({
+    url: `${HUB_ORIGIN}/resources/${id}/update/${updateId}/react?reaction_id=${targetReactionId}`,
+    body: {
+      _xfRequestUri: canonicalPathFor(id),
+      _xfWithData: 1,
+      _xfToken: sessionToken,
+      _xfResponseType: 'json',
+    },
+  }))
+  const reactionId = json.reactionId ?? null
+  const liked = reactionId != null
+  updateSnapshot(id, { liked, reactionId })
+  return { liked }
 }
 
 function canonicalPathFor(id) {
   const snap = resourceState.get(String(id))
   return snap?.canonicalPath || `/resources/${id}/`
+}
+
+function reactionUpdateIdFor(id) {
+  return resourceState.get(String(id))?.reactionUpdateId || null
+}
+
+/** The visitor's current reaction id (null if none) — drives which id an un-like posts. */
+function reactionIdFor(id) {
+  return resourceState.get(String(id))?.reactionId ?? null
 }
 
 function updateSnapshot(id, patch) {

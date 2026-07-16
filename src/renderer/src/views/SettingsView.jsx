@@ -7,21 +7,26 @@ import {
   CheckCircle,
   AlertTriangle,
   Bug,
+  Bookmark,
+  Heart,
+  Wrench,
   Trash2,
-  Eye,
-  EyeOff,
   ShieldCheck,
   Compass,
   FlaskConical,
   CurlyBraces,
+  Network,
+  Plug,
+  PlugZap,
+  X,
 } from 'lucide-react'
 import { formatBytes } from '@/lib/utils'
 import { parseDisableBehavior, disableBehaviorMoveTo } from '@shared/disable-behavior.js'
+import { DEFAULT_REMOTE_PORT, normalizeConnectUrl } from '@shared/remote-config.js'
 import { toast } from '@/components/Toast'
 import { useStatusStore } from '@/stores/useStatusStore'
 import { useLibraryStore } from '@/stores/useLibraryStore'
-import { useHubStore } from '@/stores/useHubStore'
-import { useHubHiddenStore } from '@/stores/useHubHiddenStore'
+import { useRemoteUiStore } from '@/stores/useRemoteUiStore'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -41,10 +46,12 @@ import {
 
 export default function SettingsView() {
   const [vamDir, setVamDir] = useState('')
-  const [blurThumbnails, setBlurThumbnails] = useState(false)
+  const blurThumbnails = useRemoteUiStore((s) => s.blurThumbnails)
+  const setBlurThumbnails = useRemoteUiStore((s) => s.setBlurThumbnails)
   const [hubDebugRequests, setHubDebugRequests] = useState(false)
   const [isDev, setIsDev] = useState(false)
   const [developerUnlocked, setDeveloperUnlocked] = useState(false)
+  const [deletedData, setDeletedData] = useState({ packages: 0, contentLabels: 0 })
   const devUnlockRef = useRef({ count: 0, resetTimer: null })
   const [scanning, setScanning] = useState(false)
   const [scanResult, setScanResult] = useState(null)
@@ -54,25 +61,34 @@ export default function SettingsView() {
   const [hubScanProgress, setHubScanProgress] = useState(null)
   const [baSyncing, setBaSyncing] = useState(false)
   const [baSyncResult, setBaSyncResult] = useState(null)
+  const [wishlistImporting, setWishlistImporting] = useState(null)
+  const [wishlistImportProgress, setWishlistImportProgress] = useState(null)
+  const [wishlistImportResult, setWishlistImportResult] = useState(null)
   const [baDirPresent, setBaDirPresent] = useState(false)
+  const [hubLoggedIn, setHubLoggedIn] = useState(false)
   const [appVersion, setAppVersion] = useState('')
   const [updateChannel, setUpdateChannel] = useState('stable')
   const [libDirs, setLibDirs] = useState({ main: '', aux: [] })
   const [libDirsLoading, setLibDirsLoading] = useState(false)
   const [disableBehavior, setDisableBehavior] = useState('suffix')
+  const [offloadSuggestions, setOffloadSuggestions] = useState([])
+  const [dismissedOffload, setDismissedOffload] = useState(() => new Set())
   const stats = useStatusStore((s) => s.stats)
   const fetchStats = useStatusStore((s) => s.fetchStats)
   const dimInactive = useLibraryStore((s) => s.dimInactive)
   const setDimInactive = useLibraryStore((s) => s.setDimInactive)
   const suppressDisablePackageWarning = useLibraryStore((s) => s.suppressDisablePackageWarning)
   const setSuppressDisablePackageWarning = useLibraryStore((s) => s.setSuppressDisablePackageWarning)
-  const showHubInfinitePager = useHubStore((s) => s.showInfinitePagerControls)
-  const setShowHubInfinitePager = useHubStore((s) => s.setShowInfinitePagerControls)
-  const rememberHubInfinitePage = useHubStore((s) => s.trackInfiniteRestorePage)
-  const setRememberHubInfinitePage = useHubStore((s) => s.setTrackInfiniteRestorePage)
-  const hiddenHubItems = useHubHiddenStore((s) => s.items)
-  const restoreHiddenHubItem = useHubHiddenStore((s) => s.unhide)
-  const clearHiddenHubItems = useHubHiddenStore((s) => s.clear)
+  const remoteWarningDismissed = useRemoteUiStore((s) => s.warningDismissed)
+  const dismissRemoteWarning = useRemoteUiStore((s) => s.dismissWarning)
+  const isRemoteClient = !!window.api.remote?.isRemote
+  const [remoteStatus, setRemoteStatus] = useState(null)
+  const [serverPort, setServerPort] = useState(String(DEFAULT_REMOTE_PORT))
+  const [serveOnLaunch, setServeOnLaunch] = useState(false)
+  const [remoteEnabled, setRemoteEnabled] = useState(false)
+  const [localIps, setLocalIps] = useState({ primary: null, all: [] })
+  const [autoConnectArmed, setAutoConnectArmed] = useState(false)
+  const [connectUrl, setConnectUrl] = useState('')
 
   const refreshLibDirs = useCallback(async () => {
     try {
@@ -81,18 +97,47 @@ export default function SettingsView() {
     } catch (err) {
       console.warn('library-dirs:list failed:', err.message)
     }
+    try {
+      setOffloadSuggestions(await window.api.libraryDirs.suggest())
+    } catch (err) {
+      console.warn('library-dirs:suggest failed:', err.message)
+    }
   }, [])
 
   useEffect(() => {
     window.api.settings.get('vam_dir').then((v) => setVamDir(v || ''))
-    window.api.settings.get('blur_thumbnails').then((v) => setBlurThumbnails(v === '1'))
     window.api.settings.get('hub_debug_requests').then((v) => setHubDebugRequests(v === '1'))
     window.api.settings.get('developer_options_unlocked').then((v) => setDeveloperUnlocked(v === '1'))
     window.api.settings.get('disable_behavior').then((v) => setDisableBehavior(v || 'suffix'))
+    window.api.settings.get('offload_suggestions_dismissed').then((v) =>
+      setDismissedOffload(
+        new Set(
+          (v || '')
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean),
+        ),
+      ),
+    )
+    window.api.settings.get('remote_serve_port').then((v) => setServerPort(v || String(DEFAULT_REMOTE_PORT)))
+    window.api.settings.get('remote_serve_on_launch').then((v) => setServeOnLaunch(v === '1'))
+    window.api.settings.get('remote_mode_enabled').then((v) => setRemoteEnabled(v === '1'))
+    window.api.settings.get('remote_connect_url').then((v) => setConnectUrl(v || ''))
+    window.api.remote
+      .getAutoconnect()
+      .then((r) => setAutoConnectArmed(!!r?.url))
+      .catch(() => {})
     window.api.dev.isDev().then(setIsDev)
+    window.api.dev
+      .countDeletedData()
+      .then((r) =>
+        setDeletedData(
+          r?.ok ? { packages: r.packages, contentLabels: r.contentLabels } : { packages: 0, contentLabels: 0 },
+        ),
+      )
+      .catch(() => {})
     window.api.app.getVersion().then(setAppVersion)
     window.api.updater.getChannel().then((c) => setUpdateChannel(c === 'dev' ? 'dev' : 'stable'))
-    useHubHiddenStore.getState().hydrate()
     refreshLibDirs()
   }, [refreshLibDirs])
 
@@ -113,24 +158,80 @@ export default function SettingsView() {
     }
   }, [libDirsLoading, refreshLibDirs, fetchStats])
 
-  const handleRemoveAuxDir = useCallback(
-    async (id) => {
+  const handleAddSuggestion = useCallback(
+    async (suggestion) => {
       if (libDirsLoading) return
       setLibDirsLoading(true)
       try {
-        await window.api.libraryDirs.remove(id)
+        const res = await window.api.libraryDirs.add(suggestion.path)
+        await refreshLibDirs()
+        fetchStats()
+        toast(
+          res?.browserAssist
+            ? `${suggestion.label} offload directory added — BrowserAssist mode enabled`
+            : `${suggestion.label} offload directory added`,
+          'success',
+        )
+      } catch (err) {
+        toast(`Failed to add directory: ${err.message}`, 'error')
+      } finally {
+        setLibDirsLoading(false)
+      }
+    },
+    [libDirsLoading, refreshLibDirs, fetchStats],
+  )
+
+  const dismissOffloadSuggestion = useCallback((id) => {
+    setDismissedOffload((prev) => {
+      if (prev.has(id)) return prev
+      const next = new Set(prev)
+      next.add(id)
+      void window.api.settings.set('offload_suggestions_dismissed', [...next].join(','))
+      return next
+    })
+  }, [])
+
+  const handleRemoveAuxDir = useCallback(
+    async (id, opts) => {
+      if (libDirsLoading) return
+      setLibDirsLoading(true)
+      try {
+        const res = await window.api.libraryDirs.remove(id, opts)
+        if (res?.matchedToolId) dismissOffloadSuggestion(res.matchedToolId)
         await refreshLibDirs()
         const next = await window.api.settings.get('disable_behavior')
         setDisableBehavior(next || 'suffix')
         fetchStats()
-        toast('Library directory removed', 'success')
+        const forgotten = res?.forgotten || 0
+        toast(
+          forgotten > 0
+            ? `Offload directory removed — ${forgotten} package${forgotten === 1 ? '' : 's'} hidden (files kept on disk; re-add to restore)`
+            : 'Offload directory removed',
+          'success',
+        )
       } catch (err) {
         toast(`Failed to remove: ${err.message}`, 'error')
       } finally {
         setLibDirsLoading(false)
       }
     },
-    [libDirsLoading, refreshLibDirs, fetchStats],
+    [libDirsLoading, refreshLibDirs, fetchStats, dismissOffloadSuggestion],
+  )
+
+  const handleToggleBrowserAssist = useCallback(
+    async (id, enabled) => {
+      if (libDirsLoading) return
+      setLibDirsLoading(true)
+      try {
+        await window.api.libraryDirs.setBrowserAssist(id, enabled)
+        await refreshLibDirs()
+      } catch (err) {
+        toast(`Failed to update BrowserAssist mode: ${err.message}`, 'error')
+      } finally {
+        setLibDirsLoading(false)
+      }
+    },
+    [libDirsLoading, refreshLibDirs],
   )
 
   const handleDisableBehaviorChange = useCallback(async (value) => {
@@ -151,6 +252,18 @@ export default function SettingsView() {
       cancelled = true
     }
   }, [vamDir])
+
+  useEffect(() => {
+    let cancelled = false
+    window.api.hub.isLoggedIn().then((v) => {
+      if (!cancelled) setHubLoggedIn(!!v)
+    })
+    const off = window.api.onHubAuthChanged((data) => setHubLoggedIn(!!data?.loggedIn))
+    return () => {
+      cancelled = true
+      off?.()
+    }
+  }, [])
 
   const handleBrowseDir = useCallback(async () => {
     const result = await window.api.wizard.browseVamDir(vamDir || undefined)
@@ -235,12 +348,6 @@ export default function SettingsView() {
     }
   }, [verifying, hubScanning, fetchStats])
 
-  const handleToggleBlurThumbnails = useCallback(async (checked) => {
-    setBlurThumbnails(checked)
-    document.documentElement.toggleAttribute('data-blur-thumbs', checked)
-    await window.api.settings.set('blur_thumbnails', checked ? '1' : '0')
-  }, [])
-
   const handleToggleHubDebug = useCallback(async (checked) => {
     setHubDebugRequests(checked)
     await window.api.settings.set('hub_debug_requests', checked ? '1' : '0')
@@ -274,6 +381,20 @@ export default function SettingsView() {
     if (!res?.ok && res?.error) toast(`Nuke database failed: ${res.error}`)
   }, [])
 
+  const handleForgetDeleted = useCallback(async () => {
+    const res = await window.api.dev.forgetDeletedData()
+    if (!res?.ok) {
+      toast(`Forget deleted data failed: ${res?.error || 'unknown error'}`)
+      return
+    }
+    setDeletedData({ packages: 0, contentLabels: 0 })
+    const parts = []
+    if (res.packages > 0) parts.push(`${res.packages} deleted package${res.packages === 1 ? '' : 's'}`)
+    if (res.contentLabels > 0)
+      parts.push(`${res.contentLabels} orphaned content label${res.contentLabels === 1 ? '' : 's'}`)
+    toast(parts.length ? `Forgot ${parts.join(' and ')}.` : 'Nothing to forget.')
+  }, [])
+
   const handleSyncBrowserAssist = useCallback(async () => {
     if (baSyncing || !baDirPresent) return
     setBaSyncing(true)
@@ -284,7 +405,7 @@ export default function SettingsView() {
         setBaSyncResult({ error: res?.error || 'Sync failed' })
         return
       }
-      const msg = `BrowserAssist: ${res.labelsImported ?? 0} imported; ${res.labelsExported ?? 0} exported; ${res.labelsRemoved ?? 0} removed. Updated ${res.tagsUpdated} resource(s); wrote ${res.shardsWritten} of ${res.shardsRead} shard(s). ${res.resourcesScanned} row(s) processed; ${res.skippedNoMatch} skipped (no local DB match).`
+      const msg = `BrowserAssist: updated ${res.tagsUpdated} resource(s); wrote ${res.shardsWritten} of ${res.shardsRead} shard(s). ${res.resourcesScanned} row(s) processed; ${res.skippedNoMatch} skipped (no local DB match).`
       if (res.errors?.length) {
         setBaSyncResult({ success: msg, warnings: res.errors })
       } else {
@@ -297,12 +418,72 @@ export default function SettingsView() {
     }
   }, [baSyncing, baDirPresent])
 
+  useEffect(() => {
+    if (!wishlistImporting) return
+    return window.api.onWishlistImportProgress((data) => setWishlistImportProgress(data))
+  }, [wishlistImporting])
+
+  const formatWishlistImportProgress = useCallback((data) => {
+    if (!data) return null
+    if (data.phase === 'collect') {
+      if (data.source === 'bookmarks') {
+        return `Scanning Hub bookmarks (page ${data.page}/${data.pageCount}) — ${data.found} found`
+      }
+      if (data.source === 'favorites') {
+        return `Scanning Hub favorites (collection ${data.collectionId}, page ${data.page}/${data.pageCount}) — ${data.found} found`
+      }
+      return null
+    }
+    if (data.phase === 'import') {
+      return `Fetching resource details (${data.current}/${data.total}) — ${data.added} added, ${data.skipped} already wishlisted`
+    }
+    return null
+  }, [])
+
+  const handleImportHubListToWishlist = useCallback(
+    async (source) => {
+      if (wishlistImporting) return
+      setWishlistImporting(source)
+      setWishlistImportProgress(null)
+      setWishlistImportResult(null)
+      try {
+        // Collect on this machine (Hub webview cookies); persist on the host DB.
+        const collected = await window.api.wishlist.importCollect(source)
+        if (!collected?.ok) {
+          setWishlistImportResult({ error: collected?.error || 'Collect failed' })
+          return
+        }
+        const res = await window.api.wishlist.importPersist({
+          source,
+          resourceIds: collected.resourceIds,
+        })
+        if (!res?.ok) {
+          setWishlistImportResult({ error: res?.error || 'Import failed' })
+          return
+        }
+        const msg = `Wishlist import (${source}): ${res.found} on Hub — ${res.added} added, ${res.skipped} already wishlisted${res.failed ? `, ${res.failed} failed` : ''}.`
+        if (res.failed)
+          setWishlistImportResult({ success: msg, warnings: [`${res.failed} resource(s) could not be fetched`] })
+        else setWishlistImportResult({ success: msg })
+      } catch (err) {
+        setWishlistImportResult({ error: err.message })
+      } finally {
+        setWishlistImporting(null)
+        setWishlistImportProgress(null)
+      }
+    },
+    [wishlistImporting],
+  )
+
   const handleOpenApplicationFolder = useCallback(async () => {
     const dbPath = await window.api.settings.getDatabasePath()
     if (dbPath) window.api.shell.showItemInFolder(dbPath)
   }, [])
 
   const showDevSection = isDev || developerUnlocked
+  // The section can't be hidden while a client/host connection is live — the
+  // toggle then reflects that forced-on state and can't be switched off.
+  const remoteSectionForced = isRemoteClient || !!remoteStatus?.running
 
   const handleAboutVersionTap = useCallback(() => {
     if (isDev || developerUnlocked) return
@@ -327,6 +508,116 @@ export default function SettingsView() {
     await window.api.settings.set('developer_options_unlocked', '0')
     setDeveloperUnlocked(false)
     toast('Developer options disabled', 'success', 2500)
+  }, [])
+
+  useEffect(() => {
+    if (isRemoteClient) return
+    window.api.remote
+      .status()
+      .then((s) => {
+        setRemoteStatus(s)
+        if (s?.port) setServerPort(String(s.port))
+      })
+      .catch(() => {})
+    window.api.remote
+      .localIps()
+      .then(setLocalIps)
+      .catch(() => {})
+    // Live updates when clients connect/disconnect (pushed from the server).
+    return window.api.on('remote:server-status', (s) => setRemoteStatus(s))
+  }, [isRemoteClient])
+
+  const refreshRemoteStatus = useCallback(async () => {
+    try {
+      setRemoteStatus(await window.api.remote.status())
+    } catch {
+      // ignore
+    }
+  }, [])
+
+  const handleStartServer = useCallback(async () => {
+    const portStr = String(parseInt(serverPort, 10) || DEFAULT_REMOTE_PORT)
+    setServerPort(portStr)
+    await window.api.settings.set('remote_serve_port', portStr)
+    const r = await window.api.remote.startServer(parseInt(portStr, 10))
+    if (!r?.ok) {
+      toast(`Could not start server: ${r?.error || 'unknown error'}`, 'error', 4500)
+      return
+    }
+    await refreshRemoteStatus()
+    toast(`Serving on port ${r.port}`, 'success')
+  }, [serverPort, refreshRemoteStatus])
+
+  const handleStopServer = useCallback(async () => {
+    await window.api.remote.stopServer()
+    await refreshRemoteStatus()
+    toast('Server stopped', 'success')
+  }, [refreshRemoteStatus])
+
+  const handleToggleServeOnLaunch = useCallback(async (checked) => {
+    setServeOnLaunch(checked)
+    await window.api.settings.set('remote_serve_on_launch', checked ? '1' : '0')
+  }, [])
+
+  const handleToggleRemoteEnabled = useCallback(
+    async (checked) => {
+      setRemoteEnabled(checked)
+      await window.api.settings.set('remote_mode_enabled', checked ? '1' : '0')
+      // Hiding the section must not leave the feature silently active behind it:
+      // clear auto-start and stop any running server so there's nothing the user
+      // can't see or reach.
+      if (!checked) {
+        if (serveOnLaunch) {
+          setServeOnLaunch(false)
+          await window.api.settings.set('remote_serve_on_launch', '0')
+        }
+        if (remoteStatus?.running) {
+          await window.api.remote.stopServer()
+          await refreshRemoteStatus()
+        }
+      }
+    },
+    [serveOnLaunch, remoteStatus, refreshRemoteStatus],
+  )
+
+  const handleConnect = useCallback(async () => {
+    const trimmed = connectUrl.trim()
+    if (!trimmed) return
+    setConnectUrl(trimmed)
+    await window.api.settings.set('remote_connect_url', trimmed)
+    const url = normalizeConnectUrl(trimmed)
+    if (!url) return
+    await window.api.remote.connect(url) // relaunches the app into client mode
+  }, [connectUrl])
+
+  const handleDisconnect = useCallback(async () => {
+    await window.api.remote.disconnect() // relaunches back into local mode (also disarms auto-connect)
+  }, [])
+
+  const handleToggleAutoConnect = useCallback(
+    async (checked) => {
+      if (checked) {
+        const trimmed = connectUrl.trim()
+        const url = normalizeConnectUrl(trimmed)
+        if (!url) {
+          toast('Enter a server address first', 'error')
+          return
+        }
+        setConnectUrl(trimmed)
+        await window.api.settings.set('remote_connect_url', trimmed)
+        await window.api.remote.setAutoconnect(url)
+        setAutoConnectArmed(true)
+      } else {
+        await window.api.remote.setAutoconnect(null)
+        setAutoConnectArmed(false)
+      }
+    },
+    [connectUrl],
+  )
+
+  const handleToggleClientAutoConnect = useCallback(async (checked) => {
+    await window.api.remote.setAutoconnect(checked ? window.api.remote.url : null)
+    setAutoConnectArmed(checked)
   }, [])
 
   return (
@@ -376,28 +667,58 @@ export default function SettingsView() {
             {libDirs.aux.length > 0 && (
               <ul className="rounded-lg border border-border divide-y divide-border bg-surface/50">
                 {libDirs.aux.map((d) => (
-                  <li key={d.id} className="flex items-center gap-3 px-3 py-2">
-                    <TruncateWithTooltip
-                      text={d.path}
-                      className="flex-1 min-w-0 text-xs font-mono truncate select-text cursor-text text-text-secondary"
-                    />
-                    <div className="text-[11px] text-text-tertiary tabular-nums whitespace-nowrap shrink-0">
-                      {d.packageCount} pkg · {formatBytes(d.sizeBytes)}
-                    </div>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      onClick={() => handleRemoveAuxDir(d.id)}
-                      disabled={libDirsLoading || d.packageCount > 0}
-                      title={d.packageCount > 0 ? 'Move all packages out before removing' : 'Remove'}
-                      className="shrink-0 text-text-tertiary hover:text-error"
-                    >
-                      <Trash2 size={14} />
-                    </Button>
-                  </li>
+                  <AuxDirRow
+                    key={d.id}
+                    d={d}
+                    vamDir={vamDir}
+                    disabled={libDirsLoading}
+                    showBrowserAssist={baDirPresent}
+                    onRemove={handleRemoveAuxDir}
+                    onToggleBrowserAssist={handleToggleBrowserAssist}
+                  />
                 ))}
               </ul>
             )}
+            {offloadSuggestions
+              .filter((s) => !dismissedOffload.has(s.id))
+              .map((s) => (
+                <div
+                  key={s.id}
+                  className="flex items-center gap-3 px-3 py-2 rounded-lg border border-accent-blue/25 bg-accent-blue/6"
+                >
+                  <Compass size={14} className="text-accent-blue shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs text-text-primary">
+                      Detected <span className="font-medium">{s.label}</span> offload folder
+                      <span className="ml-1.5 text-[11px] text-text-tertiary">
+                        · {s.varCount.toLocaleString()} var{s.varCount === 1 ? '' : 's'}
+                      </span>
+                    </div>
+                    <div className="text-[11px] font-mono text-text-tertiary truncate select-text cursor-text">
+                      {s.path}
+                    </div>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handleAddSuggestion(s)}
+                    disabled={libDirsLoading}
+                    className="shrink-0"
+                  >
+                    Add
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    onClick={() => dismissOffloadSuggestion(s.id)}
+                    disabled={libDirsLoading}
+                    title="Dismiss suggestion"
+                    className="shrink-0 text-text-tertiary hover:text-text-primary"
+                  >
+                    <X size={14} />
+                  </Button>
+                </div>
+              ))}
           </div>
 
           {libDirs.aux.length > 0 && (
@@ -420,10 +741,10 @@ export default function SettingsView() {
                   </SelectValue>
                 </SelectTrigger>
                 <SelectContent className="max-w-[420px]">
-                  <SelectItem value="suffix">VaM native (rename to .var.disabled)</SelectItem>
+                  <SelectItem value="suffix">VaM native (.var.disabled marker)</SelectItem>
                   {libDirs.aux.map((d) => (
                     <SelectItem key={d.id} value={disableBehaviorMoveTo(d.id)} title={d.path}>
-                      <span className="block min-w-0 truncate">Move to {d.path}</span>
+                      <span className="block min-w-0 truncate">Move to {shortenLibraryPath(d.path, vamDir)}</span>
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -535,87 +856,6 @@ export default function SettingsView() {
           </div>
         </Section>
 
-        {/* Hub */}
-        <Section title="Hub" description="Control Hub browsing behavior.">
-          <div className="space-y-2">
-            <div className="flex items-start gap-3">
-              <div className="flex-1 min-w-0">
-                <div className="text-xs text-text-primary font-medium flex items-center gap-1.5">
-                  <EyeOff size={13} className="text-text-tertiary" />
-                  Hidden Hub items
-                </div>
-                <div className="text-[11px] text-text-tertiary mt-0.5">
-                  {hiddenHubItems.length.toLocaleString()} hidden resource{hiddenHubItems.length === 1 ? '' : 's'}.
-                </div>
-              </div>
-              <AlertDialog>
-                <AlertDialogTrigger asChild>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={hiddenHubItems.length === 0}
-                    className="shrink-0 text-xs"
-                  >
-                    <Trash2 size={13} /> Clear
-                  </Button>
-                </AlertDialogTrigger>
-                <AlertDialogContent>
-                  <AlertDialogHeader>
-                    <AlertDialogTitle>Clear hidden Hub items?</AlertDialogTitle>
-                    <AlertDialogDescription>
-                      All hidden Hub resources will show in normal Hub browsing again.
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel>Cancel</AlertDialogCancel>
-                    <AlertDialogAction variant="destructive" onClick={clearHiddenHubItems}>
-                      Clear list
-                    </AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
-            </div>
-            {hiddenHubItems.length > 0 && (
-              <ul className="max-h-48 overflow-y-auto rounded-lg border border-border divide-y divide-border bg-surface/50">
-                {hiddenHubItems.map((item) => (
-                  <li key={item.resource_id} className="flex items-center gap-3 px-3 py-2">
-                    <div className="flex-1 min-w-0">
-                      <div className="text-xs text-text-secondary truncate">{item.title || 'Untitled Hub item'}</div>
-                      <div className="text-[10px] text-text-tertiary font-mono">{item.resource_id}</div>
-                    </div>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => restoreHiddenHubItem(item.resource_id)}
-                      className="shrink-0 text-xs"
-                    >
-                      <Eye size={13} /> Restore
-                    </Button>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-          <label className="flex items-center gap-3 cursor-pointer">
-            <div className="flex-1 min-w-0">
-              <div className="text-xs text-text-primary font-medium">Show infinite-scroll page controls</div>
-              <div className="text-[11px] text-text-tertiary mt-0.5">
-                Show page navigation in the Hub toolbar while using infinite scrolling.
-              </div>
-            </div>
-            <Switch checked={showHubInfinitePager} onCheckedChange={setShowHubInfinitePager} />
-          </label>
-          <label className="flex items-center gap-3 cursor-pointer">
-            <div className="flex-1 min-w-0">
-              <div className="text-xs text-text-primary font-medium">Restore last scrolled page</div>
-              <div className="text-[11px] text-text-tertiary mt-0.5">
-                Reopen Hub infinite scrolling at the page you last reached.
-              </div>
-            </div>
-            <Switch checked={rememberHubInfinitePage} onCheckedChange={setRememberHubInfinitePage} />
-          </label>
-        </Section>
-
         {/* Display */}
         <Section title="Display" description="Control how library content appears.">
           <div className="space-y-3">
@@ -679,7 +919,7 @@ export default function SettingsView() {
                   Apply a blur to all package and content thumbnail images to keep it SFW.
                 </div>
               </div>
-              <Switch checked={blurThumbnails} onCheckedChange={handleToggleBlurThumbnails} />
+              <Switch checked={blurThumbnails} onCheckedChange={setBlurThumbnails} />
             </label>
             <label className="flex items-center gap-3 cursor-pointer">
               <div className="flex-1 min-w-0">
@@ -701,14 +941,278 @@ export default function SettingsView() {
               </div>
               <Switch checked={suppressDisablePackageWarning} onCheckedChange={setSuppressDisablePackageWarning} />
             </label>
+            <label
+              className="flex items-center gap-3 cursor-pointer"
+              title={remoteSectionForced ? "Can't be hidden while a client/host connection is active." : undefined}
+            >
+              <div className="flex-1 min-w-0">
+                <div className="text-xs text-text-primary font-medium">Client-server mode</div>
+                <div className="text-[11px] text-text-tertiary mt-0.5">
+                  Show the network options for using one library from several devices. Leave off if you only run this
+                  app on a single PC.
+                </div>
+              </div>
+              <Switch
+                checked={remoteEnabled || remoteSectionForced}
+                disabled={remoteSectionForced}
+                onCheckedChange={handleToggleRemoteEnabled}
+              />
+            </label>
           </div>
         </Section>
+
+        {(hubLoggedIn || baDirPresent) && (
+          <Section
+            title="Experimental"
+            icon={FlaskConical}
+            description="Early features that may change or be removed. Feedback welcome."
+          >
+            <div className="space-y-4">
+              {hubLoggedIn && (
+                <div className="space-y-3">
+                  <div>
+                    <div className="text-xs text-text-primary font-medium">Import Hub lists to wishlist</div>
+                    <div className="text-[11px] text-text-tertiary mt-0.5">
+                      Reads your Hub favorites or bookmarks and adds them to the local wishlist. Already-wishlisted
+                      items are skipped.
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        variant="outline"
+                        size="lg"
+                        onClick={() => void handleImportHubListToWishlist('favorites')}
+                        disabled={!!wishlistImporting}
+                        className="shrink-0 gap-2 text-xs"
+                      >
+                        {wishlistImporting === 'favorites' ? (
+                          <Loader2 size={14} className="animate-spin shrink-0" />
+                        ) : (
+                          <Heart size={14} className="shrink-0" />
+                        )}
+                        {wishlistImporting === 'favorites' ? 'Importing favorites…' : 'Import favorites to wishlist'}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="lg"
+                        onClick={() => void handleImportHubListToWishlist('bookmarks')}
+                        disabled={!!wishlistImporting}
+                        className="shrink-0 gap-2 text-xs"
+                      >
+                        {wishlistImporting === 'bookmarks' ? (
+                          <Loader2 size={14} className="animate-spin shrink-0" />
+                        ) : (
+                          <Bookmark size={14} className="shrink-0" />
+                        )}
+                        {wishlistImporting === 'bookmarks' ? 'Importing bookmarks…' : 'Import bookmarks to wishlist'}
+                      </Button>
+                    </div>
+                    {wishlistImportProgress && wishlistImporting && (
+                      <div className="text-[11px] text-text-tertiary select-text cursor-text">
+                        {formatWishlistImportProgress(wishlistImportProgress)}
+                      </div>
+                    )}
+                    <ResultBanner result={wishlistImportResult} />
+                  </div>
+                </div>
+              )}
+
+              {baDirPresent && (
+                <div className={`space-y-3 ${hubLoggedIn ? 'border-t border-border pt-4' : ''}`}>
+                  <div>
+                    <div className="text-xs text-text-primary font-medium">Sync with BrowserAssist</div>
+                    <div className="text-[11px] text-text-tertiary mt-0.5">
+                      Write User tags (scene-real / scene-look / scene-other) plus user-defined Labels into JayJayWon
+                      BrowserAssist settings — package Labels onto package rows, and content Labels (own + inherited
+                      from package) onto matching resources in this app&apos;s library.
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    <Button
+                      variant="outline"
+                      size="lg"
+                      onClick={handleSyncBrowserAssist}
+                      disabled={baSyncing}
+                      className="shrink-0 gap-2 text-xs"
+                    >
+                      {baSyncing ? (
+                        <Loader2 size={14} className="animate-spin shrink-0" />
+                      ) : (
+                        <RefreshCw size={14} className="shrink-0" />
+                      )}
+                      {baSyncing ? 'Syncing…' : 'Sync with BrowserAssist'}
+                    </Button>
+                    <ResultBanner result={baSyncResult} />
+                  </div>
+                </div>
+              )}
+            </div>
+          </Section>
+        )}
+
+        {(remoteEnabled || remoteSectionForced) && (
+          <Section
+            title="Client-server mode"
+            icon={Network}
+            description="Use one library from several devices. Run this app on the PC that stores your library (the host), then point another device on the same network at it to browse and manage that library remotely."
+          >
+            {isRemoteClient ? (
+              <div className="space-y-4">
+                <div className="flex items-start gap-3">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs text-text-primary font-medium flex items-center gap-1.5">
+                      <PlugZap size={14} className="text-accent-blue shrink-0" />
+                      Running as remote client
+                    </div>
+                    <div className="text-[11px] text-text-tertiary mt-0.5 select-text cursor-text font-mono break-all">
+                      {window.api.remote.url}
+                    </div>
+                  </div>
+                  <Button variant="outline" size="lg" onClick={handleDisconnect} className="shrink-0 text-xs">
+                    <Plug size={14} /> Disconnect
+                  </Button>
+                </div>
+                <label className="flex items-center gap-3 cursor-pointer border-t border-border pt-4">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs text-text-primary font-medium">Reconnect on launch</div>
+                    <div className="text-[11px] text-text-tertiary mt-0.5">
+                      Connect to this host automatically each time the app starts. Disconnecting turns this off.
+                    </div>
+                  </div>
+                  <Switch checked={autoConnectArmed} onCheckedChange={handleToggleClientAutoConnect} />
+                </label>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {!remoteWarningDismissed && (
+                  <div className="flex items-start gap-2 p-2.5 rounded-lg text-[11px] bg-warning/10 border border-warning/20 text-warning">
+                    <AlertTriangle size={13} className="shrink-0 mt-0.5" />
+                    <span className="flex-1 min-w-0">
+                      No login, encryption, or access control — anyone who can reach the host can view and change its
+                      library. Only use this on a network you trust.
+                    </span>
+                    <button
+                      type="button"
+                      onClick={dismissRemoteWarning}
+                      title="Dismiss"
+                      className="shrink-0 -mt-0.5 -mr-0.5 text-warning/60 hover:text-warning cursor-pointer"
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
+                )}
+                <div className="flex items-end gap-2">
+                  <div className="flex-1 min-w-0" title={HOST_SERVE_TOOLTIP}>
+                    <div className="text-xs text-text-primary font-medium flex items-center gap-1.5">
+                      <Network size={14} className="text-text-tertiary shrink-0" />
+                      Host this library
+                    </div>
+                    <div className="text-[11px] text-text-tertiary mt-0.5">
+                      {remoteStatus?.running ? (
+                        <>
+                          Reachable at{' '}
+                          <span
+                            className="select-text cursor-text"
+                            title={getLocalReachabilityTooltip(localIps, remoteStatus.port)}
+                          >
+                            <span className="font-mono text-text-secondary">
+                              {localIps.primary || 'this-pc'}
+                              {remoteStatus.port === DEFAULT_REMOTE_PORT ? '' : `:${remoteStatus.port}`}
+                            </span>
+                            {localIps.all.length > 1 && ` (+${localIps.all.length - 1} more)`}
+                          </span>{' '}
+                          · {remoteStatus.clients} client{remoteStatus.clients === 1 ? '' : 's'} connected
+                        </>
+                      ) : (
+                        'Run this on the PC that holds your library so other devices can connect to it.'
+                      )}
+                    </div>
+                  </div>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={serverPort}
+                    onChange={(e) => setServerPort(e.target.value.replace(/[^\d]/g, ''))}
+                    disabled={remoteStatus?.running}
+                    placeholder={String(DEFAULT_REMOTE_PORT)}
+                    title={`Network port other devices connect to (default ${DEFAULT_REMOTE_PORT}).`}
+                    className="w-20 h-9 bg-elevated border border-border rounded-lg px-2.5 text-xs text-text-secondary font-mono disabled:opacity-50"
+                  />
+                  {remoteStatus?.running ? (
+                    <Button variant="outline" size="lg" onClick={handleStopServer} className="shrink-0 text-xs">
+                      Stop
+                    </Button>
+                  ) : (
+                    <Button variant="outline" size="lg" onClick={handleStartServer} className="shrink-0 text-xs">
+                      Start
+                    </Button>
+                  )}
+                </div>
+
+                <label className="flex items-center gap-3 cursor-pointer" title={HOST_SERVE_TOOLTIP}>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs text-text-primary font-medium">Start server on launch</div>
+                    <div className="text-[11px] text-text-tertiary mt-0.5">
+                      Automatically start hosting on the port above each time you open VaM Backstage.
+                    </div>
+                  </div>
+                  <Switch checked={serveOnLaunch} onCheckedChange={handleToggleServeOnLaunch} />
+                </label>
+
+                <div className="flex items-end gap-2 border-t border-border pt-4">
+                  <div
+                    className="flex-1 min-w-0"
+                    title="To launch straight into client mode, start with --connect=<host> (or set VAM_CONNECT)."
+                  >
+                    <div className="text-xs text-text-primary font-medium flex items-center gap-1.5">
+                      <PlugZap size={14} className="text-text-tertiary shrink-0" />
+                      Connect to a host
+                    </div>
+                    <div className="text-[11px] text-text-tertiary mt-0.5">
+                      From another device, enter the host&apos;s address (e.g. its IP, like 192.168.1.5) to use its
+                      library here. The app relaunches as a client.
+                    </div>
+                  </div>
+                  <input
+                    type="text"
+                    value={connectUrl}
+                    onChange={(e) => setConnectUrl(e.target.value)}
+                    placeholder="192.168.1.5"
+                    className="w-44 h-9 bg-elevated border border-border rounded-lg px-2.5 text-xs text-text-secondary font-mono"
+                  />
+                  <Button
+                    variant="outline"
+                    size="lg"
+                    onClick={handleConnect}
+                    disabled={!connectUrl.trim()}
+                    className="shrink-0 text-xs"
+                  >
+                    <Plug size={14} /> Connect
+                  </Button>
+                </div>
+
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs text-text-primary font-medium">Connect on launch</div>
+                    <div className="text-[11px] text-text-tertiary mt-0.5">
+                      Start as a client pointed at the address above every time the app opens. Disconnecting from the
+                      connection screen turns this off.
+                    </div>
+                  </div>
+                  <Switch checked={autoConnectArmed} onCheckedChange={handleToggleAutoConnect} />
+                </label>
+              </div>
+            )}
+          </Section>
+        )}
 
         {showDevSection && (
           <Section
             title="Developer"
+            icon={Wrench}
             danger
-            description="Debug logging, BrowserAssist sync, and database tools. In release builds, tap the app version below seven times to show this section."
+            description="Debug logging and database tools. In release builds, tap the app version below seven times to show this section."
           >
             <div className="space-y-4">
               {developerUnlocked && !isDev && (
@@ -768,60 +1272,51 @@ export default function SettingsView() {
 
               <div className="border-t border-border pt-4 space-y-3">
                 <div>
-                  <div className="text-xs text-text-primary font-medium">Sync with BrowserAssist</div>
-                  <div className="text-[11px] text-text-tertiary mt-0.5">
-                    Sync Backstage Labels with BrowserAssist user tags. Hub tags and non-user BrowserAssist categories
-                    are not changed.
-                  </div>
+                  <AlertDialog>
+                    <AlertDialogTrigger asChild>
+                      <Button
+                        variant="outline"
+                        size="lg"
+                        disabled={deletedData.packages === 0 && deletedData.contentLabels === 0}
+                        className="shrink-0 gap-2 text-xs"
+                      >
+                        <Trash2 size={14} className="shrink-0" />
+                        Forget deleted data{deletedData.packages > 0 ? ` (${deletedData.packages})` : ''}
+                      </Button>
+                    </AlertDialogTrigger>
+                    <AlertDialogContent>
+                      <AlertDialogHeader>
+                        <AlertDialogTitle className="select-text cursor-text">Forget deleted data?</AlertDialogTitle>
+                        <AlertDialogDescription asChild>
+                          <div className="text-[11px] text-text-tertiary space-y-2">
+                            <p>
+                              The app keeps the identity and settings (hub link, labels, type override, content
+                              visibility) of {deletedData.packages} package{deletedData.packages === 1 ? '' : 's'} whose
+                              file{deletedData.packages === 1 ? ' is' : 's are'} no longer on disk, so they are restored
+                              if the file reappears (moved back, restored from a backup, or a remounted drive)
+                              {deletedData.contentLabels > 0
+                                ? `, plus ${deletedData.contentLabels} label${deletedData.contentLabels === 1 ? '' : 's'} on content that a package update has since removed`
+                                : ''}
+                              .
+                            </p>
+                            <p>
+                              This permanently discards that remembered data to reclaim database space. Packages and
+                              content still on disk are not affected.
+                            </p>
+                            <p className="font-medium text-warning">This cannot be undone.</p>
+                          </div>
+                        </AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter>
+                        <AlertDialogCancel>Cancel</AlertDialogCancel>
+                        <AlertDialogAction variant="destructive" onClick={handleForgetDeleted}>
+                          Forget
+                        </AlertDialogAction>
+                      </AlertDialogFooter>
+                    </AlertDialogContent>
+                  </AlertDialog>
                 </div>
-                <Button
-                  variant="outline"
-                  size="lg"
-                  onClick={handleSyncBrowserAssist}
-                  disabled={baSyncing || !baDirPresent}
-                  className="shrink-0 gap-2 text-xs"
-                >
-                  {baSyncing ? (
-                    <Loader2 size={14} className="animate-spin shrink-0" />
-                  ) : (
-                    <RefreshCw size={14} className="shrink-0" />
-                  )}
-                  {baSyncing ? 'Syncing…' : 'Sync labels'}
-                </Button>
-                {baSyncResult && (
-                  <div
-                    className={`flex items-start gap-2 p-3 rounded-lg text-xs ${
-                      baSyncResult.error
-                        ? 'bg-error/10 border border-error/20 text-error'
-                        : baSyncResult.warnings?.length
-                          ? 'bg-warning/10 border border-warning/20 text-warning'
-                          : 'bg-success/10 border border-success/20 text-success'
-                    }`}
-                  >
-                    {baSyncResult.error ? (
-                      <AlertTriangle size={14} className="shrink-0 mt-0.5" />
-                    ) : baSyncResult.warnings?.length ? (
-                      <AlertTriangle size={14} className="shrink-0 mt-0.5" />
-                    ) : (
-                      <CheckCircle size={14} className="shrink-0 mt-0.5" />
-                    )}
-                    <div className="min-w-0 space-y-1.5">
-                      <span className="select-text cursor-text">{baSyncResult.error || baSyncResult.success}</span>
-                      {baSyncResult.warnings?.length > 0 && (
-                        <ul className="mt-1 space-y-0.5 text-[11px] opacity-90">
-                          {baSyncResult.warnings.map((w, i) => (
-                            <li key={`${i}:${w}`} className="select-text cursor-text">
-                              · {w}
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                    </div>
-                  </div>
-                )}
-              </div>
 
-              <div className="border-t border-border pt-4">
                 <AlertDialog>
                   <AlertDialogTrigger asChild>
                     <Button
@@ -876,7 +1371,7 @@ export default function SettingsView() {
   )
 }
 
-function Section({ title, description, danger, children }) {
+function Section({ title, description, danger, icon: Icon, children }) {
   return (
     <div className="rounded-xl border border-border bg-surface overflow-hidden">
       {danger && (
@@ -891,13 +1386,174 @@ function Section({ title, description, danger, children }) {
       )}
       <div className="p-4 space-y-3">
         <div>
-          <h2 className="text-sm font-medium text-text-primary">{title}</h2>
-          {description && <p className="text-[11px] mt-0.5 text-text-tertiary">{description}</p>}
+          <h2 className="text-[15px] font-semibold tracking-tight text-text-primary flex items-center gap-2">
+            {Icon && <Icon size={16} className="text-text-tertiary shrink-0" />}
+            {title}
+          </h2>
+          {description && <p className="text-[11px] mt-1 text-text-tertiary">{description}</p>}
         </div>
         {children}
       </div>
     </div>
   )
+}
+
+/** Result callout with error / warning / success tones plus an optional list of warnings. */
+function ResultBanner({ result }) {
+  if (!result) return null
+  const hasWarnings = result.warnings?.length > 0
+  const tone = result.error
+    ? 'bg-error/10 border border-error/20 text-error'
+    : hasWarnings
+      ? 'bg-warning/10 border border-warning/20 text-warning'
+      : 'bg-success/10 border border-success/20 text-success'
+  const Icon = result.error || hasWarnings ? AlertTriangle : CheckCircle
+  return (
+    <div className={`flex items-start gap-2 p-3 rounded-lg text-xs ${tone}`}>
+      <Icon size={14} className="shrink-0 mt-0.5" />
+      <div className="min-w-0 space-y-1.5">
+        <span className="select-text cursor-text">{result.error || result.success}</span>
+        {hasWarnings && (
+          <ul className="mt-1 space-y-0.5 text-[11px] opacity-90">
+            {result.warnings.map((w, i) => (
+              <li key={`${i}:${w}`} className="select-text cursor-text">
+                · {w}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * A registered offload directory row. When the dir is empty, the trash button
+ * removes it directly. When it still holds packages, the trash button opens a
+ * warning dialog that spells out what "un-registering" forgets before removing.
+ */
+function AuxDirRow({ d, vamDir, disabled, showBrowserAssist, onRemove, onToggleBrowserAssist }) {
+  const hasPackages = d.packageCount > 0
+  // Only surface the BrowserAssist toggle to users who actually run BrowserAssist
+  // (its data dir was detected). Still show it when the dir already has the mode on,
+  // so a stray enabled flag can always be turned back off even if detection fails.
+  const canBrowserAssist = showBrowserAssist || !!d.browserAssist
+  return (
+    <li className="px-3 py-2 space-y-2">
+      <div className="flex items-center gap-3">
+        <TruncateWithTooltip
+          text={d.path}
+          className="flex-1 min-w-0 text-xs font-mono truncate select-text cursor-text text-text-secondary"
+        >
+          {shortenLibraryPath(d.path, vamDir)}
+        </TruncateWithTooltip>
+        <div className="text-[11px] text-text-tertiary tabular-nums whitespace-nowrap shrink-0">
+          {d.packageCount} pkg · {formatBytes(d.sizeBytes)}
+        </div>
+        {hasPackages ? (
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                disabled={disabled}
+                title="Remove (stops tracking these packages)"
+                className="shrink-0 text-text-tertiary hover:text-error"
+              >
+                <Trash2 size={14} />
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle className="select-text cursor-text">
+                  Stop tracking this offload directory?
+                </AlertDialogTitle>
+                <AlertDialogDescription asChild>
+                  <div className="text-[13px] leading-relaxed text-text-secondary space-y-2.5">
+                    <p>
+                      <span className="font-mono text-text-primary select-text cursor-text">
+                        {shortenLibraryPath(d.path, vamDir)}
+                      </span>{' '}
+                      currently holds{' '}
+                      <span className="font-medium text-text-primary">
+                        {d.packageCount.toLocaleString()} package{d.packageCount === 1 ? '' : 's'}
+                      </span>
+                      . Removing it un-registers the folder and hides those packages from Backstage.
+                    </p>
+                    <p>
+                      <span className="font-medium text-success">No files are deleted</span> — every{' '}
+                      <span className="font-mono">.var</span> stays where it is on disk, and VaM&apos;s own state for
+                      those packages (including the <span className="font-medium">favorite</span> and{' '}
+                      <span className="font-medium">hidden</span> status of their content) is untouched.
+                    </p>
+                    <p>
+                      <span className="font-medium text-success">Your Backstage data is kept</span> — the labels and
+                      category overrides you set are remembered, and re-adding the folder later restores them along with
+                      the packages.
+                    </p>
+                  </div>
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction variant="destructive" onClick={() => onRemove(d.id, { force: true })}>
+                  Remove folder
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        ) : (
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={() => onRemove(d.id)}
+            disabled={disabled}
+            title="Remove"
+            className="shrink-0 text-text-tertiary hover:text-error"
+          >
+            <Trash2 size={14} />
+          </Button>
+        )}
+      </div>
+      {canBrowserAssist && (
+        <label className="flex items-center gap-2 cursor-pointer w-fit" title={BROWSER_ASSIST_MODE_HINT}>
+          <Switch
+            size="sm"
+            checked={!!d.browserAssist}
+            onCheckedChange={(v) => onToggleBrowserAssist(d.id, v)}
+            disabled={disabled}
+          />
+          <span className="text-[11px] text-text-tertiary">
+            BrowserAssist mode <span className="text-text-tertiary/70">· write .var.json sidecars</span>
+          </span>
+        </label>
+      )}
+    </li>
+  )
+}
+
+const BROWSER_ASSIST_MODE_HINT =
+  'When offloading a package into this folder, also write a JayJayWon BrowserAssist ' +
+  '.var.json sidecar recording its original AddonPackages folder — so BrowserAssist can ' +
+  'restore packages you offloaded, and Backstage can restore packages BrowserAssist offloaded.'
+
+/**
+ * Show an offload path that lives inside the VaM dir as `<VaM base dir name>/<relative>`
+ * for brevity while keeping context (e.g. `VaM/AllPackages`). Paths outside the VaM
+ * dir are returned unchanged.
+ */
+function shortenLibraryPath(path, vamDir) {
+  if (!path || !vamDir) return path
+  const strip = (p) => p.replace(/[\\/]+$/, '')
+  const v = strip(vamDir)
+  const p = strip(path)
+  if (p === v) return path
+  if (p.startsWith(v + '/') || p.startsWith(v + '\\')) {
+    const rel = p.slice(v.length + 1).replace(/\\/g, '/')
+    const base = v.split(/[\\/]/).pop() || v
+    return base + '/' + rel
+  }
+  return path
 }
 
 function getDisableBehaviorLabel(value, auxDirs) {
@@ -910,9 +1566,17 @@ function getDisableBehaviorLabel(value, auxDirs) {
   return `Move to ${basename}`
 }
 
+const HOST_SERVE_TOOLTIP =
+  'Runs the normal app and hosts at the same time. For a headless server with no window, launch with --serve (or set VAM_SERVE).'
+
+function getLocalReachabilityTooltip(localIps, port) {
+  if (localIps.all.length <= 1) return undefined
+  return `Enter one of these on the other device:\n${localIps.all.map((a) => `${a.address}:${port} (${a.name})`).join('\n')}`
+}
+
 function getDisableBehaviorTooltip(value, auxDirs) {
   const parsed = parseDisableBehavior(value)
-  if (parsed.kind === 'suffix') return 'VaM native disable (rename to .var.disabled)'
+  if (parsed.kind === 'suffix') return 'VaM native disable (empty .var.disabled marker beside the package)'
   const dir = auxDirs.find((d) => d.id === parsed.auxDirId)
   return dir ? `Move to ${dir.path}` : undefined
 }

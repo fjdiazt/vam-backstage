@@ -1,9 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { join } from 'path'
-import { mkdir } from 'fs/promises'
+import { mkdir, writeFile } from 'fs/promises'
 import { mkTempVamDir, openTestDatabase } from '../../test/fixtures/index.js'
-import { closeDatabase, setSetting } from './db.js'
-import { validateNewAuxDirPath, refreshLibraryDirs } from './library-dirs.js'
+import { closeDatabase, setSetting, insertLibraryDir, setLibraryDirBrowserAssist, getLibraryDir } from './db.js'
+import {
+  validateNewAuxDirPath,
+  refreshLibraryDirs,
+  pkgVarPath,
+  resolveContentPath,
+  libraryRelSubpath,
+  isBrowserAssistLibraryDir,
+} from './library-dirs.js'
 import { ADDON_PACKAGES_FILE_PREFS } from '@shared/paths.js'
 
 // Domain separation: an offload (aux) library dir may live anywhere *except*
@@ -81,5 +88,127 @@ describe('validateNewAuxDirPath — domain separation from monitored content dir
     const dir = join(tmp.addonPackages, 'Nested')
     await mkdir(dir, { recursive: true })
     expect(await validateNewAuxDirPath(dir)).toMatch(/main AddonPackages/)
+  })
+})
+
+// A `.var` may live in a subfolder of its library dir. `libraryRelSubpath`
+// derives the stored subpath from a discovered on-disk path; `pkgVarPath`
+// joins it back so nested packages resolve for every reader/writer/deleter.
+describe('libraryRelSubpath', () => {
+  const root = join('/lib', 'AddonPackages')
+
+  it('returns empty string for a file at the library root', () => {
+    expect(libraryRelSubpath(root, join(root, 'Author.Pkg.1.var'))).toBe('')
+  })
+
+  it('returns the single parent folder for a one-level-deep file', () => {
+    expect(libraryRelSubpath(root, join(root, 'Author', 'Author.Pkg.1.var'))).toBe('Author')
+  })
+
+  it('returns a POSIX-joined path for a deeply nested file', () => {
+    expect(libraryRelSubpath(root, join(root, 'Author', 'Scenes', 'Author.Pkg.1.var'))).toBe('Author/Scenes')
+  })
+
+  it('falls back to empty string when the file is not under the library dir', () => {
+    expect(libraryRelSubpath(root, join('/elsewhere', 'Author.Pkg.1.var'))).toBe('')
+    expect(libraryRelSubpath('', join(root, 'Author.Pkg.1.var'))).toBe('')
+  })
+})
+
+describe('pkgVarPath — nominal subpath resolution', () => {
+  it('joins subpath for an enabled package in main', () => {
+    const pkg = {
+      filename: 'Author.Pkg.1.var',
+      storage_state: 'enabled',
+      library_dir_id: null,
+      subpath: 'Author/Scenes',
+    }
+    expect(pkgVarPath(pkg)).toBe(join(tmp.addonPackages, 'Author', 'Scenes', 'Author.Pkg.1.var'))
+  })
+
+  it('is always the bare canonical name, even for a disabled package', () => {
+    const pkg = {
+      filename: 'Author.Pkg.1.var',
+      storage_state: 'disabled',
+      library_dir_id: null,
+      subpath: 'Author',
+    }
+    expect(pkgVarPath(pkg)).toBe(join(tmp.addonPackages, 'Author', 'Author.Pkg.1.var'))
+  })
+
+  it('resolves nested subpath inside an aux/offload dir', () => {
+    const auxPath = join(tmp.vamDir, '..', 'auxlib')
+    const auxId = insertLibraryDir(auxPath)
+    refreshLibraryDirs()
+    const pkg = { filename: 'Author.Pkg.1.var', storage_state: 'offloaded', library_dir_id: auxId, subpath: 'Sub' }
+    expect(pkgVarPath(pkg)).toBe(join(auxPath, 'Sub', 'Author.Pkg.1.var'))
+  })
+
+  it('still works for a root-level package (empty subpath)', () => {
+    const pkg = { filename: 'Author.Pkg.1.var', storage_state: 'enabled', library_dir_id: null, subpath: '' }
+    expect(pkgVarPath(pkg)).toBe(join(tmp.addonPackages, 'Author.Pkg.1.var'))
+  })
+})
+
+describe('isBrowserAssistLibraryDir', () => {
+  it('returns false for main (null) and for aux dirs with the flag off', () => {
+    expect(isBrowserAssistLibraryDir(null)).toBe(false)
+    const auxId = insertLibraryDir(join(tmp.vamDir, 'Offload'))
+    refreshLibraryDirs()
+    expect(isBrowserAssistLibraryDir(auxId)).toBe(false)
+  })
+
+  it('returns true after BrowserAssist mode is enabled on an aux dir', () => {
+    const auxId = insertLibraryDir(join(tmp.vamDir, 'Offload'))
+    setLibraryDirBrowserAssist(auxId, true)
+    refreshLibraryDirs()
+    expect(isBrowserAssistLibraryDir(auxId)).toBe(true)
+    expect(!!getLibraryDir(auxId).browser_assist).toBe(true)
+  })
+})
+
+// resolveContentPath reads the disk for disabled rows, so where the bytes
+// physically live (bare marker layout vs legacy `.var.disabled` suffix) is
+// re-derived on demand rather than cached in the DB.
+describe('resolveContentPath — physical byte location from disk', () => {
+  it('returns the nominal bare path for an enabled package (no disk probe needed)', async () => {
+    const dir = join(tmp.addonPackages, 'Author')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'Author.Pkg.1.var'), 'content')
+    const pkg = { filename: 'Author.Pkg.1.var', storage_state: 'enabled', library_dir_id: null, subpath: 'Author' }
+    expect(await resolveContentPath(pkg)).toBe(join(dir, 'Author.Pkg.1.var'))
+  })
+
+  it('returns the bare path for a marker-disabled package (bytes in the bare .var)', async () => {
+    const dir = join(tmp.addonPackages, 'Author')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'Author.Pkg.1.var'), 'content')
+    await writeFile(join(dir, 'Author.Pkg.1.var.disabled'), '') // empty marker
+    const pkg = { filename: 'Author.Pkg.1.var', storage_state: 'disabled', library_dir_id: null, subpath: 'Author' }
+    expect(await resolveContentPath(pkg)).toBe(join(dir, 'Author.Pkg.1.var'))
+  })
+
+  it('returns the .var.disabled path for a legacy suffix-disabled package (bytes in the suffix)', async () => {
+    const dir = join(tmp.addonPackages, 'Author')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'Author.Pkg.1.var.disabled'), 'content') // no bare sibling
+    const pkg = { filename: 'Author.Pkg.1.var', storage_state: 'disabled', library_dir_id: null, subpath: 'Author' }
+    expect(await resolveContentPath(pkg)).toBe(join(dir, 'Author.Pkg.1.var.disabled'))
+  })
+
+  it('returns the .DISABLED path for a Qvaro-disabled package (bytes in the rename)', async () => {
+    const dir = join(tmp.addonPackages, 'Author')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'Author.Pkg.1.DISABLED'), 'content') // Qvaro rename, no bare sibling
+    const pkg = { filename: 'Author.Pkg.1.var', storage_state: 'disabled', library_dir_id: null, subpath: 'Author' }
+    expect(await resolveContentPath(pkg)).toBe(join(dir, 'Author.Pkg.1.DISABLED'))
+  })
+
+  it('returns the nominal aux path for an offloaded package without probing disk', async () => {
+    const auxPath = join(tmp.vamDir, '..', 'auxlib')
+    const auxId = insertLibraryDir(auxPath)
+    refreshLibraryDirs()
+    const pkg = { filename: 'Author.Pkg.1.var', storage_state: 'offloaded', library_dir_id: auxId, subpath: 'Sub' }
+    expect(await resolveContentPath(pkg)).toBe(join(auxPath, 'Sub', 'Author.Pkg.1.var'))
   })
 })

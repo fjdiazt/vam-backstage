@@ -1,24 +1,75 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import { Search, X, ChevronDown, ChevronRight, Check, Tag, Hash, User } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { Search, X, ChevronDown, ChevronRight, Check } from 'lucide-react'
 import { usePersistedPanelWidth } from '@/hooks/usePersistedPanelWidth'
 import ResizeHandle from './ResizeHandle'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Button } from '@/components/ui/button'
-import { Switch } from '@/components/ui/switch'
-import { LabelChip } from '@/components/labels/LabelChip'
-import { LabelManageMenu } from '@/components/labels/LabelManageMenu'
-import { useLabelRename } from '@/components/labels/useLabelRename'
-import { labelColor } from '@/lib/labels'
+import { TextAutocomplete } from './filter-panel/TextAutocomplete'
+import { TagsAutocomplete } from './filter-panel/TagsAutocomplete'
+import { LabelsAutocomplete } from './filter-panel/LabelsAutocomplete'
+import { AuthorAutocomplete } from './filter-panel/AuthorAutocomplete'
+import { SmartSearchBar } from './filter-panel/SmartSearchBar'
+
+/** Structural equality for the value shapes a section can hold — primitives, a `Set`
+ *  (type multi-select), or a polarity/id array. Only used to decide whether a section
+ *  deviates from its declared default, so it stays intentionally shallow. */
+function sameFilterValue(a, b) {
+  if (a === b) return true
+  if (a instanceof Set) {
+    const other = b instanceof Set ? b : new Set(b)
+    if (a.size !== other.size) return false
+    for (const v of a) if (!other.has(v)) return false
+    return true
+  }
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) {
+      const x = a[i]
+      const y = b[i]
+      if (x === y) continue
+      // Polarity list entries: { value, negate }
+      if (x && y && typeof x === 'object' && typeof y === 'object' && x.value === y.value && !!x.negate === !!y.negate)
+        continue
+      return false
+    }
+    return true
+  }
+  return false
+}
+
+/**
+ * Whether a section deviates from the default the app ships with. The indicator is
+ * deliberately mechanical ("differs from default"), never a judgement of how
+ * "destructive" a value is — that keeps it consistent across every control.
+ *
+ * Opt-in by config: a section participates only if it declares a `default` (or an
+ * explicit `active` boolean). Sort sections omit both, so they never light up and
+ * never count toward the "N filters" tally — they reorder, they don't hide content.
+ * Returns `null` for non-participating sections.
+ */
+export function sectionActive(section) {
+  if (typeof section.active === 'boolean') return section.active
+  if (!('default' in section)) return null
+  if (!sameFilterValue(section.value, section.default)) return true
+  // Author folds its exclude chips into the same section as the include value.
+  if (Array.isArray(section.excluded) && section.excluded.length > 0) return true
+  return false
+}
 
 export default function FilterPanel({
   search,
   onSearchChange,
+  /** When set, the top search box becomes a sigil-aware smart bar (`@`/`#`/`%` + `-`/`!`). */
+  smartSearch = null,
   sections = [],
   defaultWidth = 220,
   minWidth = 160,
   maxWidth = 340,
+  /** Render the panel in place but inert (e.g. hub wishlist mode has no filters yet). */
+  disabled = false,
 }) {
+  const activeFlags = sections.map(sectionActive)
   const [width, setWidth] = usePersistedPanelWidth('panel_width_filters', {
     min: minWidth,
     max: maxWidth,
@@ -35,675 +86,206 @@ export default function FilterPanel({
   )
 
   return (
-    <div className="flex shrink-0" style={{ width }}>
-      <div className="flex-1 min-w-0 bg-surface border-r border-border flex flex-col overflow-y-auto">
-        {/* Search */}
-        <div className="p-3 pb-2">
-          <div className="relative">
-            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-tertiary z-10" />
-            <Input
-              type="text"
-              placeholder="Search…"
-              value={search}
-              onChange={(e) => onSearchChange(e.target.value)}
-              className="h-8 bg-elevated pl-8 pr-7 text-xs"
-            />
-            {search && (
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                onClick={() => onSearchChange('')}
-                className="absolute right-1 top-1/2 -translate-y-1/2 text-text-tertiary hover:text-text-secondary"
-              >
-                <X size={12} />
-              </Button>
+    <div className="flex shrink-0" style={{ width }} aria-hidden={disabled}>
+      <div
+        className={`flex-1 min-w-0 min-h-0 bg-surface border-r border-border flex flex-col ${disabled ? 'opacity-40 pointer-events-none select-none' : ''}`}
+      >
+        <div className="flex-1 min-h-0 overflow-y-auto">
+          {/* Search — no section title; bar hugs the edit box only (inset by padding). */}
+          <div className="relative px-3 pt-3 pb-2">
+            {!!search && (
+              <span
+                className="absolute left-0 top-3 bottom-2 w-[3px] rounded-r-full bg-accent-blue"
+                title="This filter is set to a non-default value"
+                aria-hidden="true"
+              />
             )}
-          </div>
-        </div>
-
-        {sections.map((section) => (
-          <SectionWrapper key={section.key} section={section}>
-            {section.type === 'list' && <ListSection section={section} />}
-
-            {section.type === 'tags' && (
-              <div className="space-y-px">
-                {section.items.map((item) => {
-                  const active = section.value.size === 0 ? item.value === 'All' : section.value.has(item.value)
-                  const selected = item.value !== 'All' && section.value.has(item.value)
-                  const pinned = section.value.size > 1 && selected
-                  return (
-                    <button
-                      type="button"
-                      key={item.value}
-                      onClick={() => section.onChange(item.value)}
-                      className={`w-full text-left px-2 py-1.5 rounded text-xs flex items-center gap-2 transition-colors cursor-pointer
-                        ${active ? 'bg-hover text-text-primary' : 'text-text-secondary hover:bg-elevated hover:text-text-primary'}`}
-                    >
-                      {item.color ? (
-                        <div className="group/dot shrink-0 relative flex items-center justify-center w-3.5 h-3.5 -m-1 p-1 box-content">
-                          <div
-                            className={`w-2 h-2 rounded-full transition-opacity ${pinned ? 'opacity-0' : 'group-hover/dot:opacity-0'}`}
-                            style={{ background: item.color, boxShadow: active ? `0 0 4px ${item.color}60` : 'none' }}
-                          />
-                          <div
-                            className={`absolute inset-0 m-1 rounded border transition-opacity flex items-center justify-center ${pinned ? 'opacity-100' : 'opacity-0 group-hover/dot:opacity-100'}`}
-                            style={{
-                              borderColor: selected
-                                ? item.color
-                                : 'color-mix(in srgb, ' + item.color + ' 45%, transparent)',
-                              background: selected ? item.color : 'transparent',
-                            }}
-                            onClick={(e) => {
-                              e.stopPropagation()
-                              section.onToggle?.(item.value)
-                            }}
-                          >
-                            {selected && <Check size={10} className="text-white" strokeWidth={2.5} />}
-                          </div>
-                        </div>
-                      ) : null}
-                      <span className="truncate">{item.label}</span>
-                      {item.count != null && (
-                        <span className="text-text-tertiary ml-auto text-[11px] shrink-0">{item.count}</span>
-                      )}
-                    </button>
-                  )
-                })}
-              </div>
-            )}
-
-            {section.type === 'text' && (
+            {smartSearch ? (
+              <SmartSearchBar
+                value={search}
+                onChange={onSearchChange}
+                authors={smartSearch.authors}
+                tags={smartSearch.tags}
+                labels={smartSearch.labels}
+                placeholder={smartSearch.placeholder}
+              />
+            ) : (
               <div className="relative">
+                <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-tertiary z-10" />
                 <Input
                   type="text"
-                  placeholder={section.placeholder || 'Search…'}
-                  value={section.value}
-                  onChange={(e) => section.onChange(e.target.value)}
-                  className="h-7 bg-elevated rounded pl-2.5 pr-7 text-xs"
+                  placeholder="Search…"
+                  value={search}
+                  onChange={(e) => onSearchChange(e.target.value)}
+                  className="h-8 bg-elevated pl-8 pr-7 text-xs"
                 />
-                {section.value ? (
+                {search && (
                   <Button
-                    type="button"
                     variant="ghost"
                     size="icon-xs"
-                    onClick={() => section.onChange('')}
-                    className="absolute right-1 top-1/2 -translate-y-1/2 text-text-tertiary hover:text-text-secondary"
-                    aria-label={`Clear ${section.label}`}
+                    onClick={() => onSearchChange('')}
+                    className="absolute right-1 top-1 text-text-tertiary hover:text-text-secondary"
                   >
                     <X size={12} />
                   </Button>
-                ) : null}
+                )}
               </div>
             )}
+          </div>
 
-            {section.type === 'text-autocomplete' && (
-              <TextAutocomplete
-                value={section.value}
-                onChange={section.onChange}
-                suggestions={section.suggestions}
-                placeholder={section.placeholder}
-              />
-            )}
+          {sections.map((section, i) => (
+            <SectionWrapper key={section.key} section={section} active={activeFlags[i] === true}>
+              {section.type === 'list' && <ListSection section={section} />}
 
-            {section.type === 'tags-autocomplete' && (
-              <TagsAutocomplete
-                value={section.value}
-                onChange={section.onChange}
-                suggestions={section.suggestions}
-                placeholder={section.placeholder}
-              />
-            )}
-
-            {section.type === 'labels-autocomplete' && (
-              <LabelsAutocomplete
-                value={section.value}
-                onChange={section.onChange}
-                labels={section.labels}
-                placeholder={section.placeholder}
-              />
-            )}
-
-            {section.type === 'select' && (
-              <Select value={String(section.value)} onValueChange={section.onChange}>
-                <SelectTrigger className="w-full h-8 bg-elevated text-xs text-text-secondary">
-                  <SelectValue placeholder={section.placeholder} />
-                </SelectTrigger>
-                <SelectContent>
-                  {section.options.map((opt) => {
-                    const val = typeof opt === 'string' ? opt : opt.value
-                    const key = String(val)
-                    if (typeof opt === 'string') {
-                      return (
-                        <SelectItem key={key} value={key}>
-                          {opt}
-                        </SelectItem>
-                      )
-                    }
-                    const hasCount = opt.count != null
-                    if (hasCount) {
-                      return (
-                        <SelectItem key={key} value={key} selectLabel={opt.label ?? key}>
-                          <span className="text-text-tertiary text-[11px] shrink-0 ml-auto">{opt.count}</span>
-                        </SelectItem>
-                      )
-                    }
-                    const menuText = opt.menuLabel ?? opt.label ?? key
+              {section.type === 'tags' && (
+                <div className="space-y-px">
+                  {section.items.map((item) => {
+                    const active = section.value.size === 0 ? item.value === 'All' : section.value.has(item.value)
+                    const selected = item.value !== 'All' && section.value.has(item.value)
+                    const pinned = section.value.size > 1 && selected
                     return (
-                      <SelectItem key={key} value={key}>
-                        {menuText}
-                      </SelectItem>
+                      <button
+                        type="button"
+                        key={item.value}
+                        onClick={() => section.onChange(item.value)}
+                        className={`w-full text-left px-2 py-1.5 rounded text-xs flex items-center gap-2 transition-colors cursor-pointer
+                        ${active ? 'bg-hover text-text-primary' : 'text-text-secondary hover:bg-elevated hover:text-text-primary'}`}
+                      >
+                        {item.color ? (
+                          <div className="group/dot shrink-0 relative flex items-center justify-center w-3.5 h-3.5 -m-1 p-1 box-content">
+                            <div
+                              className={`w-2 h-2 rounded-full transition-opacity ${pinned ? 'opacity-0' : 'group-hover/dot:opacity-0'}`}
+                              style={{ background: item.color, boxShadow: active ? `0 0 4px ${item.color}60` : 'none' }}
+                            />
+                            <div
+                              className={`absolute inset-0 m-1 rounded border transition-opacity flex items-center justify-center ${pinned ? 'opacity-100' : 'opacity-0 group-hover/dot:opacity-100'}`}
+                              style={{
+                                borderColor: selected
+                                  ? item.color
+                                  : 'color-mix(in srgb, ' + item.color + ' 45%, transparent)',
+                                background: selected ? item.color : 'transparent',
+                              }}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                section.onToggle?.(item.value)
+                              }}
+                            >
+                              {selected && <Check size={10} className="text-white" strokeWidth={2.5} />}
+                            </div>
+                          </div>
+                        ) : null}
+                        <span className="truncate">{item.label}</span>
+                        {item.count != null && (
+                          <span className="text-text-tertiary ml-auto text-[11px] shrink-0">{item.count}</span>
+                        )}
+                      </button>
                     )
                   })}
-                </SelectContent>
-              </Select>
-            )}
+                </div>
+              )}
 
-            {section.type === 'switch' && (
-              <label className="flex items-center justify-between gap-3 rounded px-2 py-1.5 text-xs text-text-secondary hover:bg-elevated hover:text-text-primary transition-colors cursor-pointer">
-                <span className="truncate">{section.switchLabel}</span>
-                <Switch size="sm" checked={!!section.checked} onCheckedChange={section.onCheckedChange} />
-              </label>
-            )}
+              {section.type === 'text' && (
+                <div className="relative">
+                  <Input
+                    type="text"
+                    placeholder={section.placeholder || 'Search…'}
+                    value={section.value}
+                    onChange={(e) => section.onChange(e.target.value)}
+                    className="h-7 bg-elevated rounded pl-2.5 pr-7 text-xs"
+                  />
+                  {section.value ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      onClick={() => section.onChange('')}
+                      className="absolute right-1 top-0.5 text-text-tertiary hover:text-text-secondary"
+                      aria-label={`Clear ${section.label}`}
+                    >
+                      <X size={12} />
+                    </Button>
+                  ) : null}
+                </div>
+              )}
 
-            {section.type === 'switches' && (
-              <div className="space-y-px">
-                {section.items.map((item) => (
-                  <label
-                    key={item.key}
-                    className="flex items-center justify-between gap-3 rounded px-2 py-1.5 text-xs text-text-secondary hover:bg-elevated hover:text-text-primary transition-colors cursor-pointer"
-                  >
-                    <span className="truncate">{item.label}</span>
-                    <Switch size="sm" checked={!!item.checked} onCheckedChange={item.onCheckedChange} />
-                  </label>
+              {section.type === 'text-autocomplete' &&
+                (section.onExcludedChange ? (
+                  <AuthorAutocomplete
+                    value={section.value}
+                    onChange={section.onChange}
+                    excluded={section.excluded}
+                    onExcludedChange={section.onExcludedChange}
+                    suggestions={section.suggestions}
+                    placeholder={section.placeholder}
+                  />
+                ) : (
+                  <TextAutocomplete
+                    value={section.value}
+                    onChange={section.onChange}
+                    suggestions={section.suggestions}
+                    placeholder={section.placeholder}
+                  />
                 ))}
-              </div>
-            )}
-          </SectionWrapper>
-        ))}
+
+              {section.type === 'tags-autocomplete' && (
+                <TagsAutocomplete
+                  value={section.value}
+                  onChange={section.onChange}
+                  suggestions={section.suggestions}
+                  placeholder={section.placeholder}
+                  allowNegate={!!section.allowNegate}
+                />
+              )}
+
+              {section.type === 'labels-autocomplete' && (
+                <LabelsAutocomplete
+                  value={section.value}
+                  onChange={section.onChange}
+                  labels={section.labels}
+                  placeholder={section.placeholder}
+                  allowNegate={!!section.allowNegate}
+                />
+              )}
+
+              {section.type === 'select' && (
+                <Select value={String(section.value)} onValueChange={section.onChange}>
+                  <SelectTrigger className="w-full h-8 bg-elevated text-xs text-text-secondary">
+                    <SelectValue placeholder={section.placeholder} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {section.options.map((opt) => {
+                      const val = typeof opt === 'string' ? opt : opt.value
+                      const key = String(val)
+                      if (typeof opt === 'string') {
+                        return (
+                          <SelectItem key={key} value={key}>
+                            {opt}
+                          </SelectItem>
+                        )
+                      }
+                      const hasCount = opt.count != null
+                      if (hasCount) {
+                        return (
+                          <SelectItem key={key} value={key} selectLabel={opt.label ?? key}>
+                            <span className="text-text-tertiary text-[11px] shrink-0 ml-auto">{opt.count}</span>
+                          </SelectItem>
+                        )
+                      }
+                      const menuText = opt.menuLabel ?? opt.label ?? key
+                      return (
+                        <SelectItem key={key} value={key}>
+                          {menuText}
+                        </SelectItem>
+                      )
+                    })}
+                  </SelectContent>
+                </Select>
+              )}
+            </SectionWrapper>
+          ))}
+        </div>
       </div>
       <ResizeHandle side="right" onResizeStart={onResizeStart} onResize={onResize} />
-    </div>
-  )
-}
-
-function TagsAutocomplete({ value = [], onChange, suggestions = {}, placeholder = 'Filter by tags…' }) {
-  const [query, setQuery] = useState('')
-  const [open, setOpen] = useState(false)
-  const [hlIndex, setHlIndex] = useState(-1)
-  const containerRef = useRef(null)
-  const inputRef = useRef(null)
-  const listRef = useRef(null)
-
-  useEffect(() => {
-    const handler = (e) => {
-      if (containerRef.current && !containerRef.current.contains(e.target)) setOpen(false)
-    }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [])
-
-  const matches = useMemo(() => {
-    const selectedSet = new Set(value)
-    const q = query.trim().toLowerCase()
-    if (!q) {
-      return Object.entries(suggestions)
-        .filter(([tag]) => !selectedSet.has(tag))
-        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-        .slice(0, 20)
-    }
-    const prefix = [],
-      rest = []
-    for (const entry of Object.entries(suggestions)) {
-      if (selectedSet.has(entry[0])) continue
-      const lower = entry[0].toLowerCase()
-      if (lower.startsWith(q)) prefix.push(entry)
-      else if (lower.includes(q)) rest.push(entry)
-    }
-    const byCount = (a, b) => b[1] - a[1] || a[0].localeCompare(b[0])
-    return [...prefix.sort(byCount), ...rest.sort(byCount)].slice(0, 20)
-  }, [suggestions, value, query])
-
-  useEffect(() => {
-    setHlIndex(-1)
-  }, [matches])
-
-  const addTag = (tag) => {
-    const trimmed = tag.trim()
-    if (!trimmed || value.includes(trimmed)) {
-      setQuery('')
-      inputRef.current?.focus()
-      return
-    }
-    onChange([...value, trimmed])
-    setQuery('')
-    inputRef.current?.focus()
-  }
-  const removeTag = (tag) => {
-    onChange(value.filter((t) => t !== tag))
-  }
-
-  const onKeyDown = (e) => {
-    if (e.key === 'ArrowDown' && open && matches.length > 0) {
-      e.preventDefault()
-      setHlIndex((i) => {
-        const next = i < matches.length - 1 ? i + 1 : 0
-        listRef.current?.children[next]?.scrollIntoView({ block: 'nearest' })
-        return next
-      })
-    } else if (e.key === 'ArrowUp' && open && matches.length > 0) {
-      e.preventDefault()
-      setHlIndex((i) => {
-        const next = i > 0 ? i - 1 : matches.length - 1
-        listRef.current?.children[next]?.scrollIntoView({ block: 'nearest' })
-        return next
-      })
-    } else if (e.key === 'Enter') {
-      if (open && hlIndex >= 0 && hlIndex < matches.length) {
-        e.preventDefault()
-        addTag(matches[hlIndex][0])
-      } else if (query.trim()) {
-        e.preventDefault()
-        addTag(query)
-      }
-    } else if (e.key === ',') {
-      if (query.trim()) {
-        e.preventDefault()
-        addTag(query)
-      }
-    } else if (e.key === 'Escape') {
-      e.preventDefault()
-      setOpen(false)
-    }
-  }
-
-  return (
-    <div ref={containerRef} className="relative">
-      {value.length > 0 && (
-        <div className="flex flex-wrap gap-1 mb-1.5">
-          {value.map((tag) => (
-            <span
-              key={tag}
-              className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-accent-blue/15 text-accent-blue text-[10px] leading-tight"
-            >
-              {tag}
-              <button type="button" onClick={() => removeTag(tag)} className="hover:text-text-primary cursor-pointer">
-                <X size={10} />
-              </button>
-            </span>
-          ))}
-          <button
-            type="button"
-            onClick={() => {
-              onChange([])
-              setQuery('')
-            }}
-            className="text-[10px] text-text-tertiary hover:text-text-secondary cursor-pointer px-1"
-          >
-            Clear
-          </button>
-        </div>
-      )}
-      <div className="relative">
-        <Hash size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-text-tertiary z-10" />
-        <Input
-          ref={inputRef}
-          type="text"
-          placeholder={placeholder}
-          value={query}
-          onChange={(e) => {
-            setQuery(e.target.value)
-            setOpen(true)
-          }}
-          onFocus={() => setOpen(true)}
-          onKeyDown={onKeyDown}
-          className="h-7 bg-elevated rounded pl-7 pr-7 text-xs"
-        />
-        {query && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            onClick={() => {
-              setQuery('')
-              setOpen(false)
-            }}
-            className="absolute right-1 top-1/2 -translate-y-1/2 text-text-tertiary hover:text-text-secondary"
-          >
-            <X size={12} />
-          </Button>
-        )}
-      </div>
-      {open && matches.length > 0 && (
-        <div
-          ref={listRef}
-          className="absolute z-30 left-0 right-0 mt-1 max-h-48 overflow-y-auto bg-popover border border-border rounded shadow-lg"
-        >
-          {matches.map(([tag, count], i) => (
-            <button
-              key={tag}
-              type="button"
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => addTag(tag)}
-              onMouseEnter={() => setHlIndex(i)}
-              className={`w-full text-left px-2.5 py-1.5 text-xs flex items-center gap-2 cursor-pointer transition-colors ${i === hlIndex ? 'bg-accent-blue/10 text-text-primary' : 'hover:bg-hover'}`}
-            >
-              <span className="truncate flex-1">{tag}</span>
-              <span className="text-text-tertiary text-[11px] shrink-0">{count}</span>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-/**
- * Labels filter widget — like `TagsAutocomplete` but values are label IDs and
- * each chip / row gets a leading colored dot. No "Create" affordance — labels
- * are born only by being applied (see UX plan §12). Right-click on a chip or
- * row opens the management menu (rename / recolor / delete + enable/disable
- * all packages).
- */
-export function filterLabelMatches(labels, selectedIds, query) {
-  const selectedSet = new Set(selectedIds)
-  const q = query.trim().toLowerCase()
-  const all = labels.filter((l) => !selectedSet.has(l.id))
-  if (!q) return all
-  const prefix = []
-  const rest = []
-  for (const l of all) {
-    const lower = l.name.toLowerCase()
-    if (lower.startsWith(q)) prefix.push(l)
-    else if (lower.includes(q)) rest.push(l)
-  }
-  return [...prefix, ...rest]
-}
-
-function LabelsAutocomplete({ value = [], onChange, labels = [], placeholder = 'Filter by label…' }) {
-  const [query, setQuery] = useState('')
-  const [open, setOpen] = useState(false)
-  const [hlIndex, setHlIndex] = useState(-1)
-  const { renamingId, renameDraft, setRenameDraft, startRename, commitRename, cancelRename } = useLabelRename()
-  const containerRef = useRef(null)
-  const inputRef = useRef(null)
-  const listRef = useRef(null)
-
-  useEffect(() => {
-    const handler = (e) => {
-      if (containerRef.current && !containerRef.current.contains(e.target)) setOpen(false)
-    }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [])
-
-  const labelMap = useMemo(() => {
-    const m = new Map()
-    for (const l of labels) m.set(l.id, l)
-    return m
-  }, [labels])
-
-  const selected = useMemo(() => value.map((id) => labelMap.get(id)).filter(Boolean), [value, labelMap])
-
-  const matches = useMemo(() => {
-    return filterLabelMatches(labels, value, query)
-  }, [labels, value, query])
-
-  useEffect(() => setHlIndex(-1), [matches])
-
-  const addLabel = (id) => {
-    onChange([...value, id])
-    setQuery('')
-    inputRef.current?.focus()
-  }
-  const removeLabel = (id) => onChange(value.filter((x) => x !== id))
-
-  const onKeyDown = (e) => {
-    if (!open || matches.length === 0) return
-    if (e.key === 'ArrowDown') {
-      e.preventDefault()
-      setHlIndex((i) => {
-        const next = i < matches.length - 1 ? i + 1 : 0
-        listRef.current?.children[next]?.scrollIntoView({ block: 'nearest' })
-        return next
-      })
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault()
-      setHlIndex((i) => {
-        const next = i > 0 ? i - 1 : matches.length - 1
-        listRef.current?.children[next]?.scrollIntoView({ block: 'nearest' })
-        return next
-      })
-    } else if (e.key === 'Enter' && hlIndex >= 0 && hlIndex < matches.length) {
-      e.preventDefault()
-      addLabel(matches[hlIndex].id)
-    } else if (e.key === 'Escape') {
-      e.preventDefault()
-      setOpen(false)
-    }
-  }
-
-  return (
-    <div ref={containerRef} className="relative">
-      {selected.length > 0 && (
-        <div className="flex flex-wrap gap-1 mb-1.5">
-          {selected.map((label) => (
-            <LabelManageMenu
-              key={label.id}
-              label={label}
-              applicationCount={(label.packageCount || 0) + (label.contentCount || 0)}
-              onStartRename={() => startRename(label)}
-              onDeleted={() => removeLabel(label.id)}
-            >
-              <LabelChip
-                label={label}
-                size="sm"
-                interactive
-                filled
-                onNameDoubleClick={() => startRename(label)}
-                onRemove={() => removeLabel(label.id)}
-                renaming={renamingId === label.id}
-                editValue={renameDraft}
-                onEditChange={setRenameDraft}
-                onCommit={commitRename}
-                onCancel={cancelRename}
-              />
-            </LabelManageMenu>
-          ))}
-          {selected.length > 1 && (
-            <button
-              type="button"
-              onClick={() => onChange([])}
-              className="text-[10px] text-text-tertiary hover:text-text-secondary cursor-pointer px-1"
-            >
-              Clear
-            </button>
-          )}
-        </div>
-      )}
-      <div className="relative">
-        <Tag size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-text-tertiary z-10" />
-        <Input
-          ref={inputRef}
-          type="text"
-          placeholder={placeholder}
-          value={query}
-          onChange={(e) => {
-            setQuery(e.target.value)
-            setOpen(true)
-          }}
-          onFocus={() => setOpen(true)}
-          onKeyDown={onKeyDown}
-          className="h-7 bg-elevated rounded pl-7 pr-7 text-xs"
-        />
-        {query && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            onClick={() => {
-              setQuery('')
-              setOpen(false)
-            }}
-            className="absolute right-1 top-1/2 -translate-y-1/2 text-text-tertiary hover:text-text-secondary"
-          >
-            <X size={12} />
-          </Button>
-        )}
-      </div>
-      {open && matches.length > 0 && (
-        <div
-          ref={listRef}
-          className="absolute z-30 left-0 right-0 mt-1 max-h-60 overflow-y-auto bg-popover border border-border rounded shadow-lg"
-        >
-          {matches.map((label, i) => {
-            const total = (label.packageCount || 0) + (label.contentCount || 0)
-            return (
-              <LabelManageMenu
-                key={label.id}
-                label={label}
-                applicationCount={total}
-                onStartRename={() => startRename(label)}
-              >
-                <button
-                  type="button"
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => addLabel(label.id)}
-                  onMouseEnter={() => setHlIndex(i)}
-                  className={`w-full text-left px-2.5 py-1.5 text-xs flex items-center gap-2 cursor-pointer transition-colors ${i === hlIndex ? 'bg-accent-blue/10 text-text-primary' : 'hover:bg-hover'}`}
-                >
-                  <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: labelColor(label) }} />
-                  <span className="truncate flex-1">{label.name}</span>
-                  {total > 0 && <span className="text-text-tertiary text-[11px] shrink-0">{total}</span>}
-                </button>
-              </LabelManageMenu>
-            )
-          })}
-        </div>
-      )}
-    </div>
-  )
-}
-
-/** Single-line filter with Hub `users`-style suggestions: substring match, ordered by occurrence count */
-function TextAutocomplete({ value = '', onChange, suggestions = {}, placeholder = 'Search…' }) {
-  const [open, setOpen] = useState(false)
-  const [hlIndex, setHlIndex] = useState(-1)
-  const containerRef = useRef(null)
-  const listRef = useRef(null)
-
-  useEffect(() => {
-    const handler = (e) => {
-      if (containerRef.current && !containerRef.current.contains(e.target)) setOpen(false)
-    }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [])
-
-  const matches = useMemo(() => {
-    const q = value.trim().toLowerCase()
-    if (!q) {
-      return Object.entries(suggestions)
-        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-        .slice(0, 20)
-    }
-    const prefix = [],
-      rest = []
-    for (const entry of Object.entries(suggestions)) {
-      const lower = entry[0].toLowerCase()
-      if (lower.startsWith(q)) prefix.push(entry)
-      else if (lower.includes(q)) rest.push(entry)
-    }
-    const byCount = (a, b) => b[1] - a[1] || a[0].localeCompare(b[0])
-    return [...prefix.sort(byCount), ...rest.sort(byCount)].slice(0, 20)
-  }, [suggestions, value])
-
-  useEffect(() => {
-    setHlIndex(-1)
-  }, [matches])
-
-  const showList = open && matches.length > 0
-
-  const onKeyDown = (e) => {
-    if (!showList) return
-    if (e.key === 'ArrowDown') {
-      e.preventDefault()
-      setHlIndex((i) => {
-        const next = i < matches.length - 1 ? i + 1 : 0
-        listRef.current?.children[next]?.scrollIntoView({ block: 'nearest' })
-        return next
-      })
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault()
-      setHlIndex((i) => {
-        const next = i > 0 ? i - 1 : matches.length - 1
-        listRef.current?.children[next]?.scrollIntoView({ block: 'nearest' })
-        return next
-      })
-    } else if (e.key === 'Enter' && hlIndex >= 0 && hlIndex < matches.length) {
-      e.preventDefault()
-      onChange(matches[hlIndex][0])
-      setOpen(false)
-    } else if (e.key === 'Escape') {
-      e.preventDefault()
-      setOpen(false)
-    }
-  }
-
-  return (
-    <div ref={containerRef} className="relative">
-      <div className="relative">
-        <User size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-text-tertiary z-10" />
-        <Input
-          type="text"
-          placeholder={placeholder}
-          value={value}
-          onChange={(e) => {
-            onChange(e.target.value)
-            setOpen(true)
-          }}
-          onFocus={() => setOpen(true)}
-          onKeyDown={onKeyDown}
-          className="h-7 bg-elevated rounded pl-7 pr-7 text-xs"
-        />
-        {value ? (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            onClick={() => {
-              onChange('')
-              setOpen(false)
-            }}
-            className="absolute right-1 top-1/2 -translate-y-1/2 text-text-tertiary hover:text-text-secondary"
-            aria-label="Clear"
-          >
-            <X size={12} />
-          </Button>
-        ) : null}
-      </div>
-      {showList && (
-        <div
-          ref={listRef}
-          className="absolute z-30 left-0 right-0 mt-1 max-h-48 overflow-y-auto bg-popover border border-border rounded shadow-lg"
-        >
-          {matches.map(([name, count], i) => (
-            <button
-              key={name}
-              type="button"
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => {
-                onChange(name)
-                setOpen(false)
-              }}
-              onMouseEnter={() => setHlIndex(i)}
-              className={`w-full text-left px-2.5 py-1.5 text-xs flex items-center gap-2 cursor-pointer transition-colors ${i === hlIndex ? 'bg-accent-blue/10 text-text-primary' : 'hover:bg-hover'}`}
-            >
-              <span className="truncate flex-1">{name}</span>
-              <span className="text-text-tertiary text-[11px] shrink-0">{count}</span>
-            </button>
-          ))}
-        </div>
-      )}
     </div>
   )
 }
@@ -731,7 +313,7 @@ function usePersistedCollapsed(key, defaultValue = false) {
   return [value, toggle]
 }
 
-function SectionWrapper({ section, children }) {
+function SectionWrapper({ section, active, children }) {
   const [collapsed, toggleCollapsed] = usePersistedCollapsed(section.key, section.collapsedByDefault ?? false)
   const isCollapsible = !!section.collapsible
 
@@ -746,21 +328,37 @@ function SectionWrapper({ section, children }) {
   }, [collapsed, isCollapsible])
 
   return (
-    <div className="px-3 pb-3">
-      {isCollapsible ? (
-        <button
-          type="button"
-          onClick={toggleCollapsed}
-          className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-text-tertiary font-medium mb-1.5 cursor-pointer hover:text-text-secondary transition-colors w-full"
-        >
-          {collapsed ? <ChevronRight size={11} className="shrink-0" /> : <ChevronDown size={11} className="shrink-0" />}
-          {section.label}
-        </button>
-      ) : (
-        <div className="text-[10px] uppercase tracking-wider text-text-tertiary font-medium mb-1.5">
-          {section.label}
-        </div>
+    <div className="relative px-3 pb-3">
+      {active && (
+        <span
+          className="absolute left-0 top-0 bottom-3 w-[3px] rounded-r-full bg-accent-blue"
+          title="This filter is set to a non-default value"
+          aria-hidden="true"
+        />
       )}
+      <div className="flex items-center gap-1 mb-1.5">
+        {isCollapsible ? (
+          <button
+            type="button"
+            onClick={toggleCollapsed}
+            className={`flex items-center gap-1 text-[10px] uppercase tracking-wider text-text-tertiary font-medium cursor-pointer hover:text-text-secondary transition-colors min-w-0 ${section.titleAction ? '' : 'flex-1'}`}
+          >
+            {collapsed ? (
+              <ChevronRight size={11} className="shrink-0" />
+            ) : (
+              <ChevronDown size={11} className="shrink-0" />
+            )}
+            <span className="truncate">{section.label}</span>
+          </button>
+        ) : (
+          <div
+            className={`flex items-center gap-1 min-w-0 text-[10px] uppercase tracking-wider text-text-tertiary font-medium ${section.titleAction ? '' : 'flex-1'}`}
+          >
+            <span className="truncate">{section.label}</span>
+          </div>
+        )}
+        {section.titleAction}
+      </div>
       {(!isCollapsible || !collapsed) && children}
     </div>
   )
@@ -778,24 +376,20 @@ function ListSection({ section }) {
   return (
     <div className="space-y-px">
       {visible.map((item) => (
-        <div key={item.value}>
-          {item.separatorBefore && <div className="my-1 mx-2 border-t border-border" />}
-          <button
-            type="button"
-            title={item.title}
-            onClick={() => section.onChange(item.value)}
-            style={item.level ? { paddingLeft: `${8 + item.level * 16}px` } : undefined}
-            className={`w-full text-left px-2 py-1.5 rounded text-xs flex items-center gap-2 transition-colors cursor-pointer
-              ${section.value === item.value ? 'bg-hover text-text-primary' : 'text-text-secondary hover:bg-elevated hover:text-text-primary'}`}
-          >
-            {item.color && <div className="w-2 h-2 rounded-full shrink-0" style={{ background: item.color }} />}
-            {item.icon && <item.icon size={12} className={item.iconClass || ''} />}
-            <span className="truncate">{item.label}</span>
-            {item.count != null && (
-              <span className="text-text-tertiary ml-auto text-[11px] shrink-0">{item.count}</span>
-            )}
-          </button>
-        </div>
+        <button
+          type="button"
+          key={item.value}
+          title={item.title}
+          onClick={() => section.onChange(item.value)}
+          style={item.level ? { paddingLeft: `${8 + item.level * 16}px` } : undefined}
+          className={`w-full text-left px-2 py-1.5 rounded text-xs flex items-center gap-2 transition-colors cursor-pointer
+            ${section.value === item.value ? 'bg-hover text-text-primary' : 'text-text-secondary hover:bg-elevated hover:text-text-primary'}`}
+        >
+          {item.color && <div className="w-2 h-2 rounded-full shrink-0" style={{ background: item.color }} />}
+          {item.icon && <item.icon size={12} className={item.iconClass || ''} />}
+          <span className="truncate">{item.label}</span>
+          {item.count != null && <span className="text-text-tertiary ml-auto text-[11px] shrink-0">{item.count}</span>}
+        </button>
       ))}
       {collapsible && (
         <button

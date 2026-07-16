@@ -4,15 +4,13 @@ import {
   renameLabel,
   recolorLabel,
   deleteLabel as dbDeleteLabel,
-  LABEL_SOURCE_BACKSTAGE,
   applyLabelToPackages as dbApplyLabelToPackages,
   removeLabelFromPackages as dbRemoveLabelFromPackages,
   applyLabelToContents as dbApplyLabelToContents,
   removeLabelFromContents as dbRemoveLabelFromContents,
-  getLabelContentSource,
-  setLabelContentSource,
 } from '../db.js'
 import { refreshLabels, refreshLabelMeta, getLabelList } from '../store.js'
+import { stripDisabledSuffix } from '../vam-prefs.js'
 import { notify } from '../notify.js'
 
 /**
@@ -79,16 +77,11 @@ export function registerLabelHandlers() {
   /** Apply or remove a label across N content items atomically. */
   ipcMain.handle('labels:apply-contents', (_, { id, items, applied }) => {
     if (!Array.isArray(items) || items.length === 0) return { ok: true, count: 0 }
-    if (applied) {
-      dbApplyLabelToContents(id, items)
-    } else {
-      dbRemoveLabelFromContents(id, items)
-    }
-    for (const item of items) {
-      const current = getLabelContentSource(id, item.packageFilename, item.internalPath)
-      const next = applied ? current | LABEL_SOURCE_BACKSTAGE : current & ~LABEL_SOURCE_BACKSTAGE
-      setLabelContentSource(id, item.packageFilename, item.internalPath, next)
-    }
+    // Content labels bind to the canonical (live) path so a loose preset keeps
+    // its labels across the `.disabled` marker toggling on enable/disable.
+    const canonicalItems = items.map((it) => ({ ...it, internalPath: stripDisabledSuffix(it.internalPath) }))
+    if (applied) dbApplyLabelToContents(id, canonicalItems)
+    else dbRemoveLabelFromContents(id, canonicalItems)
     refreshLabels()
     notify('labels:updated')
     notify('contents:updated')

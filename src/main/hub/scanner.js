@@ -3,6 +3,7 @@ import { fetchPackagesJson, getPackagesIndex } from './packages-json.js'
 import {
   getAllPackagesForHubScan,
   getHubResource,
+  getNotFoundHubResourceIds,
   getPackagesNeedingHubDetailApply,
   getPackagesNeedingHubDetailFetch,
   getPackagesNeedingHubNameLookup,
@@ -35,7 +36,7 @@ async function fetchOneDetail({ rid, filename }) {
   } catch (e) {
     console.warn('[hub-scan] getResourceDetail failed for', rid, e.message)
     try {
-      upsertHubResourceDetail(rid, { _unavailable: true, _error: e.message })
+      if (upsertHubResourceDetail(rid, { _unavailable: true, _error: e.message })) notify('wishlist:updated')
       applyHubDetailToPackage(filename, { _unavailable: true })
     } catch {}
   }
@@ -133,6 +134,7 @@ export async function scanHubDetails(onProgress) {
 
   const index = getPackagesIndex()
   const rows = getAllPackagesForHubScan()
+  const notFoundIds = getNotFoundHubResourceIds()
   const total = rows.length
   let found = 0
 
@@ -147,6 +149,9 @@ export async function scanHubDetails(onProgress) {
   // is gated to a true no-op when the column already matches, so warm-start
   // re-runs cost zero writes here. Track real changes so we can skip the
   // post-pass `buildFromDb`/`notify` when nothing moved.
+  //
+  // Skip authoritative dead ids — the CDN index can lag a Hub re-publish (same
+  // .var, new resource_id), and writing the old id would fight Pass 4's heal.
   let pass1Changes = 0
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]
@@ -161,8 +166,11 @@ export async function scanHubDetails(onProgress) {
     if (!entry?.resourceId) continue
 
     found++
+    const rid = String(entry.resourceId)
+    if (notFoundIds.has(rid)) continue
+
     try {
-      pass1Changes += setHubResourceId(row.filename, String(entry.resourceId))
+      pass1Changes += setHubResourceId(row.filename, rid)
     } catch {}
   }
 
@@ -182,9 +190,9 @@ export async function scanHubDetails(onProgress) {
   // intentionally excluded — known failures aren't retried every launch.
   // Rows are already shaped { filename, rid } via the SQL alias.
   const toFetch = getPackagesNeedingHubDetailFetch()
-  // Pass 4 work-list — packages packages.json couldn't link (paid, hub-removed,
-  // off-Hub). The unresolved (`hub_resource_id IS NULL`) set is fixed after
-  // Pass 1's linking, so it's safe to compute here, before Pass 3 runs.
+  // Pass 4 work-list — packages packages.json couldn't link (paid/off-Hub), plus
+  // packages linked to an authoritative dead id. Dead links remain intact until
+  // name lookup finds a replacement, preserving genuinely removed resources.
   //
   // Gated on the index being available: with no index, Pass 1 linked nothing, so
   // EVERY package would look off-index and we'd name-look-up the whole library
@@ -217,10 +225,9 @@ export async function scanHubDetails(onProgress) {
 
   await fetchPromise
 
-  // Pass 4: name-based resolution for the leftovers. Each package is asked once
-  // per lifetime (resolveOneByName stamps hub_name_checked_at on a definitive
-  // answer), so this is a one-time cost on the first scan after deploy and then
-  // only brand-new packages each run. Continues the shared 'fetching' span.
+  // Pass 4: name-based resolution for leftovers and dead links. Each state is
+  // asked once (resolveOneByName stamps hub_name_checked_at on a definitive
+  // answer), so warm scans remain free. Continues the shared 'fetching' span.
   const nameHits = await runNameResolution(nameLookups, {
     onProgress: emitNet ? (data) => emitNet(toFetch.length + data.current) : undefined,
   })
@@ -257,8 +264,13 @@ export function enrichNewPackages(filenames) {
   const index = getPackagesIndex()
   if (!index) return
 
+  const notFoundIds = getNotFoundHubResourceIds()
   const toFetch = []
   const toResolveByName = []
+  // The watcher calls this AFTER its own buildFromDb(), so synchronous writes
+  // below (id link + cached-detail apply) won't reach the in-memory store — and
+  // thus packages:list — without the rebuild+notify gated on this flag.
+  let syncChanged = false
   for (const filename of filenames) {
     const parts = filename.replace(/\.var$/i, '').split('.')
     if (parts.length < 3) continue
@@ -272,14 +284,21 @@ export function enrichNewPackages(filenames) {
     }
 
     const rid = String(entry.resourceId)
+    // Dead CDN id (Hub re-publish) — same heal path as scanHubDetails Pass 4.
+    if (notFoundIds.has(rid)) {
+      toResolveByName.push({ filename, packageName })
+      continue
+    }
+
     try {
-      setHubResourceId(filename, rid)
+      if (setHubResourceId(filename, rid) > 0) syncChanged = true
     } catch {}
 
     const cached = getHubResource(rid)
     if (cached?.hub_json) {
       try {
         applyHubDetailToPackage(filename, JSON.parse(cached.hub_json))
+        syncChanged = true
       } catch {}
       continue
     }
@@ -287,10 +306,22 @@ export function enrichNewPackages(filenames) {
     toFetch.push({ rid, filename })
   }
 
-  if (toFetch.length > 0) runDetailFetches(toFetch)
+  if (syncChanged) {
+    buildFromDb({ skipGraph: true })
+    notify('packages:updated')
+    resolvePackageThumbnails()
+  }
+
+  // On any completion, surface it: refresh the in-memory store, repaint the
+  // library, and fetch the now-linked Hub thumbnail.
+  if (toFetch.length > 0) {
+    runDetailFetches(toFetch).then(() => {
+      buildFromDb({ skipGraph: true })
+      notify('packages:updated')
+      resolvePackageThumbnails()
+    })
+  }
   if (toResolveByName.length > 0) {
-    // On any hit, surface it: refresh the in-memory store, repaint the library,
-    // and fetch the now-linked Hub thumbnail.
     runNameResolution(toResolveByName).then((hits) => {
       if (hits > 0) {
         buildFromDb({ skipGraph: true })

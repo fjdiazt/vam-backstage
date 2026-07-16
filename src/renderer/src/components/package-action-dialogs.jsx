@@ -7,6 +7,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { activeBreakingDependents } from '@/lib/package-disable-confirm'
 import { formatBytes } from '@/lib/utils'
 
 const CONFIRM_LIST_MAX = 5
@@ -98,7 +99,7 @@ export function UninstallDialogContent({ pkg, name, hasDependents, dependentName
 }
 
 export function DisablePackageDialogContent({ pkg, name, onConfirm }) {
-  const dependents = pkg.dependents || []
+  const dependents = activeBreakingDependents(pkg)
   const cascadeDeps = pkg.cascadeDisableDeps || []
 
   return (
@@ -107,10 +108,7 @@ export function DisablePackageDialogContent({ pkg, name, onConfirm }) {
         <AlertDialogTitle className="select-text cursor-text">Disable {name}?</AlertDialogTitle>
         <AlertDialogDescription asChild>
           <div className="space-y-2 text-sm text-muted-foreground select-text cursor-text">
-            <p>
-              The package file will be renamed to <span className="font-mono text-[11px]">.var.disabled</span>. VaM will
-              not load it.
-            </p>
+            <p>The package will be marked as disabled. VaM will not load it.</p>
             {dependents.length > 0 && (
               <div>
                 <p className="text-destructive font-medium">

@@ -1,22 +1,29 @@
 import parcelWatcher from '@parcel/watcher'
 import { join, extname, basename, relative, sep, dirname } from 'path'
-import { stat, mkdir, rename, unlink } from 'fs/promises'
+import { stat, mkdir, rename, unlink, readdir } from 'fs/promises'
 import { ADDON_PACKAGES_FILE_PREFS } from '@shared/paths.js'
 import { LOCAL_PACKAGE_FILENAME, LOCAL_CONTENT_DIRS } from '@shared/local-package.js'
-import { isVarFilename, canonicalVarFilename } from './scanner/var-reader.js'
+import { isVarFilename, canonicalVarFilename, qvaroDisabledName } from './scanner/var-reader.js'
 import { scanAndUpsert } from './scanner/ingest.js'
 import { computeAutoHidePathsForNewPackage } from './scanner/index.js'
 import { inheritFromOlderVersion } from './scanner/inherit.js'
+import { refreshExtractedPresetsForUpdates } from './scenes/extract-refresh.js'
+import { reconcileExtractedLifecycleAndResync } from './scenes/extracted-reconcile.js'
 import { runLocalScan } from './scanner/local.js'
-import { deletePackage, getPackageCacheInfo, setStorageState } from './db.js'
-import { buildFromDb, getPrefsMap, setPrefsMap, getPackageIndex, getForwardDeps } from './store.js'
-import { computeCascadeEnable } from './scanner/graph.js'
+import { markPackageMissing, getPackageReconcileInfo, setStorageState } from './db.js'
+import { buildFromDb, getPrefsMap, setPrefsMap } from './store.js'
 import { notify } from './notify.js'
 import { enrichNewPackages } from './hub/scanner.js'
-import { getAllLibraryDirs, refreshLibraryDirs } from './library-dirs.js'
-import { applyStorageState } from './storage-state.js'
+import {
+  getAllLibraryDirs,
+  refreshLibraryDirs,
+  getLibraryDirPath,
+  libraryRelSubpath,
+  classifyMainVarOnDisk,
+} from './library-dirs.js'
 import { awaitStable } from './var-stability.js'
-import { hidePackageContent, readAllPrefs } from './vam-prefs.js'
+import { hidePackageContent, readAllPrefs, stripDisabledSuffix } from './vam-prefs.js'
+import { warmFileWatcherBackend } from './watcher-warm.js'
 
 const DEBOUNCE_MS = 500
 
@@ -151,6 +158,10 @@ export async function restartPackageWatcher() {
 
 export async function startWatcher(vamDir) {
   vamDirPath = vamDir
+
+  // Ensure parcel's native backend is warmed (on a worker) before the first real subscribe,
+  // so this never blocks the main thread for ~5s on Explorer launches. See watcher-warm.js.
+  await warmFileWatcherBackend()
 
   await restartPackageWatcher()
 
@@ -298,11 +309,26 @@ function onPackageRawEvent(ev, libraryDirId) {
 }
 
 async function routePackage(ev, libraryDirId) {
-  if (!isVarFilename(basename(ev.path))) return
+  const name = basename(ev.path)
+  if (!isVarFilename(name)) return
   const type = parcelTypeToLegacy(ev.type)
+  // A `.var.disabled` in main can be an empty marker (VaM-native disable), not a
+  // readable zip — gating it on zip stability would silently drop the disable
+  // event, so a 0-byte one passes straight through (its handling re-resolves the
+  // canonical's footprint from disk anyway). Only an *empty* file qualifies: a
+  // non-empty `.var.disabled` is legacy suffix content mid-copy or complete, and
+  // must settle into a stable, valid archive like any bare `.var`.
   if (type !== 'unlink') {
-    const ok = await awaitStable(ev.path)
-    if (!ok) return // file vanished or never settled into a valid zip
+    let isEmptyMainMarker = false
+    if (libraryDirId == null && /\.disabled$/i.test(name)) {
+      const s = await stat(ev.path).catch(() => null)
+      if (!s) return // vanished before we could look — the unlink event follows
+      isEmptyMainMarker = s.size === 0
+    }
+    if (!isEmptyMainMarker) {
+      const ok = await awaitStable(ev.path)
+      if (!ok) return // file vanished or never settled into a valid zip
+    }
   }
   pendingPackageEvents.set(ev.path, { type, libraryDirId })
   scheduleBatch()
@@ -330,24 +356,19 @@ function scheduleBatch() {
 }
 
 /**
- * Compute the storage state implied by a single observed event's path + libraryDirId.
- * Aux dirs always imply 'offloaded'; main dir branches on .disabled. (Aux-dir `.var.disabled`
- * files are normalized to bare `.var` before reaching this function — see `processBatch`.)
- */
-function inferStorageState({ libraryDirId, isDisabled }) {
-  if (libraryDirId != null) return 'offloaded'
-  return isDisabled ? 'disabled' : 'enabled'
-}
-
-/**
- * Normalize a stray `.var.disabled` in an aux dir to bare `.var`. Aux dirs only ever
- * hold suffix-less files in our model — anything `.disabled` there came from external
- * tooling. Records both source and dest paths via `recordOwnedPath`; effective when
+ * Normalize a stray `.var.disabled` or Qvaro `.DISABLED` in an aux dir to bare
+ * `.var`. Aux dirs only ever hold suffix-less files in our model (offloaded ==
+ * active) — anything `.disabled`/`.DISABLED` there came from external tooling (a
+ * renamed content file or a VaM-native empty marker). The canonical bare name is
+ * derived by `canonicalVarFilename` (which understands both rename forms). Records
+ * both source and dest paths via `recordOwnedPath`; effective when
  * called from inside a bulk window (i.e. `processBatch`, which always wraps), no-op
  * from the standalone scanner pass (during which the watcher isn't yet running).
  *
  * Returns the bare path on successful rename, or `null` if:
- *   - a bare sibling already exists (we drop or refuse the duplicate),
+ *   - a bare sibling already exists (we drop the duplicate — empty marker or a
+ *     byte-identical copy — or refuse a differently-sized one, leaving both),
+ *   - the source is an empty marker with no bare sibling (unlinked as meaningless),
  *   - the rename itself fails (permissions, mid-flight unlink, etc.).
  *
  * Callers should treat null as "skip this file" — caller-side behavior is identical
@@ -367,7 +388,8 @@ export async function normalizeAuxDisabled(fullPath) {
   if (bareStat) {
     try {
       const disabledStat = await stat(fullPath)
-      if (disabledStat.size === bareStat.size) {
+      // Empty marker, or byte-identical copy of the bare content → drop it.
+      if (disabledStat.size === 0 || disabledStat.size === bareStat.size) {
         try {
           await unlink(fullPath)
         } catch {}
@@ -378,6 +400,19 @@ export async function normalizeAuxDisabled(fullPath) {
         )
       }
     } catch {}
+    return null
+  }
+  // No bare sibling: an empty marker on its own carries no content — drop it
+  // rather than rename an empty file into a bogus offloaded package.
+  try {
+    const disabledStat = await stat(fullPath)
+    if (disabledStat.size === 0) {
+      try {
+        await unlink(fullPath)
+      } catch {}
+      return null
+    }
+  } catch {
     return null
   }
   try {
@@ -418,11 +453,11 @@ async function processBatch() {
   }
   processing = true
 
-  // Wrap the whole pass in a bulk window so internal renames (normalizeAuxDisabled,
-  // cascade-enable through applyStorageState) get filtered: each operation calls
-  // recordOwnedPath for its source/dest paths, then the watcher's resulting events
-  // buffer here and drop on close. Without this, every internal rename triggers a
-  // redundant follow-up batch that mtime+size cache-hits but still costs a stat.
+  // Wrap the whole pass in a bulk window so internal renames (normalizeAuxDisabled)
+  // get filtered: each operation calls recordOwnedPath for its source/dest paths,
+  // then the watcher's resulting events buffer here and drop on close. Without this,
+  // every internal rename triggers a redundant follow-up batch that mtime+size
+  // cache-hits but still costs a stat.
   await withBulkWindow(async () => {
     const pkgEvents = new Map(pendingPackageEvents)
     const prefsEvents = new Map(pendingPrefsEvents)
@@ -435,7 +470,14 @@ async function processBatch() {
 
     let packagesChanged = false
     let contentsChanged = false
-    const newlyScannedEnabled = [] // enabled filenames that were freshly added/changed
+    // Enabled filenames freshly added/changed on disk — fed to Hub enrichment only.
+    // We deliberately do NOT cascade-enable their deps: a watcher event is an
+    // *external* change (VaM, a sync tool, another app), and silently enabling
+    // other packages in response would (a) race a peer app that may have its own
+    // dep changes queued, (b) enable content the user may not want, and (c) be a
+    // surprising side effect of an unattended change. Missing deps just surface as
+    // "broken" in the dependency graph, same as any other unsatisfied package.
+    const newlyScannedEnabled = []
     /** @type {Array<{ filename: string, pkgType: string|null, contentItems: Array<any>, packageName: string, isNewInstall: boolean }>} */
     const autoHideCandidates = [] // freshly-scanned packages eligible for auto-hide rule application
 
@@ -463,52 +505,94 @@ async function processBatch() {
         const isDisabled = /\.disabled$/i.test(name)
         const canonical = isDisabled ? canonicalVarFilename(name) : name
         if (!byCanonical.has(canonical)) byCanonical.set(canonical, [])
-        byCanonical.get(canonical).push({ fullPath, type, isDisabled, libraryDirId })
+        byCanonical.get(canonical).push({ fullPath, type, libraryDirId })
       }
 
       const allDirs = getAllLibraryDirs()
+
+      // Unlinks: before deleting any row, find the canonical's current home on disk —
+      // it may have moved (cross-dir, or into/out of a subfolder) rather than been
+      // removed. Resolve every unlinked canonical in a single recursive walk per
+      // library dir (`locateVars`) instead of one walk per file. A surviving copy
+      // anywhere under a library root keeps the row (and its label/setting FKs) alive
+      // via setStorageState; only a truly-gone file is deleted. When the batch also has
+      // the matching add (move within one batch), the add is then a no-op because
+      // scanSingleVar's cache check matches mtime+size against the now-current row.
+      // No in-mem patch needed here — the trailing buildFromDb() reloads packageIndex
+      // from DB whenever packagesChanged is set.
+      const unlinkedCanonicals = new Set()
+      for (const [canonical, events] of byCanonical) {
+        if (events.some((e) => e.type === 'unlink')) unlinkedCanonicals.add(canonical)
+      }
+      const relocated = unlinkedCanonicals.size > 0 ? await locateVars(allDirs, unlinkedCanonicals) : new Map()
 
       for (const [canonical, events] of byCanonical) {
         const adds = events.filter((e) => e.type !== 'unlink')
         const unlinks = events.filter((e) => e.type === 'unlink')
 
-        // Unlinks: probe every registered dir for a sibling before deleting. When the
-        // batch also has an add (cross-dir move within one batch), findElsewhere finds
-        // the new location and updates state; the add is then a no-op because
-        // scanSingleVar's cache check matches mtime+size against the now-current row.
-        // No in-mem patch needed here — the trailing buildFromDb() reloads packageIndex
-        // from DB whenever packagesChanged is set.
         if (unlinks.length > 0) {
-          const altLocation = await findElsewhere(canonical, allDirs)
+          const altLocation = relocated.get(canonical)
           if (altLocation) {
-            setStorageState(canonical, altLocation.storageState, altLocation.libraryDirId)
+            setStorageState(canonical, altLocation.storageState, altLocation.libraryDirId, altLocation.subpath)
             packagesChanged = true
           } else {
-            deletePackage(canonical)
-            packagesChanged = true
-            contentsChanged = true
+            // Soft-delete rather than DELETE: the file is gone from disk *right now*,
+            // but this is often transient — BrowserAssist's disable/offload renames the
+            // `.var` away and back within the same debounce window, and users relocate or
+            // unplug packages. Tombstoning hides the row from the gallery immediately
+            // while preserving its identity (hub link, labels, type override, content
+            // visibility) so a reappearance (see scanSingleVar's cache-hit branch)
+            // restores everything. A genuine delete just leaves a permanent tombstone,
+            // cleared only by the dev "Forget deleted packages" button.
+            if (markPackageMissing(canonical)) {
+              packagesChanged = true
+              contentsChanged = true
+            }
           }
         }
 
-        // Adds/changes: install or in-place state flip via scanSingleVar.
-        for (const { fullPath, type, isDisabled, libraryDirId } of adds) {
-          const newState = inferStorageState({ libraryDirId, isDisabled })
+        // Adds/changes: resolve the canonical's on-disk footprint, then (re)scan or
+        // reconcile state via scanSingleVar. For main we classify bare + `.disabled`
+        // sizes so a marker add flips state without re-reading the archive, and a
+        // legacy suffix file is read from its `.disabled` path. Multiple add events
+        // for one canonical (bare + its marker) collapse to a single resolution.
+        if (adds.length > 0) {
+          const { libraryDirId } = adds[0]
           try {
-            const result = await scanSingleVar(fullPath, newState, libraryDirId)
-            if (result) {
-              packagesChanged = true
-              contentsChanged = true
-              if (newState === 'enabled') newlyScannedEnabled.push(canonical)
-              autoHideCandidates.push({
-                filename: canonical,
-                pkgType: result.pkgType,
-                contentItems: result.contentItems,
-                packageName: result.packageName,
-                isNewInstall: result.isNewInstall,
-              })
+            let contentPath, storageState
+            if (libraryDirId != null) {
+              // Aux adds were already normalized to bare; always offloaded.
+              contentPath = adds[0].fullPath
+              storageState = 'offloaded'
+            } else {
+              const cls = await classifyMainVarOnDisk(join(dirname(adds[0].fullPath), canonical))
+              if (!cls.present) contentPath = null
+              else {
+                contentPath = cls.contentPath
+                storageState = cls.storageState
+              }
+            }
+            if (contentPath) {
+              const result = await scanSingleVar(contentPath, storageState, libraryDirId)
+              if (result) {
+                packagesChanged = true
+                if (storageState === 'enabled') newlyScannedEnabled.push(canonical)
+                // A cache-hit state flip (e.g. marker toggled) reconciles storage
+                // only — no content change, no auto-hide pass.
+                if (!result.reconciledOnly) {
+                  contentsChanged = true
+                  autoHideCandidates.push({
+                    filename: canonical,
+                    pkgType: result.pkgType,
+                    contentItems: result.contentItems,
+                    packageName: result.packageName,
+                    isNewInstall: result.isNewInstall,
+                  })
+                }
+              }
             }
           } catch (err) {
-            console.warn(`Watcher: ${type} failed for`, canonical, err.message)
+            console.warn(`Watcher: package event failed for`, canonical, err.message)
             notify('scan:unreadable', { filename: canonical })
           }
         }
@@ -531,6 +615,7 @@ async function processBatch() {
       // and `hidePackageContent` both wrap themselves in `withBulkWindow`
       // (nested with the outer one — depth-counted) and `recordOwnedPath`
       // their writes, so the resulting sidecar events get filtered out.
+      const extractRefreshAdditions = []
       if (autoHideCandidates.length > 0 && vamDirPath) {
         let sidecarsTouched = false
         for (const { filename, pkgType, contentItems, packageName, isNewInstall } of autoHideCandidates) {
@@ -544,6 +629,9 @@ async function processBatch() {
               })
               if (inherited) {
                 sidecarsTouched = true
+                if (inherited.donor) {
+                  extractRefreshAdditions.push({ filename, donorFilename: inherited.donor, contentItems })
+                }
                 continue
               }
             } catch (err) {
@@ -560,29 +648,41 @@ async function processBatch() {
           }
         }
         if (sidecarsTouched) setPrefsMap(await readAllPrefs(vamDirPath))
+        // buildFromDb already ran above (packagesChanged), so the new .var is
+        // resolvable; regenerate extracted presets for strictly-newer versions.
+        await refreshExtractedPresetsForUpdates(extractRefreshAdditions, vamDirPath)
       }
 
-      // Cascade-enable disabled/offloaded deps needed by newly enabled packages
-      if (newlyScannedEnabled.length > 0) {
-        const pkgIndex = getPackageIndex()
-        const fwd = getForwardDeps()
-        const allToEnable = new Set()
-        for (const fn of newlyScannedEnabled) {
-          for (const dep of computeCascadeEnable(fn, pkgIndex, fwd)) allToEnable.add(dep)
-        }
-        if (allToEnable.size > 0) {
-          for (const depFn of allToEnable) {
-            try {
-              await applyStorageState(depFn, { storageState: 'enabled', libraryDirId: null })
-            } catch (err) {
-              console.warn(`Cascade-enable failed for ${depFn}:`, err.message)
-            }
-          }
-        }
-      }
-
+      // Hub-enrich freshly-scanned enabled packages. Note: we intentionally do
+      // NOT cascade-enable their deps here — external FS changes never trigger
+      // state side effects on other packages (see `newlyScannedEnabled` above).
       if (newlyScannedEnabled.length > 0) {
         enrichNewPackages(newlyScannedEnabled)
+      }
+
+      // Reconcile extracted-preset enable/disable state against the (externally)
+      // changed package activeness — the same bookkeeping the app-driven toggle
+      // does, now also for VaM / sync-tool / other-instance changes. Unlike
+      // cascading deps, extracted presets are our own derived artifacts, so
+      // keeping them in sync isn't a surprising side effect. Full sweep: an
+      // external removal tombstones the owning package out of the store, so a
+      // targeted-by-filename pass couldn't reach a preset whose last owner just
+      // vanished (it's disabled, not deleted — removal is reversible). Renames
+      // are app-owned, so they buffer + drop in this batch's bulk window.
+      //
+      // PERF: runs a full sweep over every extracted preset on *any* package-
+      // changing batch, even ones that can't affect presets. It's an in-memory
+      // pass (no fs/DB unless something's actually out of sync), so cheap today.
+      // If extracted-preset counts ever grow enough to matter, gate this on an
+      // actual state-flip/removal and/or pass a targeted `filenames` set (with a
+      // separate orphan pass to cover tombstoned owners).
+      if (packagesChanged && vamDirPath) {
+        try {
+          const { changed } = await reconcileExtractedLifecycleAndResync({ vamDir: vamDirPath })
+          if (changed > 0) contentsChanged = true
+        } catch (err) {
+          console.warn('Watcher: extracted-preset reconcile failed:', err.message)
+        }
       }
     }
 
@@ -642,7 +742,9 @@ async function processBatch() {
         try {
           const rel = relative(vamDirPath, fullPath).split(sep).join('/')
           const sidecarExt = extname(rel).toLowerCase()
-          const internalPath = rel.slice(0, -sidecarExt.length)
+          // Bind to the canonical (live) path so the flag tracks the preset
+          // across the `.disabled` marker toggling.
+          const internalPath = stripDisabledSuffix(rel.slice(0, -sidecarExt.length))
           const key = LOCAL_PACKAGE_FILENAME + '/' + internalPath
           let exists = false
           try {
@@ -694,32 +796,80 @@ export async function __localPrefsEventSyncForTests(fullPath) {
 }
 
 /**
- * Probe every registered dir for the canonical filename. Aux dirs only accept the
- * suffix-less name (we normalize away `.disabled` in aux); main accepts both with
- * their respective enabled/disabled states. Returns the first match's location +
- * resolved storage_state.
+ * Locate the current on-disk home of each wanted canonical `.var` across every
+ * registered library dir, supporting nested placement (a `.var` may live in any
+ * subfolder under a library root). One recursive walk per dir, short-circuiting
+ * as soon as every wanted canonical is found.
+ *
+ * Dir precedence follows `dirs` order (main first), and within the tree a
+ * shallower / earlier match wins. Aux dirs accept only the suffix-less name (we
+ * normalize away the disabled spelling in aux); main classifies bare + disabled-
+ * sibling sizes (`classifyMainVar`) to distinguish enabled / marker-disabled /
+ * suffix-disabled (the sibling may be a VaM `.var.disabled` or a Qvaro `.DISABLED`
+ * rename), and treats a lone empty marker as "not found".
+ *
+ * @returns {Promise<Map<string, { libraryDirId: number|null, storageState: string, subpath: string }>>}
  */
-async function findElsewhere(canonical, dirs) {
+async function locateVars(dirs, wanted) {
+  const out = new Map()
+  const remaining = new Set(wanted)
   for (const { id, path: dirPath } of dirs) {
+    if (remaining.size === 0) break
     if (!dirPath) continue
-    const enabledPath = join(dirPath, canonical)
-    try {
-      await stat(enabledPath)
-      return { libraryDirId: id, storageState: id == null ? 'enabled' : 'offloaded' }
-    } catch {}
-    if (id == null) {
-      // Main dir: also probe the .disabled variant.
-      try {
-        await stat(enabledPath + '.disabled')
-        return { libraryDirId: null, storageState: 'disabled' }
-      } catch {}
-    }
+    await locateWalk(dirPath, dirPath, id, remaining, out)
   }
-  return null
+  return out
+}
+
+async function locateWalk(root, dir, libraryDirId, remaining, out) {
+  if (remaining.size === 0) return
+  let entries
+  try {
+    entries = await readdir(dir, { withFileTypes: true })
+  } catch {
+    return // unreadable subdir — skip, mirrors the scanner's silent-skip
+  }
+  const subdirs = []
+  const files = new Set()
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) continue // never follow symlinks (matches the scanner/parcel)
+    if (entry.isDirectory()) subdirs.push(entry.name)
+    else if (entry.isFile()) files.add(entry.name)
+  }
+  const rel = relative(root, dir) // dir's own subpath relative to the library root ('' at root)
+  const subpath = rel ? rel.split(sep).join('/') : ''
+  for (const canonical of [...remaining]) {
+    if (libraryDirId != null) {
+      // Aux dirs are suffix-less in our model (offloaded == active).
+      if (files.has(canonical)) {
+        out.set(canonical, { libraryDirId, storageState: 'offloaded', subpath })
+        remaining.delete(canonical)
+      }
+      continue
+    }
+    // Gate on the dirent set first so we only stat canonicals actually present
+    // in this folder, then classify their bare/`.var.disabled`/Qvaro `.DISABLED`
+    // footprint on disk.
+    if (!files.has(canonical) && !files.has(canonical + '.disabled') && !files.has(qvaroDisabledName(canonical)))
+      continue
+    const cls = await classifyMainVarOnDisk(join(dir, canonical))
+    if (!cls.present) continue // e.g. only an empty marker — no content here
+    out.set(canonical, {
+      libraryDirId,
+      storageState: cls.storageState,
+      subpath,
+    })
+    remaining.delete(canonical)
+  }
+  for (const name of subdirs) {
+    if (remaining.size === 0) return
+    await locateWalk(root, join(dir, name), libraryDirId, remaining, out)
+  }
 }
 
 async function scanSingleVar(fullPath, storageState, libraryDirId) {
   const filename = canonicalVarFilename(basename(fullPath))
+  const subpath = libraryRelSubpath(getLibraryDirPath(libraryDirId), fullPath)
 
   let s
   try {
@@ -731,10 +881,24 @@ async function scanSingleVar(fullPath, storageState, libraryDirId) {
   const mtime = s.mtimeMs / 1000
   const size = s.size
 
-  const cached = getPackageCacheInfo(filename)
+  const cached = getPackageReconcileInfo(filename)
   if (cached && cached.file_mtime === mtime && cached.size_bytes === size) {
-    if (cached.storage_state !== storageState || (cached.library_dir_id ?? null) !== (libraryDirId ?? null)) {
-      setStorageState(filename, storageState, libraryDirId)
+    // Content bytes unchanged. Reconcile location/state cheaply (no archive read).
+    // This is the path a marker add/remove takes: the bare `.var` is untouched,
+    // so we cache-hit here and only flip storage_state.
+    //
+    // A set `missing_since` means this file was tombstoned (an earlier unlink in
+    // this or a prior batch) and has now reappeared byte-identical — the classic
+    // BrowserAssist rename-away-and-back. setStorageState clears the tombstone, so
+    // we must force the reconcile path even when state/location already match.
+    if (
+      cached.storage_state !== storageState ||
+      (cached.library_dir_id ?? null) !== (libraryDirId ?? null) ||
+      (cached.subpath ?? '') !== subpath ||
+      cached.missing_since != null
+    ) {
+      setStorageState(filename, storageState, libraryDirId, subpath)
+      return { reconciledOnly: true }
     }
     return null // no change
   }
@@ -744,6 +908,6 @@ async function scanSingleVar(fullPath, storageState, libraryDirId) {
   // it to decide between inheriting from an older version vs applying default
   // auto-hide rules. Stale-cache rescans (row exists, content changed) are not
   // new installs.
-  const result = await scanAndUpsert(fullPath, { storageState, libraryDirId, isDirect: 1 })
+  const result = await scanAndUpsert(fullPath, { storageState, libraryDirId, subpath, isDirect: 1 })
   return result ? { ...result, isNewInstall: !cached } : null
 }

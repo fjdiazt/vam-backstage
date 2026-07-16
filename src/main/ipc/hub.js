@@ -9,25 +9,22 @@ import {
 import {
   findLocalByHubResourceId,
   findLocalByFilename,
+  annotateInstallState,
   getCreatorsNeedingUserId,
   getPackageIndex,
   getGroupIndex,
   buildFromDb,
+  resolveHubDownloadUrl,
 } from '../store.js'
 import { resolveRef } from '../scanner/graph.js'
 import {
-  deleteHubWishlist,
-  clearHubHidden,
-  deleteHubHidden,
-  getHubHiddenIds,
-  listHubHidden,
+  getNotFoundHubResourceIds,
   setHubResourceId,
   setHubUserId,
   setHubDisplayName,
   upsertHubUser,
   setPackageHubMeta,
   transact,
-  upsertHubHidden,
 } from '../db.js'
 import { cacheAvatarsFromResources } from '../avatar-cache.js'
 import { notify } from '../notify.js'
@@ -37,11 +34,11 @@ import {
   getResourceUserState,
   toggleFavorite,
   toggleBookmark,
+  toggleRate,
   toggleLike,
   neutralResourceState,
   HubAuthError,
 } from '../hub/interactions.js'
-import { listWishlist, toggleWishlist, wishlistIds } from '../hub/wishlist.js'
 
 export function registerHubHandlers() {
   ipcMain.handle('hub:filters', async () => {
@@ -93,19 +90,8 @@ export function registerHubHandlers() {
   ipcMain.handle('hub:toggleBookmark', (_, id, currentlyBookmarked) =>
     withAuthGuard(toggleBookmark)(id, currentlyBookmarked),
   )
-  ipcMain.handle('hub:toggleLike', (_, id, currentlyLiked) => withAuthGuard(toggleLike)(id, currentlyLiked))
-
-  ipcMain.handle('hub:wishlist:list', () => listWishlist())
-  ipcMain.handle('hub:wishlist:ids', () => wishlistIds())
-  ipcMain.handle('hub:wishlist:toggle', async (_, resource) => {
-    return await toggleWishlist(resource)
-  })
-
-  ipcMain.handle('hub:hidden:list', () => listHubHidden())
-  ipcMain.handle('hub:hidden:ids', () => getHubHiddenIds())
-  ipcMain.handle('hub:hidden:hide', (_, resource) => upsertHubHidden(resource))
-  ipcMain.handle('hub:hidden:unhide', (_, resourceId) => deleteHubHidden(resourceId))
-  ipcMain.handle('hub:hidden:clear', () => clearHubHidden())
+  ipcMain.handle('hub:toggleRate', (_, id, currentlyRated) => withAuthGuard(toggleRate)(id, currentlyRated))
+  ipcMain.handle('hub:toggleLike', (_, id) => withAuthGuard(toggleLike)(id))
 
   ipcMain.handle('hub:search', async (_, params) => {
     const result = await searchResources(params)
@@ -113,16 +99,7 @@ export function registerHubHandlers() {
     // Annotate resources with local install status (for renderer)
     const locals = []
     for (const resource of result.resources) {
-      const local = findLocalByHubResourceId(resource.resource_id)
-      if (local) {
-        resource._installed = true
-        resource._isDirect = !!local.is_direct
-        resource._localFilename = local.filename
-      } else {
-        resource._installed = false
-        resource._isDirect = false
-      }
-      locals.push(local)
+      locals.push(annotateInstallState(resource))
     }
 
     // Batch all DB writes in a single transaction (search_json auto-persisted by searchResources)
@@ -132,7 +109,6 @@ export function registerHubHandlers() {
         for (let i = 0; i < result.resources.length; i++) {
           const resource = result.resources[i]
           const local = locals[i]
-          if (local?.is_direct) deleteHubWishlist(resource.resource_id)
           if (resource.user_id) {
             upsertHubUser(String(resource.user_id), resource.username, {
               user_id: resource.user_id,
@@ -197,11 +173,7 @@ export function registerHubHandlers() {
     const out = {}
     const isReal = (v) => v && v !== 'null'
     for (const [ref, hubFile] of Object.entries(hubResults)) {
-      const url = isReal(hubFile.downloadUrl)
-        ? hubFile.downloadUrl
-        : isReal(hubFile.urlHosted)
-          ? hubFile.urlHosted
-          : null
+      const url = resolveHubDownloadUrl(hubFile)
       const available = !!(isReal(hubFile.filename) && url)
       out[ref] = {
         available,
@@ -239,6 +211,8 @@ export function registerHubHandlers() {
 
     // Check installed status from hubFiles filenames
     let displayNameBackfilled = false
+    let hubIdRelinked = false
+    const notFoundIds = getNotFoundHubResourceIds()
     if (detail.hubFiles?.length) {
       for (const file of detail.hubFiles) {
         const local = findLocalByFilename(file.filename)
@@ -249,9 +223,16 @@ export function registerHubHandlers() {
             detail._isDirect = !!local.is_direct
             detail._localFilename = local.filename
           }
-          if (!local.hub_resource_id && detail.resource_id) {
+          // Filename matching can heal a missing/dead link after a Hub re-publish,
+          // but must not replace a different live association just because this
+          // page happens to list the same file.
+          if (detail.resource_id && (!local.hub_resource_id || notFoundIds.has(String(local.hub_resource_id)))) {
             try {
-              setHubResourceId(local.filename, String(detail.resource_id))
+              const rid = String(detail.resource_id)
+              if (setHubResourceId(local.filename, rid) > 0) {
+                local.hub_resource_id = rid
+                hubIdRelinked = true
+              }
             } catch {}
           }
           if (detail.user_id && !local.hub_user_id) {
@@ -309,7 +290,7 @@ export function registerHubHandlers() {
 
     cacheAvatarsFromResources([detail])
       .then(() => {
-        let needsRebuild = displayNameBackfilled
+        let needsRebuild = displayNameBackfilled || hubIdRelinked
         if (detail.user_id && detail.username) {
           const norm = detail.username.replace(/\s/g, '').toLowerCase()
           const filenames = getCreatorsNeedingUserId().get(norm)

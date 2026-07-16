@@ -1,14 +1,15 @@
 import { join, dirname } from 'path'
-import { readFile, access, writeFile, mkdir } from 'fs/promises'
+import { readFile, access, writeFile, mkdir, unlink } from 'fs/promises'
 import { constants } from 'fs'
 import { createHash } from 'crypto'
 import { isLocalPackage } from '@shared/local-package.js'
-import { app } from 'electron'
+import { hubResourceIconUrl } from '@shared/hub-http.js'
+import { app, net, nativeImage } from 'electron'
 import { getSetting, getContentThumbnailPath } from './db.js'
 import { extractFile, extractFiles } from './scanner/var-reader.js'
 import { getPackageIndex } from './store.js'
 import { pLimit } from './p-limit.js'
-import { pkgVarPath } from './library-dirs.js'
+import { pkgVarPath, resolveContentPath } from './library-dirs.js'
 
 const MAX_ENTRIES = 3000
 // Bounded concurrency for thumbnail jobs (companion-jpg reads, loose ct: reads,
@@ -16,6 +17,14 @@ const MAX_ENTRIES = 3000
 // headroom without queue padding; sequential awaits on a 50-card cold batch
 // otherwise gate the renderer on whichever single archive is slowest under AV.
 const THUMB_CONCURRENCY = 8
+/** Side length of dependency-graph point tiles (matches renderer atlas). */
+const GRAPH_THUMB_PX = 64
+/** nativeImage.resize is sync — one at a time, then yield so IPC can pump. */
+const GRAPH_RESIZE_YIELD_EVERY = 8
+/** Full-res → tile in chunks so getThumbnails never holds the whole library at once. */
+const GRAPH_RESIZE_CHUNK = 200
+/** Parallel reads of already-resized graph tiles from disk. */
+const GRAPH_TILE_READ_CONCURRENCY = 32
 const cache = new Map()
 
 function touchLru(key) {
@@ -32,7 +41,7 @@ function evict() {
   for (let i = 0; i < toDelete; i++) cache.delete(iter.next().value)
 }
 
-function getThumbCacheDir() {
+export function getThumbCacheDir() {
   return join(app.getPath('userData'), 'thumb-cache')
 }
 
@@ -45,9 +54,9 @@ async function tryReadFile(filePath) {
   }
 }
 
-function resolveVarPath(filename) {
+async function resolveVarPath(filename) {
   const pkg = getPackageIndex().get(filename)
-  return pkgVarPath(pkg) ?? null
+  return (await resolveContentPath(pkg)) ?? null
 }
 
 // Persist extracted thumbnails to thumb-cache/ so subsequent launches read a
@@ -64,20 +73,54 @@ async function ensureThumbCacheDir(thumbCacheDir) {
   } catch {}
 }
 
-// Per-content (ct:) thumbs share a `.var` filename namespace with the package
-// thumb, so we suffix with a sha1 of the internal path. 16 hex chars is plenty
-// — collision space is per-archive, not global.
-function ctCacheFilename(packageFilename, internalPath) {
+// Per-content thumbs share a `.var` filename namespace with the package thumb,
+// so we suffix with a sha1 of the internal path. 16 hex chars is plenty —
+// collision space is per-archive, not global. The package card's own thumb is
+// just its representative content thumb, so it reuses this same entry.
+export function ctCacheFilename(packageFilename, internalPath) {
   const hash = createHash('sha1').update(internalPath).digest('hex').slice(0, 16)
   return packageFilename + '__' + hash + '.jpg'
 }
 
-async function persistVarThumb(thumbCacheDir, filename, buf) {
-  if (!buf?.length) return
+// A Hub resource's CDN icon, keyed by resource id. Shared by installed packages
+// (via hub_resource_id, written by thumb-resolver) and wishlist cards (which
+// have no local `.var` name) — one file serves either view.
+export function hubIconCacheFile(thumbCacheDir, rid) {
+  return join(thumbCacheDir, `hub-icon-${rid}.jpg`)
+}
+
+/**
+ * Resolve a wishlist resource thumbnail: disk cache first, then a CDN fetch on
+ * miss (persisted for next time). `imageUrl` is the snapshot's own `image_url`
+ * when known; otherwise the URL is derived from the resource id. Returns the
+ * JPEG buffer or null. Never throws.
+ */
+async function getHubResThumb(thumbCacheDir, rid, imageUrl) {
+  const file = hubIconCacheFile(thumbCacheDir, rid)
+  let buf = await tryReadFile(file)
+  if (buf) return buf
+  const url = imageUrl || hubResourceIconUrl(rid)
+  if (!url) return null
   try {
+    const res = await net.fetch(url)
+    if (!res.ok) return null
+    buf = Buffer.from(await res.arrayBuffer())
+    if (!buf.length) return null
     await ensureThumbCacheDir(thumbCacheDir)
-    await writeFile(join(thumbCacheDir, filename + '.jpg'), buf)
-  } catch {}
+    await writeFile(file, buf)
+    return buf
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Proactively cache a wishlist resource's thumbnail (fire-and-forget from
+ * `wishlist:add`) so it survives the resource later disappearing from the Hub.
+ */
+export async function prefetchHubResThumbnail(rid, imageUrl) {
+  const thumbCacheDir = getThumbCacheDir()
+  await getHubResThumb(thumbCacheDir, String(rid), imageUrl)
 }
 
 async function persistCtThumb(thumbCacheDir, packageFilename, internalPath, buf) {
@@ -88,20 +131,101 @@ async function persistCtThumb(thumbCacheDir, packageFilename, internalPath, buf)
   } catch {}
 }
 
+/** On-disk path for a 64×64 graph tile derived from a full thumbnail key. */
+function graphTilePath(thumbCacheDir, key) {
+  const hash = createHash('sha1').update(key).digest('hex').slice(0, 16)
+  return join(thumbCacheDir, 'graph64', `${hash}.jpg`)
+}
+
 /**
  * Drop specific keys from the in-memory thumbnail buffer cache so the next
  * `getThumbnails` call re-reads from disk (or re-extracts). Used by
  * thumb-resolver after it writes a fresh Hub thumbnail to `thumb-cache/`, so
  * the previously cached fallback (internal .var thumb or null) isn't served.
+ * Also drops derived graph64 tiles so the next graph open rebuilds from the
+ * fresh full-size image.
  */
 export function invalidateThumbnailCache(keys) {
   if (!keys?.length) return
-  for (const key of keys) cache.delete(key)
+  const thumbCacheDir = getThumbCacheDir()
+  for (const key of keys) {
+    cache.delete(key)
+    void unlink(graphTilePath(thumbCacheDir, key)).catch(() => {})
+  }
+}
+
+/**
+ * Resize a full JPEG/PNG buffer to a square graph tile via Electron's
+ * nativeImage (no extra native deps). Sync work — callers must yield between
+ * batches so the message pump stays responsive.
+ */
+function resizeToGraphTile(buf) {
+  const img = nativeImage.createFromBuffer(buf)
+  if (img.isEmpty()) return null
+  return img.resize({ width: GRAPH_THUMB_PX, height: GRAPH_THUMB_PX, quality: 'better' }).toJPEG(75)
+}
+
+const yieldToEventLoop = () => new Promise((r) => setImmediate(r))
+
+/**
+ * Bulk thumbnails for the dependency graph: 64×64 JPEGs from `thumb-cache/graph64/`,
+ * built on demand from the normal full-size thumbnail pipeline. Warm hits are
+ * tiny IPC payloads; cold misses resize in chunks, yielding so main stays free.
+ *
+ * @param {string[]} keys Same keys as `getThumbnails` (`pkg:…`, etc.)
+ * @returns {Promise<Record<string, Buffer|null>>}
+ */
+export async function getGraphThumbnails(keys) {
+  if (!keys?.length) return {}
+  const thumbCacheDir = getThumbCacheDir()
+  const graphDir = join(thumbCacheDir, 'graph64')
+  await ensureThumbCacheDir(thumbCacheDir)
+  try {
+    await mkdir(graphDir, { recursive: true })
+  } catch {}
+
+  const results = {}
+  const misses = []
+  const readLimit = pLimit(GRAPH_TILE_READ_CONCURRENCY)
+  await Promise.all(
+    keys.map((key) =>
+      readLimit(async () => {
+        const buf = await tryReadFile(graphTilePath(thumbCacheDir, key))
+        if (buf) results[key] = buf
+        else misses.push(key)
+      }),
+    ),
+  )
+  if (misses.length === 0) return results
+
+  for (let i = 0; i < misses.length; i += GRAPH_RESIZE_CHUNK) {
+    const chunk = misses.slice(i, i + GRAPH_RESIZE_CHUNK)
+    const full = await getThumbnails(chunk)
+    let sinceYield = 0
+    for (const key of chunk) {
+      const src = full[key]
+      if (!src?.length) {
+        results[key] = null
+        continue
+      }
+      try {
+        const tile = resizeToGraphTile(src)
+        results[key] = tile
+        if (tile) void writeFile(graphTilePath(thumbCacheDir, key), tile).catch(() => {})
+      } catch {
+        results[key] = null
+      }
+      sinceYield++
+      if (sinceYield >= GRAPH_RESIZE_YIELD_EVERY) {
+        sinceYield = 0
+        await yieldToEventLoop()
+      }
+    }
+  }
+  return results
 }
 
 export async function getThumbnails(keys) {
-  const vamDir = getSetting('vam_dir')
-  if (!vamDir) return {}
   const thumbCacheDir = getThumbCacheDir()
   const results = {}
 
@@ -111,20 +235,44 @@ export async function getThumbnails(keys) {
     results[key] = v
   }
 
-  // First pass: serve cache hits, classify the rest into job buckets. Group
-  // ct: keys by varPath so one yauzl open extracts every needed thumb from a
-  // given archive.
-  const pkgJobs = []
-  const ctLooseJobs = []
-  const varExtractions = new Map()
+  const limit = pLimit(THUMB_CONCURRENCY)
 
+  // hub-icon:{rid} keys are keyed by hub resource id and hit only the disk cache /
+  // CDN — they don't depend on the local library, so resolve them regardless of
+  // whether vam_dir is configured (and before the guard below).
+  const hubResJobs = []
+  const otherKeys = []
   for (const key of keys) {
     if (cache.has(key)) {
       touchLru(key)
       results[key] = cache.get(key)
       continue
     }
+    if (key.startsWith('hub-icon:')) hubResJobs.push({ key, rid: key.slice(9) })
+    else otherKeys.push(key)
+  }
 
+  const hubResPromises = hubResJobs.map(({ key, rid }) =>
+    limit(async () => {
+      setKey(key, await getHubResThumb(thumbCacheDir, rid))
+    }),
+  )
+
+  const vamDir = getSetting('vam_dir')
+  if (!vamDir) {
+    await Promise.all(hubResPromises)
+    return results
+  }
+
+  // First pass: classify the remaining (library) keys into job buckets. Group
+  // ct: keys by canonical filename so one yauzl open extracts every needed thumb
+  // from a given archive. The physical `.var` path is resolved lazily, only if
+  // that archive actually has to be opened (see varPromises below).
+  const pkgJobs = []
+  const ctLooseJobs = []
+  const varExtractions = new Map()
+
+  for (const key of otherKeys) {
     if (key.startsWith('pkg:')) {
       const filename = key.slice(4)
       if (isLocalPackage(filename)) {
@@ -150,49 +298,50 @@ export async function getThumbnails(keys) {
         ctLooseJobs.push({ key, fullPath: join(vamDir, thumbPath) })
         continue
       }
-      const varPath = resolveVarPath(filename)
-      if (!varPath) {
-        setKey(key, null)
-        continue
-      }
-      let group = varExtractions.get(varPath)
+      let group = varExtractions.get(filename)
       if (!group) {
-        group = { filename, items: [] }
-        varExtractions.set(varPath, group)
+        group = { items: [] }
+        varExtractions.set(filename, group)
       }
       group.items.push({ key, internalPath: thumbPath })
     }
   }
 
-  const limit = pLimit(THUMB_CONCURRENCY)
-
   const pkgPromises = pkgJobs.map(({ key, filename }) =>
     limit(async () => {
-      // Resolve once per job so a missing/aux-relocated package contributes a
-      // null thumb rather than throwing. Companion .jpg lives next to the
-      // current physical .var (could be aux dir or `.var.disabled` in main).
-      const varPath = resolveVarPath(filename)
+      // The companion .jpg and every cache lookup only need the *directory*, which
+      // is the same whether the bytes sit in the bare `.var` or a `.var.disabled`
+      // sibling — so use the nominal path (no disk probe). The physical byte path
+      // is resolved lazily below, only if we must open the archive.
+      const pkg = getPackageIndex().get(filename)
+      const nominalPath = pkgVarPath(pkg) ?? null
 
       // 1. Companion .jpg next to the .var (always named with .var stem, never .disabled)
       let buf = null
-      if (varPath) {
-        buf = await tryReadFile(join(dirname(varPath), filename.replace(/\.var$/i, '.jpg')))
+      if (nominalPath) {
+        buf = await tryReadFile(join(dirname(nominalPath), filename.replace(/\.var$/i, '.jpg')))
       }
-      // 2. Hub thumbnail cache (also where persistVarThumb writes to)
-      if (!buf) buf = await tryReadFile(join(thumbCacheDir, filename + '.jpg'))
-      // 3. First content thumbnail from inside the .var (may be .var.disabled on disk)
-      if (!buf && varPath) {
+      // 2. Hub CDN icon (resolved by thumb-resolver), keyed by resource id and
+      //    shared with wishlist cards for the same resource.
+      if (!buf && pkg?.hub_resource_id) {
+        buf = await tryReadFile(hubIconCacheFile(thumbCacheDir, pkg.hub_resource_id))
+      }
+      // 3. Representative content thumb from inside the .var. It's the same image
+      //    (and same cache entry) a content card uses, so package and content
+      //    views share one file — no Hub gating needed, the icon lives under a
+      //    separate name.
+      if (!buf) {
         const internalPath = getContentThumbnailPath(filename)
         if (internalPath) {
-          try {
-            buf = await extractFile(varPath, internalPath)
-          } catch {}
-          // Race-free gating: only persist when this package isn't on the Hub.
-          // If hub_resource_id is set, thumb-resolver owns the same path and
-          // will overwrite with a CDN thumb; we step aside. If unset, the
-          // resolver early-outs and leaves the path to us forever.
-          if (buf && !getPackageIndex().get(filename)?.hub_resource_id) {
-            void persistVarThumb(thumbCacheDir, filename, buf)
+          buf = await tryReadFile(join(thumbCacheDir, ctCacheFilename(filename, internalPath)))
+          if (!buf) {
+            const varPath = await resolveContentPath(pkg)
+            if (varPath) {
+              try {
+                buf = await extractFile(varPath, internalPath)
+              } catch {}
+              if (buf) void persistCtThumb(thumbCacheDir, filename, internalPath, buf)
+            }
           }
         }
       }
@@ -207,11 +356,12 @@ export async function getThumbnails(keys) {
     }),
   )
 
-  const varPromises = [...varExtractions.entries()].map(([varPath, group]) =>
+  const varPromises = [...varExtractions.entries()].map(([filename, group]) =>
     limit(async () => {
-      const { filename, items } = group
+      const { items } = group
       // Disk-cache lookup first: any item whose extracted thumb is already
-      // persisted skips yauzl. If every item is cached, the .var never opens.
+      // persisted skips yauzl. If every item is cached, the .var never opens
+      // (and we never resolve its physical path — no disk probe on the hot path).
       const cacheReads = await Promise.all(
         items.map((it) => tryReadFile(join(thumbCacheDir, ctCacheFilename(filename, it.internalPath)))),
       )
@@ -223,6 +373,11 @@ export async function getThumbnails(keys) {
         else need.push(it)
       }
       if (need.length === 0) return
+      const varPath = await resolveVarPath(filename)
+      if (!varPath) {
+        for (const { key } of need) setKey(key, null)
+        return
+      }
       try {
         const paths = need.map((i) => i.internalPath)
         const extracted = await extractFiles(varPath, paths)
@@ -237,7 +392,7 @@ export async function getThumbnails(keys) {
     }),
   )
 
-  await Promise.all([...pkgPromises, ...ctLoosePromises, ...varPromises])
+  await Promise.all([...hubResPromises, ...pkgPromises, ...ctLoosePromises, ...varPromises])
 
   evict()
   return results

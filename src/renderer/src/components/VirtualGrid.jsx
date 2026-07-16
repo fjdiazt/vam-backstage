@@ -1,6 +1,6 @@
 import { useRef, useState, useCallback, useEffect, useLayoutEffect } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import BackToTopButton from './BackToTopButton'
+import { ScrollToTopButton } from '@/components/ScrollToTopButton'
 
 /**
  * Virtualised grid: column count follows min track width; cells share row width
@@ -22,60 +22,30 @@ export function VirtualGrid({
   overscan = 3,
   padding = 16,
   scrollResetKey,
-  restoreIndex = null,
-  restoreKey = '',
   onLayout,
-  onFirstVisibleIndexChange,
   /** When bulk selection is on, clear it on pointer down outside any `[data-grid-card]` (gaps, padding, empty scroll area). */
   onEmptyAreaPointerDown,
-  showBackToTop = false,
+  /** Flat index of the selected item; keeps keyboard selection visible in the viewport. */
+  selectedIndex,
+  /** Fired when the last visible row is within `endReachedThreshold` rows of the end (infinite scroll). */
+  onEndReached,
+  /** How many rows from the bottom trigger `onEndReached`. `range.endIndex` already includes `overscan`,
+   *  so a small value fires roughly a viewport-plus before the end (matches the old ~1600px prefetch margin). */
+  endReachedThreshold = 4,
+  /** Rendered below the virtualised rows, inside the scroll container (e.g. "Loading more…"). */
+  footer,
+  /** When true, suppress the default "No items found" message (caller renders its own empty state). */
+  hideEmptyMessage = false,
 }) {
   const rowGap = gapY ?? gap
   const scrollRef = useRef(null)
   const [layout, setLayout] = useState({ cols: 1, cellWidth: itemWidth })
-  const [layoutReady, setLayoutReady] = useState(false)
   const layoutRef = useRef(layout)
-  const layoutReadyRef = useRef(false)
   const scrollFixRef = useRef(null)
   const anchorRef = useRef(0)
   const suppressAnchorRef = useRef(false)
-  const consumedRestoreKeyRef = useRef('')
-  const lastFirstVisibleIndexRef = useRef(null)
-  const onFirstVisibleIndexChangeRef = useRef(onFirstVisibleIndexChange)
-
-  useLayoutEffect(() => {
-    onFirstVisibleIndexChangeRef.current = onFirstVisibleIndexChange
-  }, [onFirstVisibleIndexChange])
-
-  const emitFirstVisibleIndex = useCallback((index) => {
-    if (lastFirstVisibleIndexRef.current === index) return
-    lastFirstVisibleIndexRef.current = index
-    onFirstVisibleIndexChangeRef.current?.(index)
-  }, [])
-
-  const markLayoutReady = useCallback(() => {
-    if (layoutReadyRef.current) return
-    layoutReadyRef.current = true
-    setLayoutReady(true)
-  }, [])
-
-  const markLayoutNotReady = useCallback(() => {
-    if (!layoutReadyRef.current) return
-    layoutReadyRef.current = false
-    setLayoutReady(false)
-  }, [])
-
-  const measureLayout = useCallback(
-    (el) => {
-      const avail = el.clientWidth - padding * 2
-      if (avail <= 0) return null
-      const cols = Math.max(1, Math.floor((avail + gap) / (itemWidth + gap)))
-      const cellWidth = (avail - (cols - 1) * gap) / cols
-      if (cellWidth <= 0) return null
-      return { cols, cellWidth, availableWidth: avail }
-    },
-    [gap, itemWidth, padding],
-  )
+  const committedKeyRef = useRef(scrollResetKey)
+  const scrollTopRef = useRef(0)
 
   const scalingHeight = itemHeight - fixedHeight
   const calcRowHeight = useCallback(
@@ -88,87 +58,28 @@ export function VirtualGrid({
     const el = scrollRef.current
     if (!el) return
     const onScroll = () => {
+      // Hiding via <Activity> (display:none) clamps scrollTop to 0 and can fire a
+      // scroll event before this listener is cleaned up — don't let it zero the anchor.
+      if (el.clientHeight === 0) return
       if (suppressAnchorRef.current) return
       const { cols, cellWidth } = layoutRef.current
       const rowH = calcRowHeight(cellWidth) + rowGap
       const topRow = Math.max(0, Math.floor((el.scrollTop - padding) / rowH))
       anchorRef.current = topRow * cols
-      emitFirstVisibleIndex(anchorRef.current)
     }
     el.addEventListener('scroll', onScroll, { passive: true })
     return () => el.removeEventListener('scroll', onScroll)
-  }, [calcRowHeight, rowGap, padding, emitFirstVisibleIndex])
-
-  useLayoutEffect(() => {
-    const el = scrollRef.current
-    if (!el) return
-    if (restoreKey && consumedRestoreKeyRef.current !== restoreKey) return
-    if (el.scrollTop === 0) {
-      anchorRef.current = 0
-      emitFirstVisibleIndex(0)
-      return
-    }
-    suppressAnchorRef.current = true
-    el.scrollTop = 0
-    anchorRef.current = 0
-    emitFirstVisibleIndex(0)
-    requestAnimationFrame(() => {
-      suppressAnchorRef.current = false
-    })
-  }, [scrollResetKey, restoreKey, emitFirstVisibleIndex])
-
-  useLayoutEffect(() => {
-    if (!layoutReady || !restoreKey || consumedRestoreKeyRef.current === restoreKey) return
-    if (restoreIndex == null || restoreIndex < 0) return
-    const el = scrollRef.current
-    if (!el) return
-    const measured = measureLayout(el)
-    if (!measured) {
-      markLayoutNotReady()
-      return
-    }
-    const prev = layoutRef.current
-    const layoutChanged = prev.cols !== measured.cols || Math.abs(prev.cellWidth - measured.cellWidth) >= 0.5
-    if (layoutChanged) {
-      const next = { cols: measured.cols, cellWidth: measured.cellWidth }
-      layoutRef.current = next
-      setLayout(next)
-      onLayout?.(measured)
-    }
-    const { cols, cellWidth } = measured
-    const rowH = calcRowHeight(cellWidth) + rowGap
-    const row = Math.floor(restoreIndex / Math.max(1, cols))
-    const targetTop = padding + row * rowH
-    consumedRestoreKeyRef.current = restoreKey
-    suppressAnchorRef.current = true
-    el.scrollTop = targetTop
-    anchorRef.current = row * cols
-    emitFirstVisibleIndex(anchorRef.current)
-    requestAnimationFrame(() => {
-      suppressAnchorRef.current = false
-    })
-  }, [
-    layoutReady,
-    restoreIndex,
-    restoreKey,
-    calcRowHeight,
-    rowGap,
-    padding,
-    emitFirstVisibleIndex,
-    measureLayout,
-    markLayoutNotReady,
-    onLayout,
-  ])
+  }, [calcRowHeight, rowGap, padding])
 
   const measure = useCallback(() => {
     const el = scrollRef.current
-    if (!el) return
-    const measured = measureLayout(el)
-    if (!measured) {
-      markLayoutNotReady()
-      return
-    }
-    const { cols: newCols, cellWidth: newCellWidth, availableWidth: avail } = measured
+    // The ResizeObserver fires with a 0-size box when <Activity> hides us; a
+    // 0-width measure would commit cols:1 / negative cellWidth, collapsing the
+    // virtual height so the scroll restore on reveal gets clamped back to 0.
+    if (!el || el.clientWidth === 0) return
+    const avail = el.clientWidth - padding * 2
+    const newCols = Math.max(1, Math.floor((avail + gap) / (itemWidth + gap)))
+    const newCellWidth = (avail - (newCols - 1) * gap) / newCols
 
     const prev = layoutRef.current
     const colsChanged = prev.cols !== newCols || Math.abs(prev.cellWidth - newCellWidth) >= 0.5
@@ -176,7 +87,6 @@ export function VirtualGrid({
     // but only update internal layout state (and fix scroll) when columns actually change.
     if (!colsChanged) {
       onLayout?.({ cols: newCols, cellWidth: newCellWidth, availableWidth: avail })
-      markLayoutReady()
       return
     }
 
@@ -190,8 +100,7 @@ export function VirtualGrid({
     layoutRef.current = next
     setLayout(next)
     onLayout?.({ cols: newCols, cellWidth: newCellWidth, availableWidth: avail })
-    markLayoutReady()
-  }, [calcRowHeight, rowGap, padding, onLayout, markLayoutReady, markLayoutNotReady, measureLayout])
+  }, [itemWidth, calcRowHeight, gap, rowGap, padding, onLayout])
 
   useEffect(() => {
     measure()
@@ -211,6 +120,29 @@ export function VirtualGrid({
     overscan,
   })
 
+  const onEndReachedRef = useRef(onEndReached)
+  onEndReachedRef.current = onEndReached
+  const rangeEndIndex = virtualizer.range?.endIndex ?? -1
+  useEffect(() => {
+    if (!onEndReachedRef.current || rowCount === 0) return
+    if (rangeEndIndex < 0) return
+    if (rangeEndIndex >= rowCount - 1 - endReachedThreshold) onEndReachedRef.current()
+  }, [rangeEndIndex, rowCount, endReachedThreshold, items.length])
+
+  // Scroll to the selection only when it actually changes. <Activity> re-runs all
+  // effects on reveal regardless of deps, and right after reveal the virtualizer's
+  // scroll rect is still the stale hidden one (0-height), so align:'auto' treats the
+  // selected row as out of view and scrolls to it — clobbering the offset the
+  // reset/restore effect below just restored.
+  const lastScrolledSelectionRef = useRef(null)
+  useEffect(() => {
+    if (selectedIndex == null || selectedIndex < 0 || !items.length) return
+    if (lastScrolledSelectionRef.current === selectedIndex) return
+    lastScrolledSelectionRef.current = selectedIndex
+    const row = Math.floor(selectedIndex / cols)
+    virtualizer.scrollToIndex(row, { align: 'auto' })
+  }, [selectedIndex, cols, items.length, virtualizer])
+
   useLayoutEffect(() => {
     virtualizer.measure()
     if (scrollFixRef.current != null) {
@@ -226,20 +158,62 @@ export function VirtualGrid({
     }
   }, [cols, cellWidth, rowHeight, rowGap, virtualizer])
 
+  // Scroll reset/restore. Reset to top only when scrollResetKey actually changes (a
+  // real filter change); otherwise restore the last user offset. <Activity> re-runs
+  // every effect on hide/reveal regardless of deps, and hiding (display:none) clamps
+  // scrollTop to 0 — so a reveal lands in the unchanged-key branch and restores.
+  //
+  // Two ordering constraints, both of which silently break restore if violated:
+  // - Capture the offset in this effect's CLEANUP, which <Activity> runs just before
+  //   applying display:none — the last moment the offset is readable. Don't rely on
+  //   scroll events for capture: their dispatch is not guaranteed (e.g. programmatic
+  //   scrolls in an occluded window fire no event at all).
+  // - This effect must be declared AFTER the useVirtualizer() call: on reveal the
+  //   virtualizer re-attaches to the scroll element and scrollTo()s its own cached
+  //   (stale) offset from a layout effect, so ours must run later to win.
+  useLayoutEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    suppressAnchorRef.current = true
+    if (committedKeyRef.current !== scrollResetKey) {
+      committedKeyRef.current = scrollResetKey
+      el.scrollTop = 0
+      anchorRef.current = 0
+      scrollTopRef.current = 0
+    } else if (scrollTopRef.current > 0) {
+      el.scrollTop = scrollTopRef.current
+    }
+    requestAnimationFrame(() => {
+      suppressAnchorRef.current = false
+    })
+    return () => {
+      // clientHeight is 0 when already hidden (unmount of a hidden Activity) — keep
+      // the previously captured offset instead of overwriting it with a clamped 0.
+      if (el.clientHeight > 0) scrollTopRef.current = el.scrollTop
+    }
+  }, [scrollResetKey])
+
   const onScrollMouseDown = useCallback(
     (e) => {
       if (!onEmptyAreaPointerDown) return
       if (e.metaKey || e.ctrlKey) return
+      // React synthetic events bubble through portals along the React tree, so a
+      // pointerdown inside a portaled overlay (e.g. a card's context menu) reaches
+      // this handler even though the overlay is not a DOM child of the scroll
+      // container. Only treat clicks that truly landed inside the scroll element
+      // as empty-area clicks; otherwise a right-click menu interaction would clear
+      // the bulk selection mid-flight.
       const el = e.target
-      if (el instanceof Element && el.closest('[data-grid-card]')) return
+      if (!(el instanceof Element) || !e.currentTarget.contains(el)) return
+      if (el.closest('[data-grid-card]')) return
       onEmptyAreaPointerDown()
     },
     [onEmptyAreaPointerDown],
   )
 
   return (
-    <div className={`relative min-h-0 ${className}`}>
-      <div ref={scrollRef} data-page-nav-scroll className="h-full overflow-y-auto" onMouseDown={onScrollMouseDown}>
+    <div className={`relative ${className}`}>
+      <div ref={scrollRef} className="absolute inset-0 overflow-y-auto" onMouseDown={onScrollMouseDown}>
         <div style={{ height: virtualizer.getTotalSize() + padding * 2, position: 'relative' }}>
           {virtualizer.getVirtualItems().map((vRow) => {
             const startIdx = vRow.index * cols
@@ -265,9 +239,12 @@ export function VirtualGrid({
             )
           })}
         </div>
-        {items.length === 0 && <div className="text-center py-16 text-text-tertiary text-sm">No items found</div>}
+        {footer}
+        {items.length === 0 && !hideEmptyMessage && (
+          <div className="text-center py-16 text-text-tertiary text-sm">No items found</div>
+        )}
       </div>
-      {showBackToTop && <BackToTopButton scrollRef={scrollRef} />}
+      <ScrollToTopButton scrollRef={scrollRef} />
     </div>
   )
 }
@@ -276,32 +253,10 @@ export function VirtualGrid({
  * Virtualised list for table-style layouts. Uses divs with flex for
  * consistent column sizing without nested <table> hacks.
  */
-export function VirtualList({
-  items,
-  rowHeight = 37,
-  renderRow,
-  className = '',
-  overscan = 5,
-  scrollResetKey,
-  restoreIndex = null,
-  restoreKey = '',
-  onFirstVisibleIndexChange,
-  showBackToTop = false,
-}) {
+export function VirtualList({ items, rowHeight = 37, renderRow, className = '', overscan = 5, scrollResetKey }) {
   const scrollRef = useRef(null)
-  const consumedRestoreKeyRef = useRef('')
-  const lastFirstVisibleIndexRef = useRef(null)
-  const onFirstVisibleIndexChangeRef = useRef(onFirstVisibleIndexChange)
-
-  useLayoutEffect(() => {
-    onFirstVisibleIndexChangeRef.current = onFirstVisibleIndexChange
-  }, [onFirstVisibleIndexChange])
-
-  const emitFirstVisibleIndex = useCallback((index) => {
-    if (lastFirstVisibleIndexRef.current === index) return
-    lastFirstVisibleIndexRef.current = index
-    onFirstVisibleIndexChangeRef.current?.(index)
-  }, [])
+  const committedKeyRef = useRef(scrollResetKey)
+  const scrollTopRef = useRef(0)
 
   const virtualizer = useVirtualizer({
     count: items.length,
@@ -314,41 +269,26 @@ export function VirtualList({
     virtualizer.measure()
   }, [rowHeight, virtualizer])
 
+  // Reset only on a real key change; restore the last offset on mount / <Activity>
+  // reveal, captured by the cleanup at hide time (see VirtualGrid for the full rationale).
   useLayoutEffect(() => {
     const el = scrollRef.current
     if (!el) return
-    if (restoreKey && consumedRestoreKeyRef.current !== restoreKey) return
-    if (el.scrollTop === 0) {
-      emitFirstVisibleIndex(0)
-      return
+    if (committedKeyRef.current !== scrollResetKey) {
+      committedKeyRef.current = scrollResetKey
+      el.scrollTop = 0
+      scrollTopRef.current = 0
+    } else if (scrollTopRef.current > 0) {
+      el.scrollTop = scrollTopRef.current
     }
-    el.scrollTop = 0
-    emitFirstVisibleIndex(0)
-  }, [scrollResetKey, restoreKey, emitFirstVisibleIndex])
-
-  useLayoutEffect(() => {
-    if (!restoreKey || consumedRestoreKeyRef.current === restoreKey) return
-    if (restoreIndex == null || restoreIndex < 0) return
-    const el = scrollRef.current
-    if (!el) return
-    consumedRestoreKeyRef.current = restoreKey
-    el.scrollTop = restoreIndex * rowHeight
-    emitFirstVisibleIndex(restoreIndex)
-  }, [restoreIndex, restoreKey, rowHeight, emitFirstVisibleIndex])
-
-  useEffect(() => {
-    const el = scrollRef.current
-    if (!el) return
-    const onScroll = () => {
-      emitFirstVisibleIndex(Math.max(0, Math.floor(el.scrollTop / rowHeight)))
+    return () => {
+      if (el.clientHeight > 0) scrollTopRef.current = el.scrollTop
     }
-    el.addEventListener('scroll', onScroll, { passive: true })
-    return () => el.removeEventListener('scroll', onScroll)
-  }, [rowHeight, emitFirstVisibleIndex])
+  }, [scrollResetKey])
 
   return (
-    <div className={`relative min-h-0 ${className}`}>
-      <div ref={scrollRef} data-page-nav-scroll className="h-full overflow-y-auto">
+    <div className={`relative ${className}`}>
+      <div ref={scrollRef} className="absolute inset-0 overflow-y-auto">
         <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
           {virtualizer.getVirtualItems().map((vRow) => (
             <div key={vRow.key} style={{ position: 'absolute', top: vRow.start, left: 0, right: 0, height: rowHeight }}>
@@ -357,7 +297,7 @@ export function VirtualList({
           ))}
         </div>
       </div>
-      {showBackToTop && <BackToTopButton scrollRef={scrollRef} />}
+      <ScrollToTopButton scrollRef={scrollRef} />
     </div>
   )
 }

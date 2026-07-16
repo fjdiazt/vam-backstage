@@ -1,6 +1,9 @@
 import { clsx } from 'clsx'
 import { twMerge } from 'tailwind-merge'
 import { VISIBLE_CATEGORIES, isCorePackageCategory } from '@shared/content-types.js'
+import { normalizeExternalUrl } from '@shared/external-url.js'
+import { isLocalPackage, LOCAL_PACKAGE_DISPLAY_NAME } from '@shared/local-package.js'
+import { toast } from '@/components/Toast.jsx'
 
 export function cn(...inputs) {
   return twMerge(clsx(inputs))
@@ -134,21 +137,32 @@ const DOMAIN_NAMES = {
   'booth.pm': 'Booth',
   'ko-fi.com': 'Ko-fi',
   'subscribestar.adult': 'SubscribeStar',
+  'github.com': 'GitHub',
 }
 
 export function extractDomainLabel(url) {
-  try {
-    const host = new URL(url).hostname.replace(/^www\./, '')
-    const name = DOMAIN_NAMES[host]
-    return name ? `Get on ${name}` : 'Get Package'
-  } catch {
-    return 'Get Package'
-  }
+  const normalized = normalizeExternalUrl(url)
+  if (!normalized) return 'Get Package'
+  const host = new URL(normalized).hostname.replace(/^www\./, '')
+  const name = DOMAIN_NAMES[host]
+  return name ? `Get on ${name}` : 'Get Package'
+}
+
+/** True when `url` normalizes to an openable http(s) link (see normalizeExternalUrl). */
+export function isPromotionalLink(url) {
+  return normalizeExternalUrl(url) != null
+}
+
+/** Open an external link via the main process, surfacing a toast if it fails. */
+export async function openExternalLink(url) {
+  const res = await window.api.shell.openExternal(url)
+  if (!res?.ok) toast(`Could not open link${res?.error ? `: ${res.error}` : ''}`)
 }
 
 // --- Display helpers ---
 
 export function displayName(pkg) {
+  if (isLocalPackage(pkg.filename)) return LOCAL_PACKAGE_DISPLAY_NAME
   if (pkg.hubDisplayName) return pkg.hubDisplayName
   if (pkg.title) return pkg.title
   const name = pkg.packageName || pkg.filename
@@ -164,7 +178,9 @@ export function displayName(pkg) {
  * refetch). Use everywhere a content row needs to show its package label.
  */
 export function contentPackageLabel(c) {
-  return c.package ? displayName(c.package) : displayName({ filename: c.packageFilename })
+  // Extracted presets are loose files owned by a package — label them by owner.
+  const pkg = c.sourcePackage ?? c.package
+  return pkg ? displayName(pkg) : displayName({ filename: c.packageFilename })
 }
 
 // --- String helpers ---

@@ -1,19 +1,19 @@
 import { createWriteStream } from 'fs'
-import { ipcMain, session } from 'electron'
-import { access, rename, unlink } from 'fs/promises'
+import { ipcMain, net } from 'electron'
+import { access, rename, unlink, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
-import { HUB_HTTP_USER_AGENT } from '@shared/hub-http.js'
 import {
   setPackageDirect,
+  touchPackageFirstSeen,
   deletePackage,
   getSetting,
-  setPackageHidden,
   setPackageTypeOverride,
   setPackageCorrupted,
   setHubResourceId,
   applyHubDetailToPackage,
 } from '../db.js'
 import { scanAndUpsert } from '../scanner/ingest.js'
+import { runLocalScan } from '../scanner/local.js'
 import { readVar } from '../scanner/var-reader.js'
 import { verifyPackageFull } from '../scanner/integrity.js'
 import {
@@ -35,19 +35,30 @@ import {
   patchTypeOverride,
   getFilteredContents,
   isNotDownloadable,
+  resolveHubDownloadUrl,
+  effectivePackageType,
+  recomputeInactiveDeps,
 } from '../store.js'
+import { isPackageActive } from '@shared/storage-state-predicates.js'
+import { extractedDeletePaths, extractedHasSurvivor } from '../scenes/extracted-lifecycle.js'
+import { reconcileExtractedLifecycleAndResync, extractedItemsFor } from '../scenes/extracted-reconcile.js'
 import { hidePackageContent, unhidePackageContent, readAllPrefs } from '../vam-prefs.js'
-import { writePackageHiddenPref } from '../package-prefs.js'
+import { computeAutoHidePathsForNewPackage } from '../scanner/index.js'
 import { computeRemovableDeps, computeCascadeDisable, computeCascadeEnable } from '../scanner/graph.js'
+import { LOCAL_PACKAGE_FILENAME } from '@shared/local-package.js'
 import { applyStorageState, parseDisableBehavior, nextStorageStateForIntent } from '../storage-state.js'
-import { pkgVarPath, getMainLibraryDirPath } from '../library-dirs.js'
+import { pkgVarPath, resolveContentPath, getMainLibraryDirPath } from '../library-dirs.js'
 import {
   enqueueInstall,
   enqueueInstallMissing,
   enqueueInstallAllMissing,
   enqueueInstallRef,
   enqueueInstallBatch,
-  openDownloadStream,
+  importLocalFromPath,
+  beginImportLocalVar,
+  appendImportLocalVar,
+  finishImportLocalVar,
+  abortImportLocalVar,
 } from '../downloads/manager.js'
 import {
   fetchPackagesJson,
@@ -77,16 +88,19 @@ function normalizeFilenameArgs(arg) {
 }
 
 /**
- * Record-as-owned + unlink the indexed physical file plus any stray main-dir
- * aliases (`<fn>` and `<fn>.disabled` in main) external tools may have left
- * around. Each path is unlinked at most once. Caller is responsible for
- * `deletePackage`. Effective only when caller wraps in `withBulkWindow`;
- * single non-bulk uninstalls accept the watcher event (idempotent).
+ * Record-as-owned + unlink everything belonging to a package: the bare `.var`
+ * and its `.var.disabled` sibling at the package's own location (covers enabled,
+ * marker-disabled, and legacy suffix-disabled layouts — nested subfolders too),
+ * plus any stray root-level aliases (`<fn>` / `<fn>.disabled` in main) external
+ * tools may have left around. Each path is unlinked at most once. Caller is
+ * responsible for `deletePackage`. Effective only when caller wraps in
+ * `withBulkWindow`; single non-bulk uninstalls accept the watcher event (idempotent).
  */
 async function unlinkPackagePhysicalAndAliases(pkg, filename) {
   const physical = pkg ? pkgVarPath(pkg) : null
   const mainDir = getMainLibraryDirPath()
-  const targets = [physical]
+  const targets = []
+  if (physical) targets.push(physical, physical + '.disabled')
   if (mainDir) targets.push(join(mainDir, filename), join(mainDir, filename + '.disabled'))
   const seen = new Set()
   for (const p of targets) {
@@ -100,6 +114,69 @@ async function unlinkPackagePhysicalAndAliases(pkg, filename) {
 }
 
 /**
+ * After promote/demote, align `.hide` sidecars with active auto-hide rules for
+ * both in-var content and extracted presets owned by the package. Extracted
+ * presets are shared across versions, so the deps rule uses "any candidate
+ * still direct" rather than only the package that just flipped.
+ */
+async function syncAutoHideAfterDirectChange(vamDir, filename, isDirect) {
+  const pkg = getPackageIndex().get(filename)
+  if (!pkg) return
+  const effectiveType = effectivePackageType(pkg)
+
+  const contents = getFilteredContents({ packageFilename: filename })
+  const pkgItems = contents.map((c) => ({ internalPath: c.internalPath, type: c.type }))
+  const hidePkg = new Set(computeAutoHidePathsForNewPackage(filename, effectiveType, isDirect, pkgItems))
+  const pkgPaths = contents.map((c) => c.internalPath)
+  const pkgHide = pkgPaths.filter((p) => hidePkg.has(p))
+  const pkgUnhide = pkgPaths.filter((p) => !hidePkg.has(p))
+  if (pkgHide.length) await hidePackageContent(vamDir, filename, pkgHide)
+  if (pkgUnhide.length) await unhidePackageContent(vamDir, filename, pkgUnhide)
+
+  const pkgIndex = getPackageIndex()
+  const candidateIsDirect = (cf) => (cf === filename ? isDirect : !!pkgIndex.get(cf)?.is_direct)
+  const toHide = []
+  const toUnhide = []
+  for (const item of extractedItemsFor([filename])) {
+    const anyDirect = extractedHasSurvivor(item.extractedCandidates, candidateIsDirect)
+    const hide = computeAutoHidePathsForNewPackage(filename, effectiveType, anyDirect, [
+      { internalPath: item.internal_path, type: item.type },
+    ])
+    if (hide.length > 0) toHide.push(item.internal_path)
+    else toUnhide.push(item.internal_path)
+  }
+  if (toHide.length) await hidePackageContent(vamDir, LOCAL_PACKAGE_FILENAME, toHide)
+  if (toUnhide.length) await unhidePackageContent(vamDir, LOCAL_PACKAGE_FILENAME, toUnhide)
+}
+
+/**
+ * When packages are removed, delete the extracted presets they exclusively
+ * owned — but only when no other installed version still claims them (`.latest`
+ * refs keep the preset working otherwise). Returns whether any file was removed.
+ * Call before `deletePackage` so `packageIndex` still resolves the candidates.
+ */
+async function cleanupExtractedPresetsForRemoval(removedFilenames) {
+  const vamDir = getSetting('vam_dir')
+  if (!vamDir) return false
+  const removedSet = removedFilenames instanceof Set ? removedFilenames : new Set(removedFilenames)
+  const pkgIndex = getPackageIndex()
+  const survives = (cf) => !removedSet.has(cf) && pkgIndex.has(cf)
+  let removedAny = false
+  for (const item of extractedItemsFor(removedSet)) {
+    if (extractedHasSurvivor(item.extractedCandidates, survives)) continue
+    for (const rel of extractedDeletePaths(item.internal_path)) {
+      const p = join(vamDir, rel)
+      recordOwnedPath(p)
+      try {
+        await unlink(p)
+      } catch {}
+    }
+    removedAny = true
+  }
+  return removedAny
+}
+
+/**
  * Shared worker for `packages:toggle-enabled` and `packages:set-enabled`. The
  * caller supplies `intentFn(pkg)` returning `'enable' | 'disable'`; for each
  * filename we resolve the resulting storage_state target via the
@@ -107,7 +184,7 @@ async function unlinkPackagePhysicalAndAliases(pkg, filename) {
  * the target end of the spectrum"), apply it via `applyStorageState`, and
  * cascade through `computeCascadeEnable / computeCascadeDisable` according
  * to the same intent. The `disable_behavior` setting decides whether disable
- * means `.var.disabled` in main or move-to-aux.
+ * means a VaM-native `.var.disabled` marker in main or move-to-aux.
  *
  * Returns the same shape on toggle and set-enabled so the renderer doesn't
  * branch: `{ ok, filename?, storageState?, cascadeCount?, unchanged?, error? }` per
@@ -143,6 +220,7 @@ async function applyStorageStateChange(filenames, intentFn) {
   // case still works — the window is cheap when there's only one rename in it.
   return withBulkWindow(async () => {
     const out = []
+    const affectedForExtracted = new Set()
     let lastProgressEmit = 0
     const emitProgressIfDue = () => {
       if (filenames.length <= 1) return
@@ -178,6 +256,7 @@ async function applyStorageStateChange(filenames, intentFn) {
 
       try {
         await applyStorageState(filename, target)
+        affectedForExtracted.add(filename)
       } catch (err) {
         out.push({ ok: false, filename, error: err.message })
         continue
@@ -193,6 +272,7 @@ async function applyStorageStateChange(filenames, intentFn) {
             if (!depTarget) return
             try {
               await applyStorageState(depFilename, depTarget)
+              affectedForExtracted.add(depFilename)
             } catch (err) {
               console.warn(`Cascade ${intent} failed for ${depFilename}:`, err.message)
             }
@@ -209,6 +289,25 @@ async function applyStorageStateChange(filenames, intentFn) {
       emitProgressIfDue()
     }
 
+    // Cascade the state change onto extracted presets owned by affected
+    // packages (rename .vap <-> .vap.disabled). Targeted by the flipped
+    // filenames — they're still present, so reachable via the store. Renames
+    // are app-owned, so the watcher stays quiet; the resync commits the moved
+    // loose-content rows to the store.
+    try {
+      const { changed } = await reconcileExtractedLifecycleAndResync({
+        vamDir: getSetting('vam_dir'),
+        filenames: affectedForExtracted,
+      })
+      if (changed > 0) notify('contents:updated')
+    } catch (err) {
+      console.warn('Extracted-preset lifecycle reconcile failed:', err.message)
+    }
+
+    // Toggles patch packageIndex in place without a full rebuild, so refresh the
+    // one aggregate that tracks disabled/offloaded deps of active packages.
+    recomputeInactiveDeps()
+
     notify('packages:updated')
     return filenames.length === 1 ? out[0] : { ok: true, results: out }
   })
@@ -221,6 +320,35 @@ export function registerPackageHandlers() {
 
   ipcMain.handle('packages:detail', (_, filename) => {
     return getPackageDetail(filename)
+  })
+
+  ipcMain.handle('packages:graph', () => {
+    const packageIndex = getPackageIndex()
+    const forwardDeps = getForwardDeps()
+    const nodes = []
+    // Only enabled (actively installed) packages — disabled/offloaded ones aren't
+    // live in VaM, so they'd only add noise to the force field.
+    const enabled = new Set()
+    for (const [filename, pkg] of packageIndex) {
+      if (!isPackageActive(pkg.storage_state)) continue
+      enabled.add(filename)
+      nodes.push({
+        id: filename,
+        creator: pkg.creator,
+        packageName: pkg.package_name,
+        isDirect: !!pkg.is_direct,
+        type: effectivePackageType(pkg),
+      })
+    }
+    const links = []
+    for (const [filename, deps] of forwardDeps) {
+      if (!enabled.has(filename)) continue
+      for (const d of deps) {
+        if (!d.resolved || !enabled.has(d.resolved)) continue
+        links.push({ source: filename, target: d.resolved })
+      }
+    }
+    return { nodes, links }
   })
 
   ipcMain.handle('packages:stats', () => {
@@ -258,9 +386,8 @@ export function registerPackageHandlers() {
     const filenames = normalizeFilenameArgs(filenameOrFilenames)
     for (const filename of filenames) {
       setPackageDirect(filename, true)
-      const contents = getFilteredContents({ packageFilename: filename })
-      const paths = contents.map((c) => c.internalPath)
-      await unhidePackageContent(vamDir, filename, paths)
+      touchPackageFirstSeen(filename)
+      await syncAutoHideAfterDirectChange(vamDir, filename, true)
     }
     const prefs = await readAllPrefs(vamDir)
     setPrefsMap(prefs)
@@ -317,9 +444,7 @@ export function registerPackageHandlers() {
         const dependents = getReverseDeps().get(filename)
         if (dependents && dependents.size > 0) {
           setPackageDirect(filename, false)
-          const contents = getFilteredContents({ packageFilename: filename })
-          const paths = contents.map((c) => c.internalPath)
-          await hidePackageContent(vamDir, filename, paths)
+          await syncAutoHideAfterDirectChange(vamDir, filename, false)
           const prefs = await readAllPrefs(vamDir)
           setPrefsMap(prefs)
           buildFromDb({ skipGraph: true })
@@ -339,10 +464,16 @@ export function registerPackageHandlers() {
           return !depPkg || !isNotDownloadable(depPkg)
         })
         const toDelete = [filename, ...filteredRemovable]
+        // Remove extracted presets no surviving version still owns (before the
+        // rows/index are torn down so candidates still resolve).
+        const removedExtracted = await cleanupExtractedPresetsForRemoval(toDelete)
         for (const fn of toDelete) {
           await unlinkPackagePhysicalAndAliases(getPackageIndex().get(fn), fn)
           deletePackage(fn)
         }
+        // Reconcile the loose-content rows for any extracted presets we deleted
+        // (their `__local__` rows would otherwise linger until the next scan).
+        if (removedExtracted) await runLocalScan(vamDir)
         buildFromDb()
         results.push({ ok: true, deleted: toDelete.length })
       }
@@ -371,22 +502,6 @@ export function registerPackageHandlers() {
     return { ok: true, count: filenames.length }
   })
 
-  ipcMain.handle('packages:set-hidden', async (_, { filename, hidden }) => {
-    if (typeof hidden !== 'boolean') throw new Error('Invalid hidden value')
-    const pkg = getPackageIndex().get(filename)
-    if (!pkg) throw new Error(`Package not found: ${filename}`)
-    const vamDir = getSetting('vam_dir')
-    if (!vamDir) throw new Error('VaM directory not configured')
-
-    await writePackageHiddenPref(vamDir, pkg.package_name, hidden)
-    for (const [otherFilename, otherPkg] of getPackageIndex()) {
-      if (otherPkg.package_name === pkg.package_name) setPackageHidden(otherFilename, hidden)
-    }
-    buildFromDb({ skipGraph: true })
-    notify('packages:updated')
-    return { ok: true }
-  })
-
   ipcMain.handle('packages:toggle-enabled', async (_, filenameOrFilenames) => {
     return await applyStorageStateChange(normalizeFilenameArgs(filenameOrFilenames), (pkg) =>
       pkg.storage_state === 'enabled' ? 'disable' : 'enable',
@@ -400,6 +515,19 @@ export function registerPackageHandlers() {
   ipcMain.handle('packages:set-enabled', async (_, { filenames, enabled }) => {
     const intent = enabled ? 'enable' : 'disable'
     return await applyStorageStateChange(normalizeFilenameArgs(filenames), () => intent)
+  })
+
+  // Enable all currently-inactive (disabled/offloaded) transitive dependencies of
+  // the given package(s), without touching the package itself. Backs the "enable
+  // them all" action surfaced when an active package has inactive deps.
+  ipcMain.handle('packages:enable-deps', async (_, filenameOrFilenames) => {
+    const toEnable = new Set()
+    for (const filename of normalizeFilenameArgs(filenameOrFilenames)) {
+      for (const dep of computeCascadeEnable(filename, getPackageIndex(), getForwardDeps())) toEnable.add(dep)
+    }
+    if (toEnable.size === 0) return { ok: true, count: 0 }
+    const res = await applyStorageStateChange([...toEnable], () => 'enable')
+    return { ok: true, count: toEnable.size, result: res }
   })
 
   ipcMain.handle('packages:force-remove', async (_, filenameOrFilenames) => {
@@ -441,14 +569,9 @@ export function registerPackageHandlers() {
     // can't actually serve, and the install IPC then fails with "No download URL".
     for (const stem of packageStems) enriched[stem] = { fileSize: null, downloadUrl: null }
     for (const [stem, hubFile] of Object.entries(results)) {
-      const url = isReal(hubFile.downloadUrl)
-        ? hubFile.downloadUrl
-        : isReal(hubFile.urlHosted)
-          ? hubFile.urlHosted
-          : null
       enriched[stem] = {
         fileSize: isReal(hubFile.file_size) ? parseInt(hubFile.file_size, 10) || null : null,
-        downloadUrl: url,
+        downloadUrl: resolveHubDownloadUrl(hubFile),
       }
     }
     return enriched
@@ -486,10 +609,40 @@ export function registerPackageHandlers() {
     return await enqueueInstallRef(hubFileData)
   })
 
+  // Import a .var supplied as raw bytes (drag-and-drop add). Works locally and
+  // over the remote bridge — a client head ships the file buffer here and the
+  // server writes it into its own AddonPackages.
+  // Local fast path: main copies the dropped file straight from its source path
+  // (reflink where supported), skipping the renderer/IPC byte streaming. Only
+  // valid when main can see the file — i.e. not a remote head.
+  ipcMain.handle('packages:import-local-copy', async (_, { filename, sourcePath }) => {
+    return await importLocalFromPath({ filename, sourcePath })
+  })
+
+  // Chunked import: begin → chunk* → finish (or abort). The file is streamed to
+  // a temp file in bounded pieces — required over the remote bridge, where the
+  // wire codec base64s each buffer into one string and a whole large .var can't
+  // cross in a single frame.
+  ipcMain.handle('packages:import-local-begin', async (_, { filename }) => {
+    return await beginImportLocalVar({ filename })
+  })
+
+  ipcMain.handle('packages:import-local-chunk', async (_, { uploadId, chunk }) => {
+    return await appendImportLocalVar({ uploadId, chunk })
+  })
+
+  ipcMain.handle('packages:import-local-finish', async (_, { uploadId }) => {
+    return await finishImportLocalVar({ uploadId })
+  })
+
+  ipcMain.handle('packages:import-local-abort', async (_, { uploadId }) => {
+    return await abortImportLocalVar({ uploadId })
+  })
+
   ipcMain.handle('packages:file-list', async (_, filename) => {
     const pkg = getPackageIndex().get(filename)
     if (!pkg) throw new Error(`Package not found: ${filename}`)
-    const varPath = pkgVarPath(pkg)
+    const varPath = await resolveContentPath(pkg)
     if (!varPath) throw new Error('Library directory not configured')
     await access(varPath)
     const { fileList } = await readVar(varPath)
@@ -554,18 +707,18 @@ export function registerPackageHandlers() {
     const tempPath = join(targetDir, filename + '.redownload.tmp')
 
     try {
-      const hubSession = session.fromPartition('persist:hub')
-      const cookies = await hubSession.cookies.get({ url: 'https://hub.virtamate.com' })
-      const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join('; ')
-
-      const res = await openDownloadStream(downloadUrl, {
-        headers: { 'User-Agent': HUB_HTTP_USER_AGENT, Cookie: cookieHeader },
+      const res = await net.fetch(downloadUrl, {
+        headers: { Cookie: 'vamhubconsent=yes' },
+        redirect: 'follow',
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`)
 
       const fileStream = createWriteStream(tempPath)
       const fileError = new Promise((_, reject) => fileStream.on('error', reject))
-      for await (const value of res.body) {
+      const reader = res.body.getReader()
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
         if (!fileStream.write(value)) {
           await new Promise((r) => fileStream.once('drain', r))
         }
@@ -581,6 +734,16 @@ export function registerPackageHandlers() {
         await unlinkPackagePhysicalAndAliases(pkg, filename)
         recordOwnedPath(finalPath)
         await rename(tempPath, finalPath)
+        // `finalPath` is always the bare `.var`, so the fresh content lands there.
+        // If the package was disabled, recreate the empty `.var.disabled` marker
+        // beside it (VaM-native marker layout) — otherwise the redownload would
+        // silently re-enable a package the user had disabled. This also normalizes
+        // a legacy suffix-disabled package to the marker layout on redownload.
+        if (pkg.storage_state === 'disabled') {
+          const markerPath = finalPath + '.disabled'
+          recordOwnedPath(markerPath)
+          await writeFile(markerPath, '')
+        }
       })
 
       // Clear corrupted flag and re-scan the package
@@ -590,6 +753,7 @@ export function registerPackageHandlers() {
           isDirect: pkg.is_direct ? 1 : 0,
           storageState: pkg.storage_state,
           libraryDirId: pkg.library_dir_id ?? null,
+          subpath: pkg.subpath ?? '',
         })
       } catch (err) {
         console.warn(`Post-redownload rescan failed for ${filename}:`, err.message)

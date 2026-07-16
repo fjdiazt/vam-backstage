@@ -6,7 +6,6 @@ import {
   getAllLabels,
   getAllLabelPackages,
   getAllLabelContents,
-  listLabelContentSources,
 } from './db.js'
 import { getCachedDetail } from './hub/client.js'
 import {
@@ -20,10 +19,15 @@ import {
   parseDepRef,
 } from './scanner/graph.js'
 import { categoryOf, isGalleryVisible, isVisible, LOOK_ITEM_EXACT_TYPES, tagOf } from '@shared/content-types.js'
-import { browserAssistResourceTypesForContent } from '@shared/browser-assist-resource-types.js'
 import { getPackagesIndex, loadPackagesJsonFromCache } from './hub/packages-json.js'
 import { isLocalPackage } from '@shared/local-package.js'
-import { packageHasExtractedAppearance, contentHasExtractedAppearance } from './scenes/extract.js'
+import { isPackageActive } from '@shared/storage-state-predicates.js'
+import {
+  packageHasExtractedAppearance,
+  contentHasExtractedAppearance,
+  APPEARANCE_SOURCE_TYPES,
+} from './scenes/extract.js'
+import { extractedPresetBasename } from './scenes/extract-targets.js'
 
 /**
  * Iterate packages excluding the synthetic `__local__` sentinel that owns loose
@@ -82,9 +86,13 @@ let removableSizeMap = new Map() // filename -> removableSize (orphaned dep byte
 let morphCountByPackage = new Map() // filename -> number of morphBinary items in that package
 let lookItemCountByPackage = new Map() // filename -> count of look / legacyLook / skinPreset items
 let extractedAppearanceBasenames = new Set() // basenames of local 'look' rows under Custom/Atom/Person/Appearance/extracted/
+let extractedOwnership = new Map() // extracted-preset basename -> Set<packageFilename> (every installed version that could own it)
+let extractedByPackage = new Map() // packageFilename -> local extracted content item[] (indexed under every candidate version)
+let allExtractedLocalItems = [] // every local extracted preset row, including orphaned ones (empty extractedCandidates)
 let aggregateMorphCountMap = new Map() // filename -> morph count (own + all resolved deps)
 let transitiveDepsCountMap = new Map() // filename -> total unique deps (resolved + missing) in subtree
 let transitiveMissingMap = new Map() // filename -> count of unique missing dep refs in subtree
+let transitiveInactiveMap = new Map() // filename -> count of resolved-but-inactive (disabled/offloaded) deps in subtree
 let creatorsNeedingUserId = new Map() // normalized creator → filenames[]
 let orphanSet = new Set() // filenames of all orphan deps (direct + cascade)
 let directOrphanSet = new Set() // filenames of direct orphans only (zero reverse deps)
@@ -93,9 +101,6 @@ let authorCounts = {} // creator string → count of packages with that creator
 let labelIndex = new Map() // label_id → { id, name, color, packageCount, contentCount }
 let labelsByPackage = new Map() // package_filename → number[] of label ids
 let labelsByContent = new Map() // `${package_filename}\0${internal_path}` → number[] of label ids
-let labelContentSources = new Map() // `${package_filename}\0${internal_path}\0${label_id}` → { sourceMask, baCategory }
-let packageDerivedHidden = new Map() // filename → { hiddenByTag, hiddenByCreator }
-let contentDerivedHiddenRules = { hiddenTagsByResourceType: new Map(), hiddenCreatorsByResourceType: new Map() }
 let nonDownloadableRids = new Set() // resource IDs known to be non-downloadable
 let stats = emptyStats()
 
@@ -104,6 +109,7 @@ function emptyStats() {
     directCount: 0,
     depCount: 0,
     totalCount: 0,
+    enabledCount: 0,
     brokenCount: 0,
     totalContent: 0,
     totalSize: 0,
@@ -125,8 +131,15 @@ function tryParse(json) {
   }
 }
 
-function isRealUrl(v) {
+export function isRealUrl(v) {
   return v && v !== 'null' && !String(v).endsWith('?file=')
+}
+
+/** Resolve a fetchable download URL from a Hub findPackages / hubFiles entry. */
+export function resolveHubDownloadUrl(hubFile) {
+  if (isRealUrl(hubFile?.downloadUrl)) return hubFile.downloadUrl
+  if (isRealUrl(hubFile?.urlHosted)) return hubFile.urlHosted
+  return null
 }
 
 function buildNonDownloadableRids() {
@@ -168,6 +181,74 @@ export function isNotDownloadable(pkg) {
   return false
 }
 
+// --- Extracted-preset ownership (derived, no persisted state) ---
+
+/** Drop a trailing `.disabled` marker so a disabled loose file matches its live name. */
+function stripDisabledSuffix(p) {
+  return p.endsWith('.disabled') ? p.slice(0, -'.disabled'.length) : p
+}
+
+/** Basename (last path segment) with any `.disabled` marker stripped. */
+function extractedBasenameOf(internalPath) {
+  const live = stripDisabledSuffix(internalPath)
+  return live.slice(live.lastIndexOf('/') + 1)
+}
+
+/**
+ * Is this local row an extracted preset? Appearance presets live as `look` rows
+ * under `Appearance/extracted/`, outfits as `clothingPreset` under
+ * `Clothing/extracted/`. The `.disabled` marker (if any) is stripped first.
+ */
+function isExtractedLocalRow(type, internalPath) {
+  const p = stripDisabledSuffix(internalPath)
+  if (type === 'look') return p.startsWith('Custom/Atom/Person/Appearance/extracted/')
+  if (type === 'clothingPreset') return p.startsWith('Custom/Atom/Person/Clothing/extracted/')
+  return false
+}
+
+/**
+ * Invert the `computeTargets` naming for one scene-source row and register its
+ * expected preset basename(s) against the owning package. Every atom of every
+ * scene contributes a basename; a basename can be claimed by several installed
+ * versions (they all produce the same unversioned filename).
+ */
+function addExtractedOwnership(map, { creator, internalPath, personAtomIdsJson, packageFilename }) {
+  if (!personAtomIdsJson) return
+  let atomIds
+  try {
+    atomIds = JSON.parse(personAtomIdsJson)
+  } catch {
+    return
+  }
+  if (!Array.isArray(atomIds) || atomIds.length === 0) return
+  const singleAtom = atomIds.length === 1
+  for (const atomId of atomIds) {
+    const base = extractedPresetBasename({ creator: creator || '!local', internalPath, atomId, singleAtom })
+    let set = map.get(base)
+    if (!set) {
+      set = new Set()
+      map.set(base, set)
+    }
+    set.add(packageFilename)
+  }
+}
+
+/** Highest installed version among candidate filenames (matches cross-version dedup). */
+function highestVersionCandidate(filenames) {
+  let best = null
+  let bestVer = -1
+  for (const fn of filenames) {
+    const pkg = packageIndex.get(fn)
+    if (!pkg) continue
+    const v = parseInt(pkg.version, 10) || 0
+    if (best === null || v > bestVer) {
+      best = fn
+      bestVer = v
+    }
+  }
+  return best
+}
+
 // --- Build from DB ---
 
 export function buildFromDb({ skipGraph = false } = {}) {
@@ -185,12 +266,18 @@ export function buildFromDb({ skipGraph = false } = {}) {
 
   const allContentItems = contentRows.map((row) => {
     const pkg = packageIndex.get(row.package_filename)
-    const prefsKey = row.package_filename + '/' + row.internal_path
+    // Prefs bind to the canonical (live) path, so a preset keeps its favorite/
+    // hidden state across the `.disabled` marker flipping on/off.
+    const prefsKey = row.package_filename + '/' + stripDisabledSuffix(row.internal_path)
     const prefs = prefsMap.get(prefsKey) || { hidden: false, favorite: false }
     return {
       ...row,
       hidden: prefs.hidden,
       favorite: prefs.favorite,
+      // A loose file on disk named `X.vap.disabled` (the `.var`-style disable
+      // convention applied to extracted presets) carries its state in the name.
+      localDisabled: isLocalPackage(row.package_filename) && row.internal_path.endsWith('.disabled'),
+      extractedFrom: null,
       category: categoryOf(row.type),
       tag: tagOf(row.type),
       creator: pkg?.creator ?? '',
@@ -210,6 +297,9 @@ export function buildFromDb({ skipGraph = false } = {}) {
   morphCountByPackage = new Map()
   lookItemCountByPackage = new Map()
   extractedAppearanceBasenames = new Set()
+  extractedOwnership = new Map()
+  extractedByPackage = new Map()
+  const localExtractedRows = []
   for (const item of allContentItems) {
     if (item.type === 'morphBinary') {
       morphCountByPackage.set(item.package_filename, (morphCountByPackage.get(item.package_filename) || 0) + 1)
@@ -217,14 +307,49 @@ export function buildFromDb({ skipGraph = false } = {}) {
     if (LOOK_ITEM_EXACT_TYPES.has(item.type)) {
       lookItemCountByPackage.set(item.package_filename, (lookItemCountByPackage.get(item.package_filename) || 0) + 1)
     }
-    if (
-      item.type === 'look' &&
-      isLocalPackage(item.package_filename) &&
-      item.internal_path.startsWith('Custom/Atom/Person/Appearance/extracted/')
-    ) {
-      extractedAppearanceBasenames.add(item.internal_path.slice(item.internal_path.lastIndexOf('/') + 1))
+    // Register the expected preset basename(s) of every packaged scene-source
+    // row against its package (any installed version claims the same names).
+    if (!isLocalPackage(item.package_filename) && APPEARANCE_SOURCE_TYPES.has(item.type)) {
+      addExtractedOwnership(extractedOwnership, {
+        creator: item.creator,
+        internalPath: item.internal_path,
+        personAtomIdsJson: item.person_atom_ids,
+        packageFilename: item.package_filename,
+      })
+    }
+    // Local extracted presets: collect now, resolve ownership after the map is
+    // fully built. Track appearance basenames for the "no preset" checkmark.
+    if (isLocalPackage(item.package_filename) && isExtractedLocalRow(item.type, item.internal_path)) {
+      localExtractedRows.push(item)
+      if (item.type === 'look') extractedAppearanceBasenames.add(extractedBasenameOf(item.internal_path))
     }
   }
+
+  // Attribute each local extracted preset to the highest installed candidate
+  // version, and index it under every candidate so any version's detail panel
+  // can list it. Kept separate from `contentByPackage` so it never perturbs
+  // package content counts or cross-version dedup.
+  for (const item of localExtractedRows) {
+    const candidates = extractedOwnership.get(extractedBasenameOf(item.internal_path))
+    // Every candidate in `extractedOwnership` is a present package (built from
+    // `getAllContents`, which filters tombstones), so a preset whose owning
+    // versions were all removed lands here with an empty set — the reconcile
+    // reads that as "no active candidate" and disables it.
+    item.extractedCandidates = candidates ? [...candidates] : []
+    if (!candidates || candidates.size === 0) continue
+    const owner = highestVersionCandidate(candidates)
+    if (!owner) continue
+    item.extractedFrom = owner
+    for (const fn of candidates) {
+      let arr = extractedByPackage.get(fn)
+      if (!arr) {
+        arr = []
+        extractedByPackage.set(fn, arr)
+      }
+      arr.push(item)
+    }
+  }
+  allExtractedLocalItems = localExtractedRows
 
   contentByPackage = new Map()
   for (const item of managedItems) {
@@ -268,6 +393,7 @@ export function buildFromDb({ skipGraph = false } = {}) {
   }
 
   computeTransitiveMissing()
+  computeTransitiveInactive()
   computeStats()
   computeAllRemovableSizes()
   computeAllMorphCounts()
@@ -326,7 +452,10 @@ function buildLabels() {
   labelsByContent = new Map()
   for (const row of getAllLabelContents()) {
     if (!labelIndex.has(row.label_id)) continue
-    const key = row.package_filename + '\0' + row.internal_path
+    // Canonical key: content labels bind to the live path, so a preset's labels
+    // survive the `.disabled` marker toggling (and legacy `.disabled` rows fold
+    // onto the same key as their live counterpart).
+    const key = row.package_filename + '\0' + stripDisabledSuffix(row.internal_path)
     let arr = labelsByContent.get(key)
     if (!arr) {
       arr = []
@@ -335,14 +464,6 @@ function buildLabels() {
     arr.push(row.label_id)
     const entry = labelIndex.get(row.label_id)
     if (entry) entry.contentCount++
-  }
-
-  labelContentSources = new Map()
-  for (const row of listLabelContentSources()) {
-    labelContentSources.set(`${row.package_filename}\0${row.internal_path}\0${row.label_id}`, {
-      sourceMask: row.source_mask,
-      baCategory: row.ba_category || null,
-    })
   }
 }
 
@@ -401,10 +522,61 @@ function computeTransitiveMissing() {
   }
 }
 
+/**
+ * For every package, count the resolved dependencies in its subtree whose file
+ * is present but *inactive* (disabled or offloaded) — i.e. installed yet not
+ * loadable by VaM. Independent of the owning package's own storage state (the
+ * UI only surfaces the count for active packages), so the memo is reusable.
+ */
+function computeTransitiveInactive() {
+  transitiveInactiveMap = new Map()
+  const memo = new Map()
+  function collect(filename) {
+    if (memo.has(filename)) return memo.get(filename)
+    const inactive = new Set()
+    memo.set(filename, inactive)
+    for (const dep of forwardDeps.get(filename) || []) {
+      if (!dep.resolved) continue
+      const depPkg = packageIndex.get(dep.resolved)
+      if (depPkg && !isPackageActive(depPkg.storage_state)) inactive.add(dep.resolved)
+      for (const r of collect(dep.resolved)) inactive.add(r)
+    }
+    return inactive
+  }
+  for (const filename of packageIndex.keys()) {
+    const inactive = collect(filename)
+    if (inactive.size > 0) transitiveInactiveMap.set(filename, inactive.size)
+  }
+}
+
+/**
+ * A package is "broken" when it's corrupted, has missing deps, or — while active —
+ * has installed-but-inactive (disabled/offloaded) deps that VaM won't load.
+ * Inactive packages aren't flagged for their inactive deps (that's expected).
+ * Shared by `computeStats` and the live `getStatusCounts`.
+ */
+function isBrokenPkg(filename, pkg) {
+  if (pkg.is_corrupted) return true
+  if ((transitiveMissingMap.get(filename) || 0) > 0) return true
+  return isPackageActive(pkg.storage_state) && (transitiveInactiveMap.get(filename) || 0) > 0
+}
+
+/**
+ * Refresh the aggregates that depend on storage state after a bulk
+ * enable/disable/offload. Toggles patch `packageIndex` rows in place (no full
+ * `buildFromDb`), so both the inactive-deps map and `stats` (whose `brokenCount`
+ * now counts active packages with inactive deps) must be recomputed here.
+ */
+export function recomputeInactiveDeps() {
+  computeTransitiveInactive()
+  computeStats()
+}
+
 function computeStats() {
   let directCount = 0,
     depCount = 0,
     totalCount = 0,
+    enabledCount = 0,
     totalSize = 0,
     directSize = 0,
     depSize = 0,
@@ -413,6 +585,7 @@ function computeStats() {
 
   for (const [filename, pkg] of userPackageEntries()) {
     totalCount++
+    if (isPackageActive(pkg.storage_state)) enabledCount++
     if (pkg.is_direct) {
       directCount++
       directSize += pkg.size_bytes
@@ -421,7 +594,7 @@ function computeStats() {
       depSize += pkg.size_bytes
     }
     totalSize += pkg.size_bytes
-    if ((transitiveMissingMap.get(filename) || 0) > 0 || pkg.is_corrupted) brokenCount++
+    if (isBrokenPkg(filename, pkg)) brokenCount++
   }
 
   let depContentCount = 0
@@ -441,6 +614,7 @@ function computeStats() {
     directCount,
     depCount,
     totalCount,
+    enabledCount,
     brokenCount,
     totalContent: contentItems.length,
     totalSize,
@@ -515,81 +689,9 @@ export function getLabelsByContentMap() {
   return labelsByContent
 }
 
-/** Live map: `${package_filename}\0${internal_path}\0${label_id}` → { sourceMask, baCategory }. */
-export function getLabelContentSourcesMap() {
-  return labelContentSources
-}
-
 /** Resolve a label id to its display name; returns null if the id is unknown. */
 export function getLabelNameById(id) {
   return labelIndex.get(id)?.name ?? null
-}
-
-export function setPackageDerivedHiddenMap(map) {
-  packageDerivedHidden = map instanceof Map ? map : new Map()
-}
-
-export function setContentDerivedHiddenRules(rules) {
-  contentDerivedHiddenRules = {
-    hiddenTagsByResourceType:
-      rules?.hiddenTagsByResourceType instanceof Map ? rules.hiddenTagsByResourceType : new Map(),
-    hiddenCreatorsByResourceType:
-      rules?.hiddenCreatorsByResourceType instanceof Map ? rules.hiddenCreatorsByResourceType : new Map(),
-  }
-}
-
-function resourceRuleHas(map, resourceTypes, value) {
-  return !!value && resourceTypes.some((type) => map.get(type)?.has(value))
-}
-
-function enrichContentHidden(c) {
-  const hiddenDirect = !!c.hidden
-  const labelIds = labelsByContent.get(c.package_filename + '\0' + c.internal_path) || []
-  const baResourceTypes = browserAssistResourceTypesForContent(c.internal_path, c.type)
-  const hiddenByTag = labelIds.some((id) => {
-    const name = getLabelNameById(id)
-    return resourceRuleHas(contentDerivedHiddenRules.hiddenTagsByResourceType, baResourceTypes, name)
-  })
-  const hiddenByCreator = resourceRuleHas(
-    contentDerivedHiddenRules.hiddenCreatorsByResourceType,
-    baResourceTypes,
-    String(c.creator || '').toLowerCase(),
-  )
-  return {
-    hidden: hiddenDirect || hiddenByTag || hiddenByCreator,
-    hiddenDirect,
-    hiddenByTag,
-    hiddenByCreator,
-    hiddenReason: hiddenDirect ? 'direct' : hiddenByTag ? 'tag' : hiddenByCreator ? 'creator' : null,
-  }
-}
-
-function labelSourceCategoriesForContent(packageFilename, internalPath) {
-  const ids = labelsByContent.get(packageFilename + '\0' + internalPath) || []
-  if (!ids.length) return {}
-  const out = {}
-  for (const id of ids) {
-    const row = labelContentSources.get(`${packageFilename}\0${internalPath}\0${id}`)
-    if (row?.baCategory) out[id] = row.baCategory
-  }
-  return out
-}
-
-function contentLabelSummaryForPackage(items = []) {
-  const ids = new Set()
-  const categories = {}
-  for (const c of items) {
-    if (!isVisible(c.type)) continue
-    const ownIds = labelsByContent.get(c.package_filename + '\0' + c.internal_path) || []
-    for (const id of ownIds) {
-      ids.add(id)
-      const cat =
-        labelContentSources.get(`${c.package_filename}\0${c.internal_path}\0${id}`)?.baCategory || categoryOf(c.type)
-      if (!cat) continue
-      ;(categories[id] ||= []).push(cat)
-    }
-  }
-  return { ids: [...ids], categories }
 }
 
 export function getContentByPackage() {
@@ -598,6 +700,16 @@ export function getContentByPackage() {
 export function getExtractedAppearanceBasenames() {
   return extractedAppearanceBasenames
 }
+/** packageFilename -> local extracted content item[] claimed by (any version of) that package. */
+export function getExtractedByPackage() {
+  return extractedByPackage
+}
+/** Every local extracted preset row (appearance/outfit), including orphaned rows
+ *  whose owning package versions are all gone (empty `extractedCandidates`). Used
+ *  by the extracted-preset lifecycle reconcile full sweep. */
+export function getAllExtractedLocalItems() {
+  return allExtractedLocalItems
+}
 export function getPrefsMap() {
   return prefsMap
 }
@@ -605,7 +717,7 @@ export function setPrefsMap(map) {
   prefsMap = map
   for (const items of contentByPackage.values()) {
     for (const item of items) {
-      const key = item.package_filename + '/' + item.internal_path
+      const key = item.package_filename + '/' + stripDisabledSuffix(item.internal_path)
       const prefs = prefsMap.get(key) || { hidden: false, favorite: false }
       item.hidden = prefs.hidden
       item.favorite = prefs.favorite
@@ -614,7 +726,10 @@ export function setPrefsMap(map) {
 }
 
 export function updatePref(packageFilename, internalPath, field, value) {
-  const key = packageFilename + '/' + internalPath
+  // Prefs bind to the canonical (live) path — a disabled preset (`X.vap.disabled`)
+  // and its enabled form share one entry.
+  const canonicalPath = stripDisabledSuffix(internalPath)
+  const key = packageFilename + '/' + canonicalPath
   let entry = prefsMap.get(key)
   if (!entry) {
     entry = { hidden: false, favorite: false }
@@ -624,7 +739,7 @@ export function updatePref(packageFilename, internalPath, field, value) {
   const items = contentByPackage.get(packageFilename)
   if (!items) return
   for (const item of items) {
-    if (item.internal_path === internalPath) {
+    if (stripDisabledSuffix(item.internal_path) === canonicalPath) {
       item[field] = value
       break
     }
@@ -647,17 +762,30 @@ export function getFilteredPackages() {
   return userPackageValues().map((p) => enrichPackageSummary(p))
 }
 
+/** True when a Looks package would show the "no preset" card badge (no look/legacyLook/skinPreset items). */
+export function packageHasNoLookPresetTag(filename) {
+  const pkg = packageIndex.get(filename)
+  if (!pkg) return false
+  return effectivePackageType(pkg) === 'Looks' && (lookItemCountByPackage.get(filename) || 0) === 0
+}
+
 function enrichPackageSummary(pkg) {
   const depCount = transitiveDepsCountMap.get(pkg.filename) || 0
   const missingDeps = transitiveMissingMap.get(pkg.filename) || 0
   const pkgContents = contentByPackage.get(pkg.filename)
   const contentCount = pkgContents?.length ?? 0
-  const contentLabels = contentLabelSummaryForPackage(pkgContents)
   let favoriteContentCount = 0
   if (pkgContents) {
     for (const c of pkgContents) {
       if (c.favorite) favoriteContentCount++
     }
+  }
+  // Presets extracted from this package's scenes are loose (`__local__`) files, so
+  // they're kept out of `contentByPackage`/`contentCount` to avoid cross-version
+  // double counting. Their favorite state is still this package's content, though,
+  // so roll it into the owner's card aggregate.
+  for (const c of extractedByPackage.get(pkg.filename) || []) {
+    if (c.favorite) favoriteContentCount++
   }
   const removableSize = removableSizeMap.get(pkg.filename) || 0
   const derivedType = pkg.type ?? null
@@ -665,10 +793,6 @@ function enrichPackageSummary(pkg) {
   const lookItemCount = lookItemCountByPackage.get(pkg.filename) || 0
   const noLookPresetTag = effectiveType === 'Looks' && lookItemCount === 0
   const hasExtractedAppearancePreset = noLookPresetTag && packageHasExtractedAppearance(pkg.filename)
-  const derivedHidden = packageDerivedHidden.get(pkg.filename) || {}
-  const hiddenDirect = !!pkg.hidden
-  const hiddenByTag = !!derivedHidden.hiddenByTag
-  const hiddenByCreator = !!derivedHidden.hiddenByCreator
   return {
     filename: pkg.filename,
     creator: pkg.creator,
@@ -684,11 +808,6 @@ function enrichPackageSummary(pkg) {
     sizeBytes: pkg.size_bytes,
     removableSize,
     isDirect: !!pkg.is_direct,
-    hidden: hiddenDirect || hiddenByTag || hiddenByCreator,
-    hiddenDirect,
-    hiddenByTag,
-    hiddenByCreator,
-    hiddenReason: hiddenDirect ? 'direct' : hiddenByTag ? 'tag' : hiddenByCreator ? 'creator' : null,
     storageState: pkg.storage_state,
     libraryDirId: pkg.library_dir_id ?? null,
     hubResourceId: pkg.hub_resource_id,
@@ -699,8 +818,10 @@ function enrichPackageSummary(pkg) {
     favoriteContentCount,
     depCount,
     missingDeps,
+    inactiveDeps: transitiveInactiveMap.get(pkg.filename) || 0,
     morphCount: aggregateMorphCountMap.get(pkg.filename) || 0,
     firstSeenAt: pkg.first_seen_at,
+    fileMtime: pkg.file_mtime,
     isCorrupted: !!pkg.is_corrupted,
     isOrphan: orphanSet.has(pkg.filename),
     isCascadeOrphan: orphanSet.has(pkg.filename) && !directOrphanSet.has(pkg.filename),
@@ -708,8 +829,6 @@ function enrichPackageSummary(pkg) {
     noLookPresetTag,
     hasExtractedAppearancePreset,
     labelIds: packageLabelIds(pkg.filename),
-    contentLabelIds: contentLabels.ids,
-    contentLabelCategories: contentLabels.categories,
   }
 }
 
@@ -749,26 +868,42 @@ export function getPackageDetail(filename) {
   const dependents = [...dependentFilenames].map((fn) => {
     const dp = packageIndex.get(fn)
     return dp
-      ? { filename: fn, creator: dp.creator, packageName: dp.package_name, version: dp.version }
-      : { filename: fn }
+      ? {
+          filename: fn,
+          creator: dp.creator,
+          packageName: dp.package_name,
+          version: dp.version,
+          storageState: dp.storage_state ?? 'enabled',
+        }
+      : { filename: fn, storageState: 'enabled' }
   })
 
-  const contents = (contentByPackage.get(filename) || [])
-    .filter((c) => isVisible(c.type))
-    .map((c) => ({
-      id: c.id,
-      packageFilename: c.package_filename,
-      internalPath: c.internal_path,
-      displayName: c.display_name,
-      type: c.type,
-      category: categoryOf(c.type),
-      tag: tagOf(c.type),
-      ...enrichContentHidden(c),
-      favorite: c.favorite,
-      thumbnailPath: c.thumbnail_path,
-      ownLabelIds: labelsByContent.get(c.package_filename + '\0' + c.internal_path) || [],
-      labelSourceCategories: labelSourceCategoriesForContent(c.package_filename, c.internal_path),
-    }))
+  const mapContentRow = (c, extra = {}) => ({
+    id: c.id,
+    packageFilename: c.package_filename,
+    internalPath: c.internal_path,
+    displayName: c.display_name,
+    type: c.type,
+    category: categoryOf(c.type),
+    tag: tagOf(c.type),
+    hidden: c.hidden,
+    favorite: c.favorite,
+    thumbnailPath: c.thumbnail_path,
+    ownLabelIds: labelsByContent.get(c.package_filename + '\0' + stripDisabledSuffix(c.internal_path)) || [],
+    ...extra,
+  })
+
+  const contents = (contentByPackage.get(filename) || []).filter((c) => isVisible(c.type)).map((c) => mapContentRow(c))
+
+  // Append presets extracted from this package's scenes. They're loose
+  // (`__local__`) files, so they never live in `contentByPackage`; surfacing
+  // them here gives the detail panel + "More from this package" the linkage.
+  // Their real store-row `id`s make ContentView's related-item lookup work.
+  for (const c of extractedByPackage.get(filename) || []) {
+    contents.push(
+      mapContentRow(c, { extracted: true, extractedFrom: c.extractedFrom ?? null, localDisabled: !!c.localDisabled }),
+    )
+  }
 
   const { removableFilenames, removableSize } = computeRemovableDeps(filename, packageIndex, forwardDeps, reverseDeps)
 
@@ -833,10 +968,12 @@ export function getFilteredContents(filters = {}) {
     type: c.type,
     category: c.category,
     tag: c.tag,
-    ...enrichContentHidden(c),
+    hidden: c.hidden,
     favorite: c.favorite,
     thumbnailPath: c.thumbnail_path,
-    labelSourceCategories: labelSourceCategoriesForContent(c.package_filename, c.internal_path),
+    extractedFrom: c.extractedFrom ?? null,
+    localDisabled: !!c.localDisabled,
+    fileMtime: isLocalPackage(c.package_filename) ? c.file_mtime || 0 : 0,
     hasExtractedAppearancePreset:
       c.type === 'legacyLook' &&
       contentHasExtractedAppearance({
@@ -844,7 +981,7 @@ export function getFilteredContents(filters = {}) {
         internalPath: c.internal_path,
         personAtomIdsJson: c.person_atom_ids,
       }),
-    ownLabelIds: labelsByContent.get(c.package_filename + '\0' + c.internal_path) || [],
+    ownLabelIds: labelsByContent.get(c.package_filename + '\0' + stripDisabledSuffix(c.internal_path)) || [],
   }))
 }
 
@@ -860,7 +997,7 @@ export function getStatusCounts() {
   for (const [filename, pkg] of userPackageEntries()) {
     if (pkg.is_direct) direct++
     else dependency++
-    if ((transitiveMissingMap.get(filename) || 0) > 0 || pkg.is_corrupted) broken++
+    if (isBrokenPkg(filename, pkg)) broken++
     if (isNotDownloadable(pkg)) local++
     if (pkg.storage_state === 'offloaded') offloaded++
   }
@@ -1002,9 +1139,8 @@ export function getContentVisibilityCounts() {
     hidden = 0,
     favorites = 0
   for (const c of contentItems) {
-    const visibility = enrichContentHidden(c)
     all++
-    if (visibility.hidden) hidden++
+    if (c.hidden) hidden++
     else visible++
     if (c.favorite) favorites++
   }
@@ -1021,6 +1157,26 @@ export function findLocalByHubResourceId(resourceId) {
   return null
 }
 
+/**
+ * Tag a hub resource / wishlist snapshot with local install state
+ * (`_installed` / `_isDirect` / `_localFilename`). Matched by resource id, so it's
+ * version-agnostic. Returns the matched local package row (or null) for callers
+ * that need it. NOTE: the `hub:detail` handler does its own richer resolution
+ * (hubFiles-first, then id fallback) and deliberately doesn't use this.
+ */
+export function annotateInstallState(target, resourceId = target?.resource_id) {
+  const local = findLocalByHubResourceId(resourceId)
+  if (local) {
+    target._installed = true
+    target._isDirect = !!local.is_direct
+    target._localFilename = local.filename
+  } else {
+    target._installed = false
+    target._isDirect = false
+  }
+  return local
+}
+
 export function findLocalByFilename(filename) {
   if (isLocalPackage(filename)) return null
   return packageIndex.get(filename) || null
@@ -1034,38 +1190,46 @@ export function patchTypeOverride(filename, typeOverride) {
 }
 
 /**
- * Fast-path patch of `storage_state` (+ optionally `library_dir_id`) on
+ * Fast-path patch of `storage_state` (+ optionally `library_dir_id` / `subpath`) on
  * `packageIndex` rows so a toggle/move doesn't pay for a full `buildFromDb()`
  * rebuild. Used by `applyStorageState`.
+ *
+ * `subpath` must be patched whenever the file's folder within its library dir
+ * changed — e.g. restoring a BrowserAssist-flattened package into the nested
+ * folder recorded in its sidecar. Omitting it leaves the in-memory subpath
+ * stale while the DB is already correct, and the next relocate then looks for
+ * the bytes under the AddonPackages root.
  *
  * Content rows on the renderer no longer carry `storageState` — they read it
  * via `c.package.storageState` after relink — so there is nothing to patch on
  * the content side here.
  *
- * NOT refreshed by this function (and currently fine because none of these
- * aggregates depend on `storage_state`):
+ * NOT refreshed by this function:
  *  - `forwardDeps` / `reverseDeps` / `groupIndex` — graph topology, keyed on filename + package_name.
  *  - `removableSizeMap`, `aggregateMorphCountMap`, `transitiveDepsCountMap`,
  *    `transitiveMissingMap` — derived from `is_direct` and the dep graph.
  *  - `orphanSet` / `directOrphanSet` — derived from `is_direct` + reverse deps.
- *  - `stats` (broken count, sizes, content totals) — `brokenCount` uses `is_corrupted`
- *    + `transitiveMissingMap`, sizes/counts use `is_direct`.
  *  - `tagCounts`, `authorCounts`, `nonDownloadableRids` — Hub/metadata, state-independent.
  *
- * Live count `getStatusCounts().offloaded` re-iterates `packageIndex` on every call,
- * so it sees the patch immediately without needing to be invalidated here.
+ * State-dependent aggregates ARE storage-state sensitive and must NOT be read stale:
+ *  - `transitiveInactiveMap` and `stats.brokenCount` (which now counts active
+ *    packages with inactive deps) are refreshed by `recomputeInactiveDeps()`,
+ *    which the toggle chokepoint (`applyStorageStateChange`) calls after the bulk.
+ *  - Live count `getStatusCounts()` re-iterates `packageIndex` on every call, so it
+ *    sees `storage_state` patches (offloaded count, broken) immediately.
  *
- * If you ever add a derived map that branches on `storage_state` (e.g. an
- * "effective broken" set that treats offloaded deps as missing), either extend
- * this function or fall back to `buildFromDb()` at the call site — otherwise
- * a toggle-enabled will silently leave that map stale until the next rescan.
+ * If you add another derived map that branches on `storage_state`, either refresh
+ * it in `recomputeInactiveDeps()` / at the toggle chokepoint, compute it live, or
+ * fall back to `buildFromDb()` — otherwise a toggle will leave it stale until the
+ * next rescan.
  */
-export function patchStorageState(filenames, storageState, libraryDirId) {
+export function patchStorageState(filenames, storageState, libraryDirId, subpath) {
   for (const fn of filenames) {
     const pkg = packageIndex.get(fn)
     if (pkg) {
       pkg.storage_state = storageState
       if (libraryDirId !== undefined) pkg.library_dir_id = libraryDirId == null ? null : libraryDirId
+      if (subpath !== undefined) pkg.subpath = subpath || ''
     }
   }
 }

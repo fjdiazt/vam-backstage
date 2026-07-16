@@ -1,29 +1,31 @@
-import { useState, useCallback, useEffect, useRef } from 'react'
-import { Compass, Library, LayoutGrid, Download, Settings, Pause } from 'lucide-react'
+import { useState, useCallback, useEffect, useRef, Activity } from 'react'
+import { Compass, Library, LayoutGrid, Download, Settings, Pause, Loader2, AlertTriangle, Network } from 'lucide-react'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogMedia,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import ribbonAppIcon from '@resources/icon.png?url'
 import StatusBar from '@/components/StatusBar'
 import DownloadsPanel from '@/components/DownloadsPanel'
 import FirstRun from '@/components/FirstRun'
+import DropImport from '@/components/DropImport'
 import ErrorBoundary from '@/components/ErrorBoundary'
 import { ToastContainer, toast } from '@/components/Toast'
 import { WhatsNewDialog } from '@/components/WhatsNewDialog'
 import { ThumbnailLightbox } from '@/components/ThumbnailLightbox'
 import { CHANGELOG } from '@/lib/changelog'
 import { compareVersions, parseVersionCore, selectUnseen } from '@/lib/semver'
-import {
-  CONTENT_STATE_KEY,
-  HUB_STATE_KEY,
-  LAST_VIEW_KEY,
-  LIBRARY_STATE_KEY,
-  debounce,
-  readSettingJson,
-  sanitizeLastView,
-  sanitizeView,
-  writeSettingJson,
-} from '@/lib/view-state'
+import { dismissTransientOverlays } from '@/lib/dismissOverlays'
 import HubView from '@/views/HubView'
 import LibraryView from '@/views/LibraryView'
 import ContentView from '@/views/ContentView'
+import DependencyGraphView from '@/views/DependencyGraphView'
 import SettingsView from '@/views/SettingsView'
 
 import { TooltipProvider } from '@/components/ui/tooltip'
@@ -32,17 +34,19 @@ import { useHubStore } from '@/stores/useHubStore'
 import { useLibraryStore } from '@/stores/useLibraryStore'
 import { useContentStore } from '@/stores/useContentStore'
 import { useLabelsStore } from '@/stores/useLabelsStore'
+import { useViewStore } from '@/stores/useViewStore'
+import { useRemoteUiStore } from '@/stores/useRemoteUiStore'
 
 const NAV_ITEMS = [
   { id: 'hub', icon: Compass, label: 'Hub' },
   { id: 'library', icon: Library, label: 'Library' },
   { id: 'content', icon: LayoutGrid, label: 'Content' },
+  { id: 'graph', icon: Network, label: 'Graph' },
 ]
-
 export default function App() {
-  const [view, setView] = useState('library')
-  const [visitedViews, setVisitedViews] = useState(() => new Set(['library']))
-  const [uiHydrated, setUiHydrated] = useState(false)
+  const view = useViewStore((s) => s.view)
+  const setView = useViewStore((s) => s.setView)
+  const blurThumbnails = useRemoteUiStore((s) => s.blurThumbnails)
   const [dlPanelOpen, setDlPanelOpen] = useState(false)
   const [showWizard, setShowWizard] = useState(null) // null=checking, true/false
   const [whatsNew, setWhatsNew] = useState(null) // { entries, current } | null
@@ -52,48 +56,10 @@ export default function App() {
   const dlErrorBadge = dlItems.filter((d) => d.status === 'failed').length
 
   useEffect(() => {
-    let cancelled = false
     useDownloadStore.getState().init()
-
-    const saveHubState = debounce((state) => writeSettingJson(HUB_STATE_KEY, state), 300)
-    const saveLibraryState = debounce((state) => writeSettingJson(LIBRARY_STATE_KEY, state), 300)
-    const saveContentState = debounce((state) => writeSettingJson(CONTENT_STATE_KEY, state), 300)
-    const cleanupHubPersistence = useHubStore.subscribe((state) => saveHubState(state.getPersistedState()))
-    const cleanupLibraryPersistence = useLibraryStore.subscribe((state) => saveLibraryState(state.getPersistedState()))
-    const cleanupContentPersistence = useContentStore.subscribe((state) => saveContentState(state.getPersistedState()))
-
-    const hydrateUiState = async () => {
-      try {
-        const [lastView, hubState, libraryState, contentState] = await Promise.all([
-          readSettingJson(LAST_VIEW_KEY, 'library'),
-          readSettingJson(HUB_STATE_KEY, null),
-          readSettingJson(LIBRARY_STATE_KEY, null),
-          readSettingJson(CONTENT_STATE_KEY, null),
-        ])
-
-        await Promise.all([
-          useHubStore.getState().hydrateHubFilterPreferences(),
-          useLibraryStore.getState().hydrateLibraryVisualPreferences(),
-          useContentStore.getState().hydrateContentVisualPreferences(),
-        ])
-
-        useHubStore.getState().applyPersistedState(hubState)
-        useLibraryStore.getState().applyPersistedState(libraryState)
-        useContentStore.getState().applyPersistedState(contentState)
-
-        const safeView = sanitizeLastView(lastView)
-        if (!cancelled) {
-          setView(safeView)
-          setVisitedViews(new Set([safeView]))
-          setUiHydrated(true)
-        }
-      } catch (err) {
-        console.warn('Failed to hydrate view state:', err.message)
-        if (!cancelled) setUiHydrated(true)
-      }
-    }
-    void hydrateUiState()
-
+    // View filters/sort/layout are restored synchronously by each store's persist
+    // middleware; only the Settings-tab behavior prefs still load from SQLite here.
+    useLibraryStore.getState().hydrateLibraryVisualPreferences()
     // Labels are app-wide reference data; load once here (not per-view) and
     // refresh on the broadcast event. Each view used to own a copy + listener,
     // which meant whichever view was unmounted at mutation time stayed stale.
@@ -106,8 +72,10 @@ export default function App() {
       const valid = new Set(useLabelsStore.getState().labels.map((l) => l.id))
       for (const store of [useLibraryStore, useContentStore]) {
         const ids = store.getState().selectedLabelIds
-        if (ids.some((id) => !valid.has(id))) {
-          store.setState({ selectedLabelIds: ids.filter((id) => valid.has(id)) })
+        if (ids.some((item) => !valid.has(typeof item === 'object' ? item.value : item))) {
+          store.setState({
+            selectedLabelIds: ids.filter((item) => valid.has(typeof item === 'object' ? item.value : item)),
+          })
         }
       }
     })
@@ -132,11 +100,13 @@ export default function App() {
     })
     const cleanupContentsUpdated = window.api.onContentsUpdated(() => {
       void useLibraryStore.getState().refreshDetail()
-      if (useContentStore.getState().contents.length) void useContentStore.getState().fetchContents()
       void useContentStore.getState().refreshSelection()
     })
     const cleanupUnreadable = window.api.onScanUnreadable(({ filename }) => {
       toast(`Corrupted package skipped: ${filename}`)
+    })
+    const cleanupToast = window.api.onToast(({ message, type }) => {
+      toast(message, type)
     })
     window.api.startup.consumeUnreadable().then((filenames) => {
       if (!filenames?.length) return
@@ -147,14 +117,11 @@ export default function App() {
       toast(`Startup scan: ${listed}${tail} could not be read (corrupted or invalid).`, 'error')
     })
     return () => {
-      cancelled = true
-      cleanupHubPersistence()
-      cleanupLibraryPersistence()
-      cleanupContentPersistence()
       cleanupLabels()
       cleanupPackagesUpdated()
       cleanupContentsUpdated()
       cleanupUnreadable()
+      cleanupToast()
     }
   }, [])
 
@@ -162,10 +129,11 @@ export default function App() {
     window.api.settings.get('initial_scan_done').then((val) => {
       setShowWizard(!val)
     })
-    window.api.settings.get('blur_thumbnails').then((val) => {
-      document.documentElement.toggleAttribute('data-blur-thumbs', val === '1')
-    })
   }, [])
+
+  useEffect(() => {
+    document.documentElement.toggleAttribute('data-blur-thumbs', blurThumbnails)
+  }, [blurThumbnails])
 
   useEffect(() => {
     if (showWizard === null) return
@@ -193,19 +161,12 @@ export default function App() {
   }, [showWizard])
 
   const navContextRef = useRef(null)
-  const activateView = useCallback((targetView) => {
-    const safeView = sanitizeView(targetView)
-    setVisitedViews((prev) => {
-      if (prev.has(safeView)) return prev
-      const next = new Set(prev)
-      next.add(safeView)
-      return next
-    })
-    setView(safeView)
-    setDlPanelOpen(false)
-    void writeSettingJson(LAST_VIEW_KEY, safeView)
-  }, [])
 
+  // Lazy activation: a hidden <Activity> still mounts (and fetches), so only start
+  // keeping a view alive once visited — otherwise launching into Library would
+  // eagerly mount Hub/Content and fire a hub search on startup. Once seen, stays alive.
+  const seenViews = useRef(new Set([view]))
+  seenViews.current.add(view)
   const onWhatsNewDismiss = useCallback(async () => {
     if (!whatsNew) return
     const v = whatsNew.current
@@ -215,28 +176,51 @@ export default function App() {
 
   const navigateTo = useCallback(
     (targetView, context) => {
+      // The outgoing view is about to be frozen by <Activity>; unmount any open overlay now,
+      // while its effects are still connected, or its portal would be orphaned at the top-left.
+      dismissTransientOverlays()
       if (targetView === 'hub') {
+        const hub = useHubStore.getState()
         if (context?.openResource) {
-          void useHubStore.getState().openDetail(context.openResource)
+          // Arriving from another view to a specific hub resource is a hub-search
+          // action — snap to hub mode so the gallery behind the detail (and
+          // prev/next stepping) is the hub, not the wishlist the user last viewed.
+          hub.setGalleryMode('hub')
+          hub.openDetail(context.openResource)
+        } else if (useViewStore.getState().view === 'hub' && hub.detailResource) {
+          // Re-clicking Hub while details are open is an escape hatch back to the gallery
+          // (especially useful after drilling into dependency packages).
+          hub.closeDetail()
         }
+        // Else leave any open detail intact — returning to Hub from another view restores it.
         navContextRef.current = null
       } else {
         navContextRef.current = context || null
       }
-      activateView(targetView)
+      setView(targetView)
+      setDlPanelOpen(false)
     },
-    [activateView],
+    [setView],
   )
 
-  if (showWizard === null || !uiHydrated) {
-    return <div className="h-full bg-base" />
+  // On a client head every `window.api` call (incl. the `initial_scan_done`
+  // lookup that resolves `showWizard`) is a remote invoke queued until the
+  // socket connects — so this loading phase can last the whole first-connect.
+  // RemoteGate must render here too, otherwise the user stares at a black
+  // screen instead of the "Connecting…" modal.
+  if (showWizard === null) {
+    return (
+      <div className="h-full bg-base">
+        <RemoteGate />
+      </div>
+    )
   }
 
   return (
     <TooltipProvider>
       <div className="flex h-full bg-base">
+        <RemoteGate />
         {showWizard && <FirstRun onDone={() => setShowWizard(false)} />}
-        {/* Ribbon */}
         <nav className="w-[56px] bg-surface flex flex-col items-center border-r border-border shrink-0">
           <div className="w-full flex flex-col items-center shrink-0 mb-1.5" title="VaM Backstage">
             <div className="w-full flex items-center justify-center h-[52px]">
@@ -256,9 +240,7 @@ export default function App() {
                 key={item.id}
                 item={item}
                 active={view === item.id && !dlPanelOpen}
-                onClick={() => {
-                  activateView(item.id)
-                }}
+                onClick={() => navigateTo(item.id)}
               />
             ))}
           </div>
@@ -275,9 +257,7 @@ export default function App() {
             <NavButton
               item={{ id: 'settings', icon: Settings, label: 'Settings' }}
               active={view === 'settings' && !dlPanelOpen}
-              onClick={() => {
-                activateView('settings')
-              }}
+              onClick={() => navigateTo('settings')}
             />
           </div>
         </nav>
@@ -289,30 +269,32 @@ export default function App() {
         <div className="flex-1 flex flex-col min-w-0">
           <main className="flex-1 overflow-hidden">
             <ErrorBoundary>
-              {visitedViews.has('hub') && (
-                <div hidden={view !== 'hub'} className="h-full min-h-0">
-                  <HubView onNavigate={navigateTo} active={view === 'hub'} />
-                </div>
+              {seenViews.current.has('hub') && (
+                <Activity mode={view === 'hub' ? 'visible' : 'hidden'}>
+                  <HubView onNavigate={navigateTo} />
+                </Activity>
               )}
-              {visitedViews.has('library') && (
-                <div hidden={view !== 'library'} className="h-full min-h-0">
-                  <LibraryView onNavigate={navigateTo} navContext={navContextRef} active={view === 'library'} />
-                </div>
+              {seenViews.current.has('library') && (
+                <Activity mode={view === 'library' ? 'visible' : 'hidden'}>
+                  <LibraryView onNavigate={navigateTo} navContext={navContextRef} />
+                </Activity>
               )}
-              {visitedViews.has('content') && (
-                <div hidden={view !== 'content'} className="h-full min-h-0">
-                  <ContentView onNavigate={navigateTo} navContext={navContextRef} active={view === 'content'} />
-                </div>
+              {seenViews.current.has('content') && (
+                <Activity mode={view === 'content' ? 'visible' : 'hidden'}>
+                  <ContentView onNavigate={navigateTo} navContext={navContextRef} />
+                </Activity>
               )}
-              {visitedViews.has('settings') && (
-                <div hidden={view !== 'settings'} className="h-full min-h-0">
-                  <SettingsView />
-                </div>
+              {seenViews.current.has('graph') && (
+                <Activity mode={view === 'graph' ? 'visible' : 'hidden'}>
+                  <DependencyGraphView />
+                </Activity>
               )}
+              {view === 'settings' && <SettingsView />}
             </ErrorBoundary>
           </main>
           <StatusBar />
         </div>
+        {!showWizard && <DropImport />}
         <ToastContainer />
         <WhatsNewDialog
           open={!!whatsNew}
@@ -323,6 +305,70 @@ export default function App() {
         <ThumbnailLightbox />
       </div>
     </TooltipProvider>
+  )
+}
+
+/**
+ * Full-window blocking gate for client (remote) mode. While the socket is not
+ * connected it covers the UI and swallows pointer/keyboard input, so the user
+ * can't fire mutations that would queue against a dead connection (and would be
+ * discarded by the reload-on-reconnect anyway).
+ *
+ * Client mode has no local DB, so there's no persisted "auto-connect" flag to
+ * disable — but a client whose server is offline would otherwise be stuck on
+ * this screen forever. So we always provide an escape: a fatal version mismatch
+ * offers it immediately, and a plain connect/reconnect that hasn't succeeded
+ * within a few seconds reveals it too. Either way one click relaunches the app
+ * back into a normal local instance.
+ */
+const SLOW_CONNECT_MS = 6000
+
+function RemoteGate() {
+  const [status, setStatus] = useState(null)
+  const [slowConnect, setSlowConnect] = useState(false)
+  useEffect(() => {
+    if (!window.api.remote?.isRemote) return
+    return window.api.remote.onStatus(setStatus)
+  }, [])
+  const connected = status?.connected && !status?.error
+  useEffect(() => {
+    if (!window.api.remote?.isRemote || connected) {
+      setSlowConnect(false)
+      return
+    }
+    const t = setTimeout(() => setSlowConnect(true), SLOW_CONNECT_MS)
+    return () => clearTimeout(t)
+  }, [connected])
+  if (!window.api.remote?.isRemote) return null
+  if (connected) return null
+  const isError = !!status?.error
+  const showEscape = isError || slowConnect
+  return (
+    <AlertDialog open>
+      <AlertDialogContent onEscapeKeyDown={(e) => e.preventDefault()}>
+        <AlertDialogHeader>
+          <AlertDialogMedia className="self-center bg-transparent">
+            {isError ? <AlertTriangle className="text-error" /> : <Loader2 className="animate-spin text-accent-blue" />}
+          </AlertDialogMedia>
+          <AlertDialogTitle>{isError ? 'Connection error' : status ? 'Reconnecting…' : 'Connecting…'}</AlertDialogTitle>
+          <AlertDialogDescription className="select-text cursor-text break-all">
+            {isError ? status.error : status?.url || window.api.remote.url}
+          </AlertDialogDescription>
+          {!isError && slowConnect && (
+            <p className="col-start-2 text-[12px] text-text-tertiary">
+              This is taking longer than usual — the server may be offline. You can start locally instead.
+            </p>
+          )}
+        </AlertDialogHeader>
+        {showEscape && (
+          <AlertDialogFooter>
+            <AlertDialogAction variant="outline" onClick={() => window.api.remote.disconnect()}>
+              Switch to local mode
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        )}
+      </AlertDialogContent>
+    </AlertDialog>
   )
 }
 

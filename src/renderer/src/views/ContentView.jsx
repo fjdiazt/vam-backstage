@@ -4,7 +4,6 @@ import {
   List,
   Compass,
   Library as LibraryIcon,
-  AlertTriangle,
   Eye,
   EyeOff,
   Power,
@@ -35,42 +34,59 @@ import {
   cn,
 } from '@/lib/utils'
 import { toastIfBulkToggleFailures, toastIfSingleToggleFailed } from '@/lib/packageStorageToggleResults'
-import { useThumbnail } from '@/hooks/useThumbnail'
-import { useContentStore } from '@/stores/useContentStore'
+import { useThumbnail } from '@/hooks/createBlobCacheHook'
+import { useContentStore, FILTER_DEFAULTS } from '@/stores/useContentStore'
 import { useLibraryStore } from '@/stores/useLibraryStore'
 import { useLabelsStore } from '@/stores/useLabelsStore'
-import { AuthorAvatar, AuthorLink, ContentCard, ContentTableRow } from '@/components/PackageCard'
+import { AuthorAvatar, AuthorLink, ContentCard, ContentTableRow, depIssues } from '@/components/PackageCard'
 import { ContentItemContextMenu } from '@/components/ContentItemContextMenu'
 import { LabelsRow } from '@/components/labels/LabelsRow'
 import { LabelChip } from '@/components/labels/LabelChip'
 import { LabelApplyPopover } from '@/components/labels/LabelApplyPopover'
 import { useAddLabel } from '@/components/labels/useAddLabel'
 import { useLabelObjects } from '@/components/labels/useLabelObjects'
-import { bulkStateMap } from '@/components/labels/labelApplyState'
-import { ContentCategory } from '@/components/ContentCategory'
-import FilterPanel from '@/components/FilterPanel'
+import { bulkStateMap } from '@/components/labels/labelHelpers'
+import { ContentCategory, buildContentGallery } from '@/components/ContentCategory'
+import FilterPanel, { sectionActive } from '@/components/FilterPanel'
+import { SearchOnHubButton } from '@/components/SearchOnHubButton'
 import ResizeHandle from '@/components/ResizeHandle'
 import { VirtualGrid, VirtualList } from '@/components/VirtualGrid'
 import { ThumbnailSizeSlider } from '@/components/ThumbnailSizeSlider'
 import { useKeyboardNav } from '@/hooks/useKeyboardNav'
 import { usePersistedPanelWidth } from '@/hooks/usePersistedPanelWidth'
 import { openLightbox } from '@/components/ThumbnailLightbox'
-import { haystacksMatchAllTerms, searchAndTerms } from '@shared/search-text.js'
+import { matchesSmartQuery, parseSmartQuery } from '@/lib/smart-search'
+import { contentSearchExtras } from '@/lib/search-text'
+import { matchesPolarityList, matchesAuthorFilter, polarityScrollKey } from '@/lib/filter-match'
 import { isLocalPackage } from '@shared/local-package.js'
 import { isPackageActive } from '@shared/storage-state-predicates.js'
 import { packageNeedsDisableConfirmation } from '@/lib/package-disable-confirm'
 import { StorageStateChip } from '@/components/StorageStateChip'
-import { resolveContentRestoreIndex, shouldIgnoreTransientTop, shouldRestoreOnActivate } from '@/lib/view-scroll-anchor'
-import {
-  getAppCommandPageDirection,
-  getMousePageDirection,
-  scrollMousePage,
-  shouldIgnoreMousePageTarget,
-} from '@/lib/mouse-page-nav'
 
 const SORT_OPTIONS = ['Recently installed', 'Name A-Z', 'Package', 'Type']
-export const LAZY_LABEL_LOADING = false
-const isPackageDisabled = (c) => !isPackageActive(c.package?.storageState ?? 'enabled')
+
+/** The package whose install / type / storage state governs a content row.
+ *  Extracted presets are loose (`__local__`) files owned by a real `.var`, so they
+ *  defer to that source package; everything else uses its own package. Plain local
+ *  content resolves to `undefined` (the `__local__` sentinel isn't in the package
+ *  map) and callers apply sane defaults for it. */
+const governingPackage = (c) => c.sourcePackage ?? c.package
+
+/** Extracted presets follow their owning (source) package's state; a `.vap.disabled`
+ *  loose file is disabled on its own. Plain local content has no real package and
+ *  defaults to enabled. */
+const isPackageDisabled = (c) => {
+  if (c.localDisabled) return true
+  return !isPackageActive(governingPackage(c)?.storageState ?? 'enabled')
+}
+
+/** Installed = governed by a direct (leaf) install. Extracted presets defer to their
+ *  source package; plain local content has no real package and counts as installed. */
+const contentIsInstalled = (c) => {
+  const owner = governingPackage(c)
+  if (owner) return !!owner.isDirect
+  return isLocalPackage(c.packageFilename)
+}
 
 function matchesContentPackageStatus(c, packageStatusFilter) {
   if (packageStatusFilter === 'all') return true
@@ -79,15 +95,19 @@ function matchesContentPackageStatus(c, packageStatusFilter) {
   return !disabled
 }
 
-function contentMatchesSelectedTags(c, selectedTags) {
-  if (selectedTags.length === 0) return true
+function contentHubTags(c) {
   const hubTags = c.package?.hubTags
-  if (!hubTags) return false
-  const tags = hubTags
-    .toLowerCase()
-    .split(',')
-    .map((t) => t.trim())
-  return selectedTags.every((st) => tags.includes(st))
+  return hubTags
+    ? hubTags
+        .toLowerCase()
+        .split(',')
+        .map((t) => t.trim())
+        .filter(Boolean)
+    : []
+}
+
+function contentMatchesSelectedTags(c, selectedTags) {
+  return matchesPolarityList(selectedTags, contentHubTags(c), { normalize: true })
 }
 
 function contentLabelIds(c) {
@@ -101,28 +121,14 @@ function contentLabelIds(c) {
 }
 
 function contentMatchesSelectedLabels(c, selectedLabelIds) {
-  if (selectedLabelIds.length === 0) return true
-  const ids = contentLabelIds(c)
-  if (!ids.length) return false
-  for (const id of selectedLabelIds) if (!ids.includes(id)) return false
-  return true
-}
-
-function contentMatchesSelectedTypes(c, selectedTypes, selectedLabelIds = []) {
-  if (selectedTypes.length === 0) return true
-  const typeSet = new Set(selectedTypes)
-  if (typeSet.has(c.category)) return true
-  if (selectedLabelIds.length === 0) return false
-  const sourceCategories = c.labelSourceCategories || {}
-  return selectedLabelIds.some((id) => typeSet.has(sourceCategories[id]))
+  return matchesPolarityList(selectedLabelIds, contentLabelIds(c))
 }
 
 function matchesContentPackageFilter(c, packageFilter) {
   if (packageFilter === 'all') return true
   if (packageFilter === 'local') return isLocalPackage(c.packageFilename)
-  if (isLocalPackage(c.packageFilename)) return false
-  if (packageFilter === 'installed') return !!c.package?.isDirect
-  return !c.package?.isDirect
+  if (packageFilter === 'installed') return contentIsInstalled(c)
+  return !contentIsInstalled(c)
 }
 
 /** Shared sidebar facet pipeline; pass `omit` to skip one dimension being counted/filtered. */
@@ -130,13 +136,18 @@ function applyContentSidebarFilters(baseItems, ctx, omit = {}) {
   let items = baseItems
 
   if (!omit.selectedTypes && ctx.selectedTypes.length > 0) {
-    items = items.filter((c) => contentMatchesSelectedTypes(c, ctx.selectedTypes, ctx.selectedLabelIds))
+    const typeSet = new Set(ctx.selectedTypes)
+    items = items.filter((c) => typeSet.has(c.category))
   }
 
   if (!omit.selectedPackageTypes && ctx.selectedPackageTypes.length > 0) {
     const ptSet = new Set(ctx.selectedPackageTypes)
     items = items.filter((c) => {
-      const t = c.package?.type
+      // Plain local content isn't from a package, so it has no package type and
+      // counts as matching any type facet. Extracted presets use their owner's type.
+      const owner = governingPackage(c)
+      if (!owner && isLocalPackage(c.packageFilename)) return true
+      const t = owner?.type
       if (ptSet.has('Other') && !isCoreLibraryCategory(t)) return true
       return ptSet.has(libraryTypeBadgeLabel(t))
     })
@@ -157,39 +168,22 @@ function applyContentSidebarFilters(baseItems, ctx, omit = {}) {
     else if (vf === 'favorites') items = items.filter((c) => c.favorite)
   }
 
-  if (!omit.tagsLabels && !omit.selectedTags) {
+  if (!omit.tagsLabels) {
     items = items.filter((c) => contentMatchesSelectedTags(c, ctx.selectedTags))
-  }
-
-  if (!omit.tagsLabels && !omit.selectedLabelIds) {
     items = items.filter((c) => contentMatchesSelectedLabels(c, ctx.selectedLabelIds))
   }
 
   return items
 }
 
-export function labelsForContentItems(labels, items, selectedLabelIds, selectedTypes = []) {
-  const available = new Set(selectedLabelIds)
-  const typeSet = new Set(selectedTypes)
-  for (const c of items) {
-    for (const id of contentLabelIds(c)) {
-      const baCategory = c.labelSourceCategories?.[id]
-      if (typeSet.size === 0 || typeSet.has(c.category) || typeSet.has(baCategory)) available.add(id)
-    }
-  }
-  return labels.filter((l) => available.has(l.id))
-}
-
-export default function ContentView({ onNavigate, navContext, active = true }) {
+export default function ContentView({ onNavigate, navContext }) {
   const {
     contents,
     selectedItem,
     selectedPackage,
-    pendingRestoreItem,
-    scrollAnchorItemId,
-    scrollAnchorPackageFilename,
     search,
     authorSearch,
+    excludedAuthors,
     selectedTypes,
     selectedPackageTypes,
     selectedTags,
@@ -202,6 +196,7 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
     viewMode,
     setSearch,
     setAuthorSearch,
+    setExcludedAuthors,
     toggleType,
     selectSingleType,
     togglePackageType,
@@ -213,13 +208,11 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
     setVisibilityFilter,
     setPrimarySort,
     setSecondarySort,
+    resetFilters,
     setViewMode,
     cardWidth,
     setCardWidth,
     selectItem,
-    clearSelection,
-    consumePendingRestoreItem,
-    setScrollAnchorItem,
     bulkSelectedIds,
     toggleBulkSelect,
     rangeBulkSelect,
@@ -227,22 +220,17 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
     clearBulkSelection,
   } = useContentStore()
   const labels = useLabelsStore((s) => s.labels)
+  const labelNameById = useMemo(() => {
+    const m = new Map()
+    for (const l of labels) m.set(l.id, l.name)
+    return m
+  }, [labels])
 
   const [gridLayout, setGridLayout] = useState({ cols: 1, availableWidth: 0 })
   const [tagCounts, setTagCounts] = useState({})
   const [authorCounts, setAuthorCounts] = useState({})
-  const [restoreScrollKey, setRestoreScrollKey] = useState(() =>
-    scrollAnchorItemId != null
-      ? `anchor:${scrollAnchorItemId}:${scrollAnchorPackageFilename ?? ''}`
-      : pendingRestoreItem?.selectedItemId != null
-        ? `selected:${pendingRestoreItem.selectedItemId}:${pendingRestoreItem.selectedPackageFilename ?? ''}`
-        : '',
-  )
   const [detailPanelWidth] = usePersistedPanelWidth('panel_width_detail', { min: 260, max: 500, defaultWidth: 340 })
   const selectingRef = useRef(false)
-  const wasActiveRef = useRef(active)
-  const restoreNonceRef = useRef(0)
-  const ignoreTransientTopRef = useRef(false)
 
   useEffect(() => {
     const load = () => {
@@ -283,14 +271,13 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
   }, [])
 
   useEffect(() => {
-    if (!active) return
     const ctx = navContext?.current
     if (!ctx) return
     if (ctx.filterByPackage) {
       useContentStore.getState().showPackageContents(ctx.filterByPackage)
     }
     navContext.current = null
-  }, [active, navContext])
+  }, [navContext])
 
   const resetPackageTypeFilter = useCallback(() => {
     selectSinglePackageType('All')
@@ -299,18 +286,28 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
   const baseFiltered = useMemo(() => {
     let result = contents
     if (search?.trim()) {
-      const terms = searchAndTerms(search)
+      const { tokens } = parseSmartQuery(search)
       result = result.filter((c) => {
         const pkgLabel = contentPackageLabel(c)
-        return haystacksMatchAllTerms([c.displayName, c.package?.packageName, pkgLabel], terms)
+        const owner = c.sourcePackage ?? c.package
+        return matchesSmartQuery(tokens, {
+          text: () => [c.displayName, owner?.packageName, pkgLabel, ...contentSearchExtras(c)],
+          author: () => owner?.creator || '',
+          tags: () => contentHubTags(c),
+          labels: () =>
+            contentLabelIds(c)
+              .map((id) => labelNameById.get(id))
+              .filter(Boolean),
+        })
       })
     }
-    if (authorSearch) {
-      const aq = authorSearch.toLowerCase()
-      result = result.filter((c) => (c.package?.creator || '').toLowerCase().includes(aq))
+    if (authorSearch || excludedAuthors.length > 0) {
+      result = result.filter((c) =>
+        matchesAuthorFilter((c.sourcePackage ?? c.package)?.creator, authorSearch, excludedAuthors),
+      )
     }
     return result
-  }, [contents, search, authorSearch])
+  }, [contents, search, authorSearch, excludedAuthors, labelNameById])
 
   const typeCounts = useMemo(() => {
     const items = applyContentSidebarFilters(
@@ -355,10 +352,18 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
       { selectedPackageTypes: true },
     )
     const counts = { _total: items.length }
+    // Plain local content matches any type facet, so it's added to every bucket.
+    let anyType = 0
     for (const c of items) {
-      const label = libraryTypeBadgeLabel(c.package?.type)
+      const owner = governingPackage(c)
+      if (!owner && isLocalPackage(c.packageFilename)) {
+        anyType++
+        continue
+      }
+      const label = libraryTypeBadgeLabel(owner?.type)
       counts[label] = (counts[label] || 0) + 1
     }
+    if (anyType) for (const t of LIBRARY_FILTER_TYPES) counts[t] = (counts[t] || 0) + anyType
     return counts
   }, [
     baseFiltered,
@@ -385,13 +390,16 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
       },
       { packageFilter: true },
     )
+    // Buckets overlap by design: extracted presets and plain local content are
+    // installed-by-default yet also count as Local, so each facet is tallied
+    // independently against the same predicate the filter uses.
     let installed = 0,
       dependency = 0,
       local = 0
     for (const c of items) {
-      if (isLocalPackage(c.packageFilename)) local++
-      else if (c.package?.isDirect) installed++
+      if (contentIsInstalled(c)) installed++
       else dependency++
+      if (isLocalPackage(c.packageFilename)) local++
     }
     return { all: items.length, installed, dependency, local }
   }, [
@@ -471,33 +479,6 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
     selectedLabelIds,
   ])
 
-  const visibleLabels = useMemo(() => {
-    const items = applyContentSidebarFilters(
-      baseFiltered,
-      {
-        selectedTypes,
-        selectedPackageTypes,
-        packageFilter,
-        packageStatusFilter,
-        visibilityFilter,
-        selectedTags,
-        selectedLabelIds,
-      },
-      { selectedTypes: true, selectedLabelIds: true },
-    )
-    return labelsForContentItems(labels, items, selectedLabelIds, selectedTypes)
-  }, [
-    baseFiltered,
-    selectedTypes,
-    selectedPackageTypes,
-    packageFilter,
-    packageStatusFilter,
-    visibilityFilter,
-    selectedTags,
-    selectedLabelIds,
-    labels,
-  ])
-
   const filtered = useMemo(() => {
     let result = applyContentSidebarFilters(baseFiltered, {
       selectedTypes,
@@ -509,7 +490,11 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
       selectedLabelIds,
     })
     const sortFns = {
-      'Recently installed': (a, b) => (b.package?.firstSeenAt || 0) - (a.package?.firstSeenAt || 0),
+      // Loose rows carry their own fileMtime (matches VaM's on-disk order). Packaged
+      // rows fall back to the owning package's install / file timestamps.
+      'Recently installed': (a, b) =>
+        (b.fileMtime || b.package?.firstSeenAt || 0) - (a.fileMtime || a.package?.firstSeenAt || 0) ||
+        (b.package?.fileMtime || 0) - (a.package?.fileMtime || 0),
       'Name A-Z': (a, b) => (a.displayName || '').localeCompare(b.displayName || ''),
       Package: (a, b) => contentPackageLabel(a).localeCompare(contentPackageLabel(b)),
       Type: (a, b) => compareContentTypes(a.category, b.category),
@@ -538,6 +523,7 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
         label: 'Type',
         type: 'tags',
         value: new Set(selectedTypes),
+        default: FILTER_DEFAULTS.selectedTypes,
         onChange: selectSingleType,
         onToggle: toggleType,
         items: [
@@ -558,6 +544,7 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
         collapsedByDefault: true,
         onCollapsedChange: resetPackageTypeFilter,
         value: new Set(selectedPackageTypes),
+        default: FILTER_DEFAULTS.selectedPackageTypes,
         onChange: selectSinglePackageType,
         onToggle: togglePackageType,
         items: [
@@ -575,6 +562,7 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
         label: 'Visibility',
         type: 'list',
         value: visibilityFilter,
+        default: FILTER_DEFAULTS.visibilityFilter,
         onChange: setVisibilityFilter,
         items: [
           { value: 'all', label: 'All', count: visibilityCounts.all },
@@ -588,6 +576,7 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
         label: 'Package status',
         type: 'list',
         value: packageStatusFilter,
+        default: FILTER_DEFAULTS.packageStatusFilter,
         onChange: setPackageStatusFilter,
         items: [
           { value: 'all', label: 'All', count: packageStatusCounts.all },
@@ -600,6 +589,7 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
         label: 'Package',
         type: 'select',
         value: packageFilter,
+        default: FILTER_DEFAULTS.packageFilter,
         onChange: setPackageFilter,
         options: [
           { value: 'all', label: 'All', count: packageFilterCounts.all },
@@ -608,16 +598,18 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
           { value: 'local', label: 'Local', count: packageFilterCounts.local },
         ],
       },
-      ...(visibleLabels.length
+      ...(labels.length
         ? [
             {
               key: 'labels',
               label: 'Labels',
               type: 'labels-autocomplete',
               value: selectedLabelIds,
+              default: FILTER_DEFAULTS.selectedLabelIds,
               onChange: setSelectedLabelIds,
-              labels: visibleLabels,
+              labels,
               placeholder: 'Filter by label…',
+              allowNegate: true,
             },
           ]
         : []),
@@ -626,18 +618,24 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
         label: 'Tags',
         type: 'tags-autocomplete',
         value: selectedTags,
+        default: FILTER_DEFAULTS.selectedTags,
         onChange: setSelectedTags,
         suggestions: tagCounts,
         placeholder: 'Filter by tags…',
+        allowNegate: true,
       },
       {
         key: 'author',
         label: 'Author',
         type: 'text-autocomplete',
         value: authorSearch,
+        default: FILTER_DEFAULTS.authorSearch,
         onChange: setAuthorSearch,
+        excluded: excludedAuthors,
+        onExcludedChange: setExcludedAuthors,
         suggestions: authorCounts,
         placeholder: 'Filter by author…',
+        titleAction: authorSearch ? <SearchOnHubButton author={authorSearch} onNavigate={onNavigate} /> : null,
       },
       {
         key: 'primarySort',
@@ -668,9 +666,10 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
       visibilityFilter,
       visibilityCounts,
       authorSearch,
+      excludedAuthors,
       selectedTags,
       selectedLabelIds,
-      visibleLabels,
+      labels,
       tagCounts,
       authorCounts,
       primarySort,
@@ -684,18 +683,18 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
       setPackageStatusFilter,
       setVisibilityFilter,
       setAuthorSearch,
+      setExcludedAuthors,
       setSelectedTags,
       setSelectedLabelIds,
       setPrimarySort,
       setSecondarySort,
+      onNavigate,
     ],
   )
 
+  const activeFilterCount = sections.filter((s) => sectionActive(s) === true).length
+
   const handleToggleHidden = useCallback(async (item) => {
-    if (item.hidden && !item.hiddenDirect) {
-      toast(`Item is hidden by BrowserAssist ${item.hiddenReason === 'creator' ? 'creator' : 'tag'} rule`)
-      return
-    }
     try {
       await window.api.contents.toggleHidden({
         id: item.id,
@@ -723,42 +722,12 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
 
   const bulkActive = bulkSelectedIds.length > 0
 
-  const scrollResetKey = `${search}\0${authorSearch}\0${selectedTypes.join(',')}\0${selectedPackageTypes.join(',')}\0${selectedTags.join(',')}\0${selectedLabelIds.join(',')}\0${packageFilter}\0${packageStatusFilter}\0${visibilityFilter}\0${primarySort}\0${secondarySort}`
+  const scrollResetKey = `${search}\0${authorSearch}\0${excludedAuthors.join(',')}\0${selectedTypes.join(',')}\0${selectedPackageTypes.join(',')}\0${polarityScrollKey(selectedTags)}\0${polarityScrollKey(selectedLabelIds)}\0${packageFilter}\0${packageStatusFilter}\0${visibilityFilter}\0${primarySort}\0${secondarySort}`
 
   const lastSelectedIdxRef = useRef(0)
   const prevScrollResetKeyRef = useRef(scrollResetKey)
   const selectedIdx = selectedItem ? filtered.findIndex((c) => c.id === selectedItem.id) : -1
-  const restoreIdx = resolveContentRestoreIndex(
-    filtered,
-    scrollAnchorItemId,
-    scrollAnchorPackageFilename,
-    selectedItem?.id,
-    selectedItem?.packageFilename,
-  )
   if (selectedIdx >= 0) lastSelectedIdxRef.current = selectedIdx
-  if (shouldRestoreOnActivate(wasActiveRef.current, active, scrollAnchorItemId)) {
-    ignoreTransientTopRef.current = true
-  }
-
-  useLayoutEffect(() => {
-    const wasActive = wasActiveRef.current
-    wasActiveRef.current = active
-    if (!shouldRestoreOnActivate(wasActive, active, scrollAnchorItemId)) return
-    ignoreTransientTopRef.current = true
-    restoreNonceRef.current += 1
-    setRestoreScrollKey(`anchor:${scrollAnchorItemId}:${scrollAnchorPackageFilename ?? ''}:${restoreNonceRef.current}`)
-  }, [active, scrollAnchorItemId, scrollAnchorPackageFilename, restoreIdx])
-
-  const handleFirstVisibleIndexChange = useCallback(
-    (index) => {
-      if (!active) return
-      if (shouldIgnoreTransientTop(ignoreTransientTopRef.current, index, restoreIdx)) return
-      ignoreTransientTopRef.current = false
-      const item = filtered[index]
-      if (item) setScrollAnchorItem(item)
-    },
-    [active, filtered, restoreIdx, setScrollAnchorItem],
-  )
 
   const runSelectItem = useCallback(
     (item) => {
@@ -772,23 +741,6 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
   )
 
   useEffect(() => {
-    if (!active || !pendingRestoreItem || filtered.length === 0) return
-    const selectedId = pendingRestoreItem.selectedItemId
-    const selectedPackageFilename = pendingRestoreItem.selectedPackageFilename
-    const target = filtered.find(
-      (c) =>
-        String(c.id) === String(selectedId) &&
-        (!selectedPackageFilename || c.packageFilename === selectedPackageFilename),
-    )
-    consumePendingRestoreItem()
-    if (!target) return
-    if (scrollAnchorItemId == null) setRestoreScrollKey(`selected:${target.id}:${target.packageFilename ?? ''}`)
-    void runSelectItem(target)
-  }, [active, pendingRestoreItem, filtered, scrollAnchorItemId, consumePendingRestoreItem, runSelectItem])
-
-  useEffect(() => {
-    if (!active) return
-    if (pendingRestoreItem) return
     if (bulkActive || filtered.length === 0) {
       prevScrollResetKeyRef.current = scrollResetKey
       return
@@ -804,7 +756,7 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
     const target = filtered[idx]
     if (!target) return
     void runSelectItem(target)
-  }, [active, pendingRestoreItem, bulkActive, filtered, selectedItem, scrollResetKey, runSelectItem])
+  }, [bulkActive, filtered, selectedItem, scrollResetKey, runSelectItem])
 
   const handleContentClick = useCallback(
     (item, e) => {
@@ -853,55 +805,17 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
   )
 
   useKeyboardNav({
-    items: !active || bulkActive ? [] : filtered,
+    items: bulkActive ? [] : filtered,
     selectedId: selectedItem?.id,
     onSelect: handleKeyboardSelect,
     onClose: () => {
       if (bulkActive) clearBulkSelection()
     },
     getId: (c) => c.id,
+    columnCount: viewMode === 'grid' ? gridLayout.cols : 1,
   })
 
-  const pageNavRootRef = useRef(null)
-  const handlePageDirection = useCallback(
-    (direction, target, root) => {
-      if (direction < 0 && selectedItem && !bulkActive) {
-        clearSelection()
-        return
-      }
-
-      if (target && shouldIgnoreMousePageTarget(target)) return
-      scrollMousePage(target || root, root, direction)
-    },
-    [bulkActive, clearSelection, selectedItem],
-  )
-
-  const handleMousePageButton = useCallback(
-    (e) => {
-      const direction = getMousePageDirection(e.button)
-      if (!direction) return
-      e.preventDefault()
-      e.stopPropagation()
-      handlePageDirection(direction, e.target, e.currentTarget)
-    },
-    [handlePageDirection],
-  )
-
-  const handleAppCommand = useCallback(
-    (command) => {
-      const direction = getAppCommandPageDirection(command)
-      if (direction) handlePageDirection(direction, pageNavRootRef.current, pageNavRootRef.current)
-    },
-    [handlePageDirection],
-  )
-
   useEffect(() => {
-    if (!active) return undefined
-    return window.api.on('app-command', handleAppCommand)
-  }, [active, handleAppCommand])
-
-  useEffect(() => {
-    if (!active) return
     function onKeyDown(e) {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return
       if ((e.metaKey || e.ctrlKey) && e.key === 'a') {
@@ -911,10 +825,9 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [active, orderedContentIds, selectAllBulk])
+  }, [orderedContentIds, selectAllBulk])
 
   useEffect(() => {
-    if (!active) return
     if (!bulkActive) return
     function onSpace(e) {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return
@@ -926,14 +839,14 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
     }
     window.addEventListener('keydown', onSpace, true)
     return () => window.removeEventListener('keydown', onSpace, true)
-  }, [active, bulkActive])
+  }, [bulkActive])
 
   const selectedBulkSet = useMemo(() => new Set(bulkSelectedIds), [bulkSelectedIds])
 
   const bulkVisibilityState = useMemo(() => {
     const items = filtered.filter((c) => bulkSelectedIds.includes(c.id))
     if (!items.length) return { disabled: true, mixed: false, allHidden: false }
-    const hiddenCount = items.filter((c) => c.hiddenDirect ?? c.hidden).length
+    const hiddenCount = items.filter((c) => c.hidden).length
     const allHidden = hiddenCount === items.length
     const allVisible = hiddenCount === 0
     return {
@@ -957,7 +870,6 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
     async (hidden) => {
       const items = filtered
         .filter((c) => bulkSelectedIds.includes(c.id))
-        .filter((c) => hidden || !c.hidden || c.hiddenDirect)
         .map((c) => ({
           id: c.id,
           packageFilename: c.packageFilename,
@@ -1090,8 +1002,13 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
   }, [bulkSelectedIds, filtered.length])
 
   return (
-    <div ref={pageNavRootRef} className="h-full flex" onMouseUp={handleMousePageButton}>
-      <FilterPanel search={search} onSearchChange={setSearch} sections={sections} />
+    <div className="h-full flex">
+      <FilterPanel
+        search={search}
+        onSearchChange={setSearch}
+        smartSearch={{ authors: authorCounts, tags: tagCounts, labels }}
+        sections={sections}
+      />
 
       <div className="flex-1 flex flex-col min-w-0">
         {/* Toolbar */}
@@ -1212,6 +1129,26 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
         ) : (
           <div className="h-10 flex flex-nowrap items-center px-4 border-b border-border shrink-0 gap-2 min-w-0 overflow-x-auto [&::-webkit-scrollbar]:h-0 [&::-webkit-scrollbar]:bg-transparent">
             <span className="shrink-0 whitespace-nowrap text-[11px] text-text-tertiary">{filtered.length} items</span>
+            {activeFilterCount > 0 && (
+              <span className="shrink-0 flex items-center gap-1.5 whitespace-nowrap text-[11px] text-text-tertiary">
+                <span aria-hidden="true">·</span>
+                <span>
+                  {activeFilterCount} {activeFilterCount === 1 ? 'filter' : 'filters'}
+                </span>
+                <span>
+                  (
+                  <button
+                    type="button"
+                    onClick={() => resetFilters()}
+                    title="Reset all filters to their defaults"
+                    className="text-text-tertiary hover:text-text-secondary transition-colors cursor-pointer"
+                  >
+                    Reset
+                  </button>
+                  )
+                </span>
+              </span>
+            )}
             <div className="flex-1 min-w-0" />
             <div className="flex shrink-0 flex-nowrap items-center gap-2">
               {viewMode !== 'table' && (
@@ -1248,12 +1185,9 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
             itemHeight={cardWidth}
             className="flex-1"
             scrollResetKey={scrollResetKey}
-            restoreIndex={restoreIdx}
-            restoreKey={restoreScrollKey}
+            selectedIndex={selectedIdx}
             onLayout={setGridLayout}
-            onFirstVisibleIndexChange={handleFirstVisibleIndexChange}
             onEmptyAreaPointerDown={bulkActive ? () => clearBulkSelection() : undefined}
-            showBackToTop
             renderItem={(item) => (
               <ContentItemContextMenu
                 key={item.id}
@@ -1278,7 +1212,7 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
           />
         ) : (
           <div className="flex-1 flex flex-col overflow-hidden p-4">
-            <div className="border border-border rounded-lg overflow-hidden flex flex-col min-h-0">
+            <div className="border border-border rounded-lg overflow-hidden flex flex-col flex-1 min-h-0">
               <div className="bg-elevated text-[10px] uppercase tracking-wider text-text-tertiary flex border-b border-border shrink-0">
                 {bulkActive && (
                   <div className="w-8 shrink-0 flex items-center justify-center border-r border-border/50 py-2">
@@ -1307,10 +1241,6 @@ export default function ContentView({ onNavigate, navContext, active = true }) {
                 rowHeight={37}
                 className="flex-1"
                 scrollResetKey={scrollResetKey}
-                restoreIndex={restoreIdx}
-                restoreKey={restoreScrollKey}
-                onFirstVisibleIndexChange={handleFirstVisibleIndexChange}
-                showBackToTop
                 renderRow={(item) => (
                   <ContentItemContextMenu
                     key={item.id}
@@ -1414,7 +1344,10 @@ function ContentDetailPanel({
   const itemThumbUrl = useThumbnail(itemThumbKey)
   const pkgThumbUrl = useThumbnail(pkg ? `pkg:${pkg.filename}` : null)
 
-  const isLocal = isLocalPackage(item.packageFilename)
+  // Extracted presets are loose files but belong to a package — show the package
+  // section ("Extracted from …") rather than the plain local-file section.
+  const isExtracted = !!item.extractedFrom
+  const isLocal = isLocalPackage(item.packageFilename) && !isExtracted
   const allContents = useContentStore((s) => s.contents)
   const allLabels = useLabelsStore((s) => s.labels)
   const onApplyLabelToItem = useCallback(
@@ -1469,6 +1402,7 @@ function ContentDetailPanel({
 
   const pkgTitle = pkg ? displayName(pkg) : ''
   const pkgVersionStr = pkg && pkg.version != null && pkg.version !== '' ? String(pkg.version) : null
+  const pkgDepIssue = pkg ? depIssues(pkg, (pkg.storageState ?? 'enabled') === 'enabled') : null
 
   return (
     <div className="flex shrink-0" style={{ width: panelWidth }}>
@@ -1541,7 +1475,7 @@ function ContentDetailPanel({
 
         <div className="p-4 border-b border-border">
           <div className="text-[9px] uppercase tracking-wider text-text-tertiary font-medium mb-2">
-            {isLocal ? 'Local File' : 'From Package'}
+            {isLocal ? 'Local File' : isExtracted ? 'Extracted from Package' : 'From Package'}
           </div>
           {isLocal ? (
             <>
@@ -1639,10 +1573,13 @@ function ContentDetailPanel({
                 >
                   {formatBytes(pkg.sizeBytes + (pkg.removableSize || 0))}
                 </span>
-                {pkg.missingDeps > 0 && (
-                  <span className="ml-auto flex items-center gap-1 text-warning shrink-0">
-                    <AlertTriangle size={10} className="shrink-0" />
-                    {pkg.missingDeps} missing
+                {pkgDepIssue && (
+                  <span
+                    className={`ml-auto flex items-center gap-1 shrink-0 ${pkgDepIssue.summary.tone}`}
+                    title={pkgDepIssue.title}
+                  >
+                    <pkgDepIssue.summary.Icon size={10} className="shrink-0" />
+                    {pkgDepIssue.summary.count} {pkgDepIssue.summary.word}
                   </span>
                 )}
               </div>
@@ -1754,7 +1691,10 @@ function PackageEnableButton({ pkg, pkgTitle }) {
 }
 
 function MoreFromPackage({ grouped, onSelectRelated, suppressHiddenRowStyle = false }) {
-  const types = Object.keys(grouped).sort(compareContentTypes)
+  const types = useMemo(() => Object.keys(grouped).sort(compareContentTypes), [grouped])
+  // Flat, display-ordered gallery so arrow keys step through every thumbnail in
+  // the section (across categories) once the lightbox is open.
+  const gallery = useMemo(() => buildContentGallery(types.flatMap((type) => grouped[type])), [types, grouped])
 
   return (
     <div className="space-y-2">
@@ -1764,6 +1704,7 @@ function MoreFromPackage({ grouped, onSelectRelated, suppressHiddenRowStyle = fa
           items={grouped[type]}
           label={type}
           onSelectRow={onSelectRelated}
+          gallery={gallery}
           suppressHiddenRowStyle={suppressHiddenRowStyle}
         />
       ))}

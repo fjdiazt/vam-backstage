@@ -1,123 +1,130 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
-import {
-  ArrowLeft,
-  ArrowRight,
-  BookOpen,
-  ChevronLeft,
-  RotateCw,
-  Globe,
-  ChevronRight,
-  ChevronsLeft,
-  ChevronsRight,
-  Download,
-  Heart,
-  Bookmark,
-  Star,
-  ThumbsUp,
-  ThumbsDown,
-  ExternalLink,
-  Bug,
-  Copy,
-  Check,
-  Library as LibraryIcon,
-  Grid2x2,
-  Grid3x3,
-  Infinity as InfinityIcon,
-  Calendar,
-  Clock,
-  Plus,
-  Loader2,
-  RefreshCw,
-  X,
-} from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import {
-  TYPE_COLORS,
-  HUB_CATEGORY_COLORS,
-  CONTENT_TYPES,
-  compareContentTypes,
-  getTypeColor,
-  formatNumber,
-  formatStarRating,
-  formatBytes,
-  formatDate,
-  getGradient,
-  extractDomainLabel,
-} from '@/lib/utils'
-import { useHubStore } from '@/stores/useHubStore'
+import { useState, useEffect, useCallback, useRef, useMemo, Activity } from 'react'
+import { Grid2x2, Grid3x3, Loader2, RefreshCw, Pin } from 'lucide-react'
+import { dismissTransientOverlays } from '@/lib/dismissOverlays'
+import { CONTENT_TYPES, compareContentTypes, getTypeColor } from '@/lib/utils'
+import { useHubStore, hubFilterSignature, HUB_FILTER_DEFAULTS, WISHLIST_FILTER_DEFAULTS } from '@/stores/useHubStore'
+import { useWishlistStore } from '@/stores/useWishlistStore'
 import { useDownloadStore } from '@/stores/useDownloadStore'
 import { useInstalledStore } from '@/stores/useInstalledStore'
-import { useHubWishlistStore } from '@/stores/useHubWishlistStore'
-import { useHubHiddenStore } from '@/stores/useHubHiddenStore'
-import { useHubInstallState } from '@/hooks/useHubInstallState'
-import { useHubInteractions } from '@/hooks/useHubInteractions'
-import { HubCard, AuthorAvatar, DepRow } from '@/components/PackageCard'
-import FilterPanel from '@/components/FilterPanel'
-import ResizeHandle from '@/components/ResizeHandle'
-import { usePersistedPanelWidth } from '@/hooks/usePersistedPanelWidth'
-import { useIsDev } from '@/hooks/useIsDev'
+import { HubCard } from '@/components/PackageCard'
+import HubDetail from '@/components/HubDetail'
+import FilterPanel, { sectionActive } from '@/components/FilterPanel'
 import { LICENSE_FILTER_OPTIONS, getHubResourceLicense } from '@/lib/licenses'
-import { LicenseTag } from '@/components/LicenseTag'
-import { Tag } from '@/components/ui/tag'
+import { matchesSmartQuery, parseSmartQuery } from '@/lib/smart-search'
+import { wishlistSearchExtras } from '@/lib/search-text'
+import { matchesPolarityList, matchesAuthorFilter, matchesLicenseFilter } from '@/lib/filter-match'
+import { SearchOnHubButton } from '@/components/SearchOnHubButton'
 import { ThumbnailSizeSlider } from '@/components/ThumbnailSizeSlider'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { HUB_PER_PAGE_OPTIONS } from '@/lib/view-state'
-import { getAppCommandPageDirection, getMousePageDirection, shouldIgnoreMousePageTarget } from '@/lib/mouse-page-nav'
-import BackToTopButton from '@/components/BackToTopButton'
+import { VirtualGrid } from '@/components/VirtualGrid'
 
 /** Hub text search: avoid a network request on every keystroke */
 const HUB_SEARCH_DEBOUNCE_MS = 320
-/** Must match `gap-3` on the hub gallery grid (`0.75rem` = 12px) */
-const HUB_GALLERY_GRID_GAP_PX = 12
-/** IntersectionObserver rootMargin (bottom): load next page before user reaches the list end */
-const HUB_LOAD_MORE_MARGIN_BOTTOM_PX = 1600
+/**
+ * Medium HubCard footer height below the square thumb. Unlike LibraryCard, HubCard adds a
+ * full-width action button row, so it's taller: author+stats block (~68px) + button row
+ * (pt-2 8 + gradient button 32 + pb-3 12 = ~52px) ≈ 120px.
+ */
+const HUB_CARD_FOOTER_PX = 120
 
-export function shouldFetchHubResources({ active, sort, filterOptions, fetchedFilterKey, hubFetchKey }) {
-  return !!active && !!sort && !!filterOptions && fetchedFilterKey !== hubFetchKey
+/**
+ * Local sort options for the wishlist gallery. Unlike the hub sort list (which
+ * comes from the server and includes server-only notions like relevance), these
+ * all map to fields present in the stored snapshot, so sorting is client-side.
+ * `added` (default) reproduces the original fixed created_at DESC order.
+ *
+ * Deliberately NO "recently updated": `last_update` is frozen in the snapshot at
+ * add / last-detail-open time, so a package updated afterward would sort as if it
+ * never changed — the one field whose staleness corrupts the sort's own premise.
+ * Downloads/rating/likes are also snapshot-stale, but only in magnitude (accepted
+ * staleness policy) — relative order stays broadly right, so they're kept.
+ */
+const WISHLIST_SORTS = [
+  { value: 'added', label: 'Recently added' },
+  { value: 'author', label: 'Author (A–Z)' },
+  { value: 'name', label: 'Name (A–Z)' },
+  { value: 'downloads', label: 'Downloads' },
+  { value: 'rating', label: 'Rating' },
+  { value: 'likes', label: 'Reaction Score' },
+]
+
+const wlNum = (v) => parseInt(v || '0', 10) || 0
+/** Tiebreaker: most recently wishlisted first (matches the default order). */
+const wlByAdded = (a, b) => (b._wishlistedAt || 0) - (a._wishlistedAt || 0)
+const WISHLIST_SORT_FNS = {
+  added: wlByAdded,
+  downloads: (a, b) => wlNum(b.download_count) - wlNum(a.download_count) || wlByAdded(a, b),
+  rating: (a, b) => (parseFloat(b.rating_avg) || 0) - (parseFloat(a.rating_avg) || 0) || wlByAdded(a, b),
+  likes: (a, b) => wlNum(b.reaction_score) - wlNum(a.reaction_score) || wlByAdded(a, b),
+  name: (a, b) => String(a.title || '').localeCompare(String(b.title || '')) || wlByAdded(a, b),
+  author: (a, b) => String(a.username || '').localeCompare(String(b.username || '')) || wlByAdded(a, b),
 }
 
-export function hubPageForVisibleResourceIndex(index, perPage, fallbackPage) {
-  return Number.isInteger(index) ? Math.floor(index / Math.max(1, perPage)) + 1 : fallbackPage
+/**
+ * Tags on the stored snapshot mirror the hub detail `tags` field: a single
+ * comma-separated string (same shape the library persists to `hub_tags`). Parse
+ * to a lowercased list, matching the library's `packageMatchesSelectedTags`.
+ */
+function parseSnapshotTags(r) {
+  if (!r.tags) return []
+  return String(r.tags)
+    .toLowerCase()
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean)
 }
 
-export function hubInfiniteOffsetLabel() {
-  return 'Page'
+/** All wishlist filter dimensions, in a fixed key order for facet cross-filtering. */
+const WISHLIST_FILTER_KEYS = ['search', 'type', 'tags', 'paid', 'author', 'license']
+
+/**
+ * Build one predicate per filter dimension bound to the current filter state.
+ * Keeping them separate lets the gallery AND each facet reuse the same logic:
+ * the gallery ANDs them all, while a facet's counts AND every dimension *except*
+ * its own (standard cross-filtered faceting).
+ */
+function wishlistPredicates({ search, type, tags, paid, author, excludedAuthors, license }) {
+  const { tokens } = parseSmartQuery(search)
+  const tagItems = tags || []
+  const excluded = excludedAuthors || []
+  return {
+    search: (r) =>
+      !tokens.length ||
+      matchesSmartQuery(tokens, {
+        text: () => [r.title, r.username, r.tag_line, ...wishlistSearchExtras(r)],
+        author: () => r.username || '',
+        tags: () => parseSnapshotTags(r),
+        labels: () => [],
+      }),
+    type: (r) => type === 'All' || r.type === type,
+    tags: (r) => matchesPolarityList(tagItems, parseSnapshotTags(r), { normalize: true }),
+    paid: (r) => paid === 'all' || (paid === 'free' ? r.category === 'Free' : r.category === 'Paid'),
+    author: (r) => matchesAuthorFilter(r.username, author, excluded),
+    license: (r) => matchesLicenseFilter(getHubResourceLicense(r), license),
+  }
 }
 
-export function hubPageCountLabel(maxPage) {
-  const n = Math.max(1, Number(maxPage) || 1)
-  return n.toLocaleString()
+/** Items passing every filter dimension except `exclude` — the input set for that facet's counts. */
+function wishlistItemsExcept(items, preds, exclude) {
+  const keys = WISHLIST_FILTER_KEYS.filter((k) => k !== exclude)
+  return items.filter((r) => keys.every((k) => preds[k](r)))
 }
 
-export function shouldRenderHubPageNav(edge, browseMode, maxHubPage, showInfinitePagerControls = true) {
-  if (maxHubPage <= 1) return false
-  if (browseMode === 'infinite' && !showInfinitePagerControls) return false
-  if (edge === 'toolbar') return true
-  if (edge === 'bottom') return browseMode === 'paged'
-  return false
+/** Apply the full wishlist filter/sort state to the raw snapshot list. */
+function filterAndSortWishlist(items, state) {
+  const preds = wishlistPredicates(state)
+  // `.filter` always returns a fresh array, so sorting never mutates the store's.
+  const result = items.filter((r) => WISHLIST_FILTER_KEYS.every((k) => preds[k](r)))
+  return result.sort(WISHLIST_SORT_FNS[state.sort] || WISHLIST_SORT_FNS.added)
 }
 
-export function shouldRenderHubPageSummary(browseMode, showInfinitePagerControls = true) {
-  return browseMode !== 'infinite' || showInfinitePagerControls
-}
-
-export default function HubView({ onNavigate, active = true }) {
+export default function HubView({ onNavigate }) {
   const {
     resources,
     totalFound,
     totalPages,
     page,
-    startPage,
-    restorePage,
-    showInfinitePagerControls,
-    trackInfiniteRestorePage,
-    perPage,
-    browseMode,
     loading,
-    loadingPrevious,
-    tailResolving,
     error,
-    resolvedTotalPages,
     search,
     selectedType,
     paidFilter,
@@ -125,12 +132,22 @@ export default function HubView({ onNavigate, active = true }) {
     selectedHubTags,
     sort,
     license,
-    hideInstalled,
-    showHidden,
+    wlSearch,
+    wlType,
+    wlTags,
+    wlPaid,
+    wlAuthor,
+    wlExcludedAuthors,
+    wlLicense,
+    wlSort,
     detailResource,
-    pendingDetailResourceId,
+    detailData,
+    detailNonce,
+    detailHistory,
     cardMode,
     cardWidth,
+    galleryMode,
+    setGalleryMode,
     filterOptions,
     setSearch,
     setSelectedType,
@@ -139,42 +156,35 @@ export default function HubView({ onNavigate, active = true }) {
     setSelectedHubTags,
     setSort,
     setLicense,
-    setHideInstalled,
-    setShowHidden,
+    setWlSearch,
+    setWlType,
+    setWlTags,
+    setWlPaid,
+    setWlAuthor,
+    setWlExcludedAuthors,
+    setWlLicense,
+    setWlSort,
+    resetFilters,
+    resetWishlistFilters,
     setCardMode,
     setCardWidth,
     fetchResources,
     fetchNextPage,
-    fetchPreviousPage,
-    resolveTailPages,
     openDetail,
-    openDetailById,
     closeDetail,
-    setBrowseMode,
-    setPerPage,
-    goToPage,
-    startInfiniteAtPage,
-    setInfiniteRestorePage,
+    popDetailHistory,
   } = useHubStore()
-  const wishlistItems = useHubWishlistStore((s) => s.items)
-  const wishlistIds = useHubWishlistStore((s) => s.ids)
-  const wishlistLoading = useHubWishlistStore((s) => s.loading)
-  const toggleWishlist = useHubWishlistStore((s) => s.toggle)
-  const hiddenIds = useHubHiddenStore((s) => s.ids)
-  const hideHubItem = useHubHiddenStore((s) => s.hide)
-  const wishlistMode = paidFilter === 'wishlist'
+
+  const wishlistMode = galleryMode === 'wishlist'
+  const detailBackLabel = detailHistory.length > 0 ? detailHistory[detailHistory.length - 1].title : null
 
   const [searchDraft, setSearchDraft] = useState(search)
-  const [startPageDraft, setStartPageDraft] = useState(String(restorePage))
   const searchDraftRef = useRef(search)
   const searchDebounceRef = useRef(null)
   useEffect(() => {
     setSearchDraft(search)
     searchDraftRef.current = search
   }, [search])
-  useEffect(() => {
-    setStartPageDraft(String(restorePage))
-  }, [restorePage])
   useEffect(
     () => () => {
       if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current)
@@ -189,7 +199,8 @@ export default function HubView({ onNavigate, active = true }) {
         clearTimeout(searchDebounceRef.current)
         searchDebounceRef.current = null
       }
-      if (value === '') {
+      const trimmed = value.trim()
+      if (trimmed === '') {
         setSearch('')
         return
       }
@@ -197,7 +208,7 @@ export default function HubView({ onNavigate, active = true }) {
         searchDebounceRef.current = null
         // Ignore stale timers (clear clicked after timeout fired, or newer keystrokes).
         if (searchDraftRef.current !== value) return
-        setSearch(value)
+        setSearch(trimmed)
       }, HUB_SEARCH_DEBOUNCE_MS)
     },
     [setSearch],
@@ -227,544 +238,113 @@ export default function HubView({ onNavigate, active = true }) {
   }, [filterOptions])
 
   useEffect(() => {
-    if (!active) return
     useHubStore.getState().fetchFilters()
-    useHubWishlistStore.getState().hydrate()
-    useHubHiddenStore.getState().hydrate()
-  }, [active])
-
-  // Track gallery container width for the zoom slider
-  const galleryRef = useRef(null)
-  const [availableWidth, setAvailableWidth] = useState(0)
-  useEffect(() => {
-    const el = galleryRef.current
-    if (!el) return
-    const measure = () => setAvailableWidth(el.clientWidth - 32) // 16px padding each side
-    measure()
-    const ro = new ResizeObserver(measure)
-    ro.observe(el)
-    return () => ro.disconnect()
   }, [])
 
-  /** Mirror `repeat(auto-fill,minmax(min(cardWidth,100%),1fr))`: count how many columns fit. */
-  const columnCount = useMemo(() => {
-    if (!availableWidth || !cardWidth) return 1
-    const effectiveCardWidth = Math.min(cardWidth, availableWidth)
-    return Math.max(
-      1,
-      Math.floor((availableWidth + HUB_GALLERY_GRID_GAP_PX) / (effectiveCardWidth + HUB_GALLERY_GRID_GAP_PX)),
-    )
-  }, [availableWidth, cardWidth])
-
-  const filteredWishlistItems = useMemo(() => {
-    if (!wishlistMode) return []
-    const q = search.trim().toLowerCase()
-    const author = authorSearch.trim().toLowerCase()
-    return wishlistItems.filter((r) => {
-      if (q && !`${r.title || ''} ${r.username || ''}`.toLowerCase().includes(q)) return false
-      if (selectedType !== 'All' && r.type !== selectedType) return false
-      if (
-        author &&
-        !String(r.username || '')
-          .toLowerCase()
-          .includes(author)
-      )
-        return false
-      if (selectedHubTags.length) {
-        const tags = Array.isArray(r.tags) ? r.tags.map((t) => String(t).toLowerCase()) : []
-        if (!selectedHubTags.every((tag) => tags.includes(String(tag).toLowerCase()))) return false
-      }
-      if (license !== 'Any' && (getHubResourceLicense(r) || r.license) !== license) return false
-      return true
+  // Wishlist: id set drives the segmented-control count + detail toggle state
+  // (loaded once on mount); the full list is loaded lazily on entering the mode.
+  const wishlistItems = useWishlistStore((s) => s.items)
+  const wishlistCount = useWishlistStore((s) => s.ids.size)
+  const wishlistLoading = useWishlistStore((s) => s.loading)
+  const wishlistLoaded = useWishlistStore((s) => s.loaded)
+  useEffect(() => {
+    useWishlistStore.getState().loadIds()
+  }, [])
+  useEffect(() => {
+    if (wishlistMode) useWishlistStore.getState().load()
+  }, [wishlistMode])
+  // Main fires `wishlist:updated` for background snapshot changes and peer
+  // pin/unpin. Keep the old local behavior for bare events; only peer membership
+  // invalidations refresh ids when the full wishlist has never been loaded.
+  useEffect(() => {
+    return window.api.onWishlistUpdated((data) => {
+      const s = useWishlistStore.getState()
+      if (s.loaded) s.load()
+      else if (data?.membership) s.loadIds()
     })
-  }, [authorSearch, license, search, selectedHubTags, selectedType, wishlistItems, wishlistMode])
+  }, [])
 
-  const galleryResources = wishlistMode ? filteredWishlistItems : resources
-  const galleryLoading = wishlistMode ? wishlistLoading : loading
-  const galleryTotalFound = wishlistMode ? filteredWishlistItems.length : totalFound
+  const [availableWidth, setAvailableWidth] = useState(0)
+  const [gridCols, setGridCols] = useState(1)
+  const handleGridLayout = useCallback(({ availableWidth: w, cols }) => {
+    setAvailableWidth(w)
+    setGridCols(cols)
+  }, [])
 
-  const installedByHubResourceId = useInstalledStore((s) => s.byHubResourceId)
-  const filteredResources = useMemo(() => {
-    return galleryResources.filter((r) => {
-      const rid = String(r.resource_id)
-      if (!showHidden && hiddenIds.has(rid)) return false
-      if (hideInstalled && (installedByHubResourceId.get(rid)?.installed ?? r._installed)) return false
-      return true
-    })
-  }, [galleryResources, hiddenIds, hideInstalled, showHidden, installedByHubResourceId])
-
-  /** While more pages exist, hide the trailing partial row so the bottom is always full rows */
-  const visibleResources = useMemo(() => {
-    if (wishlistMode) return filteredResources
-    if (browseMode === 'paged') return filteredResources
-    if (page >= totalPages) return filteredResources
-    const fullRowCount = Math.floor(filteredResources.length / columnCount) * columnCount
-    if (fullRowCount === 0) return filteredResources
-    return filteredResources.slice(0, fullRowCount)
-  }, [browseMode, filteredResources, page, totalPages, columnCount, wishlistMode])
-
-  // Filter changes → reset to page 1 and fetch
-  const firstFetchRef = useRef(true)
-  const hubFetchKey = useMemo(
+  // Wishlist filtering/sorting is client-side over the locally stored snapshots.
+  const wishlistFiltered = useMemo(
     () =>
-      `${search}\0${selectedType}\0${paidFilter}\0${authorSearch}\0${selectedHubTags.join(',')}\0${sort}\0${license}`,
+      filterAndSortWishlist(wishlistItems, {
+        search: wlSearch,
+        type: wlType,
+        tags: wlTags,
+        paid: wlPaid,
+        author: wlAuthor,
+        excludedAuthors: wlExcludedAuthors,
+        license: wlLicense,
+        sort: wlSort,
+      }),
+    [wishlistItems, wlSearch, wlType, wlTags, wlPaid, wlAuthor, wlExcludedAuthors, wlLicense, wlSort],
+  )
+
+  // While more hub pages exist, hide the trailing partial row so the gallery bottom is always
+  // full rows — the ragged remainder fills in once the next chunk loads. `gridCols` comes from
+  // VirtualGrid's onLayout (its actual column count), so the trim tracks resize/slider changes.
+  const visibleResources = useMemo(() => {
+    if (page >= totalPages) return resources
+    const fullRowCount = Math.floor(resources.length / gridCols) * gridCols
+    if (fullRowCount === 0) return resources
+    return resources.slice(0, fullRowCount)
+  }, [resources, page, totalPages, gridCols])
+
+  // Per-mode scroll reset keys: each grid resets only on a filter change within its
+  // own mode, so toggling Hub<->Wishlist keeps both scroll positions. The hub key
+  // reuses the fetch-guard signature so "filters changed" means the same thing for
+  // scroll reset and refetch.
+  const hubScrollResetKey = useMemo(
+    () => hubFilterSignature({ search, selectedType, paidFilter, authorSearch, selectedHubTags, sort, license }),
     [search, selectedType, paidFilter, authorSearch, selectedHubTags, sort, license],
   )
-  const fetchedFilterKeyRef = useRef(null)
+  const wlScrollResetKey = useMemo(
+    () =>
+      `${wlSearch}\0${wlType}\0${wlTags.map((t) => `${typeof t === 'object' ? t.value : t}:${t?.negate ? 1 : 0}`).join(',')}\0${wlPaid}\0${wlAuthor}\0${wlExcludedAuthors.join(',')}\0${wlLicense}\0${wlSort}`,
+    [wlSearch, wlType, wlTags, wlPaid, wlAuthor, wlExcludedAuthors, wlLicense, wlSort],
+  )
+
+  const hubShowSkeleton = resources.length === 0 && (loading || !sort)
+
+  const compactCards = cardMode === 'minimal'
+
+  // Filter changes → reset to page 1 and fetch. Freshness-guarded so an <Activity>
+  // reveal with unchanged filters is a no-op (doesn't wipe loaded pages).
   useEffect(() => {
-    if (!active) return
-    if (wishlistMode) {
-      fetchedFilterKeyRef.current = hubFetchKey
-      useHubWishlistStore.getState().hydrate()
-      return
-    }
-    if (
-      !shouldFetchHubResources({
-        active,
-        sort,
-        filterOptions,
-        fetchedFilterKey: fetchedFilterKeyRef.current,
-        hubFetchKey,
-      })
-    )
-      return
-    const firstFetch = firstFetchRef.current
-    firstFetchRef.current = false
-    fetchedFilterKeyRef.current = hubFetchKey
-    const targetPage = firstFetch ? page : 1
-    useHubStore.getState().fetchResources(true, { page: targetPage })
-  }, [active, filterOptions, hubFetchKey, page, sort, wishlistMode])
+    if (!sort) return // wait for sort options to load
+    const s = useHubStore.getState()
+    if (hubFilterSignature(s) === s.lastFetchedKey) return
+    s.fetchResources(true)
+  }, [search, selectedType, paidFilter, authorSearch, selectedHubTags, sort, license])
 
+  // Page changes (without filter change) → fetch same filters, new page (append mode)
+  const pageRef = useRef(page)
   useEffect(() => {
-    if (!active) return
-    if (wishlistMode) return
-    if (loading) return
-    if (tailResolving || resolvedTotalPages || totalPages <= 1) return
-    void resolveTailPages()
-  }, [active, loading, resolvedTotalPages, resolveTailPages, tailResolving, totalPages, wishlistMode])
-
-  useEffect(() => {
-    if (!active || !pendingDetailResourceId || detailResource) return
-    void openDetailById(pendingDetailResourceId)
-  }, [active, pendingDetailResourceId, detailResource, openDetailById])
-
-  const topVisiblePage = useCallback(() => {
-    const fallbackPage = browseMode === 'infinite' ? restorePage : page
-    const root = galleryRef.current
-    if (!root) return fallbackPage
-    const rootTop = root.getBoundingClientRect().top
-    const cards = root.querySelectorAll('[data-hub-resource-index]')
-    for (const card of cards) {
-      if (card.getBoundingClientRect().bottom <= rootTop + 8) continue
-      const index = Number(card.dataset.hubResourceIndex)
-      return hubPageForVisibleResourceIndex(index, perPage, fallbackPage)
-    }
-    return fallbackPage
-  }, [browseMode, page, perPage, restorePage])
-
-  useEffect(() => {
-    if (!active) return
-    if (wishlistMode) return
-    if (browseMode !== 'infinite') return
-    if (!trackInfiniteRestorePage) return
-    const root = galleryRef.current
-    if (!root) return
-    let frame = 0
-    const updateRestorePage = () => {
-      frame = 0
-      setInfiniteRestorePage(topVisiblePage())
-    }
-    const onScroll = () => {
-      if (frame) return
-      frame = requestAnimationFrame(updateRestorePage)
-    }
-    updateRestorePage()
-    root.addEventListener('scroll', onScroll, { passive: true })
-    return () => {
-      root.removeEventListener('scroll', onScroll)
-      if (frame) cancelAnimationFrame(frame)
-    }
-  }, [
-    active,
-    browseMode,
-    resources.length,
-    setInfiniteRestorePage,
-    topVisiblePage,
-    trackInfiniteRestorePage,
-    wishlistMode,
-  ])
-
-  const toggleBrowseMode = useCallback(() => {
-    const store = useHubStore.getState()
-    if (browseMode === 'infinite') {
-      const nextPage = topVisiblePage()
-      setBrowseMode('paged')
-      galleryRef.current?.scrollTo({ top: 0 })
-      void store.fetchResources(true, { page: nextPage })
-    } else {
-      setBrowseMode('infinite')
-      galleryRef.current?.scrollTo({ top: 0 })
-      void store.fetchResources(true, { page: 1 })
-    }
-  }, [browseMode, setBrowseMode, topVisiblePage])
-
-  const goPagedPage = useCallback(
-    (nextPage) => {
-      galleryRef.current?.scrollTo({ top: 0 })
-      goToPage(nextPage)
-    },
-    [goToPage],
-  )
-  const goInfiniteStartPage = useCallback(
-    (nextPage) => {
-      galleryRef.current?.scrollTo({ top: 0 })
-      void startInfiniteAtPage(nextPage)
-    },
-    [startInfiniteAtPage],
-  )
-  const commitInfiniteStartDraft = useCallback(() => {
-    goInfiniteStartPage(startPageDraft)
-  }, [goInfiniteStartPage, startPageDraft])
-
-  const captureHubScrollAnchor = useCallback(() => {
-    const root = galleryRef.current
-    if (!root) return null
-    const rootTop = root.getBoundingClientRect().top
-    const cards = root.querySelectorAll('[data-hub-resource-id]')
-    for (const card of cards) {
-      const rect = card.getBoundingClientRect()
-      if (rect.bottom <= rootTop + 8) continue
-      return { id: card.dataset.hubResourceId, top: rect.top }
-    }
-    return null
-  }, [])
-
-  const restoreHubScrollAnchor = useCallback((anchor) => {
-    if (!anchor) return
-    requestAnimationFrame(() => {
-      const root = galleryRef.current
-      if (!root) return
-      const cards = root.querySelectorAll('[data-hub-resource-id]')
-      const card = [...cards].find((node) => node.dataset.hubResourceId === anchor.id)
-      if (!card) return
-      root.scrollTop += card.getBoundingClientRect().top - anchor.top
-    })
-  }, [])
-
-  const fetchPreviousHubPage = useCallback(async () => {
-    const anchor = captureHubScrollAnchor()
-    const prepended = await fetchPreviousPage()
-    if (prepended) restoreHubScrollAnchor(anchor)
-  }, [captureHubScrollAnchor, fetchPreviousPage, restoreHubScrollAnchor])
-
-  const handleGalleryWheel = useCallback(
-    (e) => {
-      if (wishlistMode) return
-      if (browseMode !== 'infinite' || loading || startPage <= 1 || e.deltaY >= 0) return
-      if (galleryRef.current?.scrollTop > 8) return
-      void fetchPreviousHubPage()
-    },
-    [browseMode, fetchPreviousHubPage, loading, startPage, wishlistMode],
-  )
-
-  const maxHubPage = wishlistMode ? 1 : Math.max(resolvedTotalPages || totalPages || 1, 1)
-  const pageCountLabel = hubPageCountLabel(maxHubPage)
-  const rangePage = wishlistMode ? 1 : browseMode === 'infinite' ? startPage : page
-  const rangeResources = wishlistMode ? filteredResources : resources
-  const pageStart = rangeResources.length ? (rangePage - 1) * perPage + 1 : 0
-  const pageEnd = rangeResources.length
-    ? Math.min((rangePage - 1) * perPage + rangeResources.length, galleryTotalFound)
-    : 0
-  const pageRange = rangeResources.length
-    ? `Showing ${pageStart.toLocaleString()}-${pageEnd.toLocaleString()} of ${galleryTotalFound.toLocaleString()}`
-    : `Showing 0 of ${galleryTotalFound.toLocaleString()}`
-  const pageButtons = useMemo(() => {
-    if (maxHubPage <= 7) return Array.from({ length: maxHubPage }, (_, i) => i + 1)
-    const pages = new Set([1, maxHubPage, page - 1, page, page + 1])
-    if (page <= 4) {
-      for (let p = 2; p <= 5; p += 1) pages.add(p)
-    }
-    if (page >= maxHubPage - 3) {
-      for (let p = maxHubPage - 4; p < maxHubPage; p += 1) pages.add(p)
-    }
-    const sorted = [...pages].filter((p) => p >= 1 && p <= maxHubPage).sort((a, b) => a - b)
-    return sorted.flatMap((p, i) => (i > 0 && p - sorted[i - 1] > 1 ? ['...', p] : [p]))
-  }, [maxHubPage, page])
-
-  const goPageDirection = useCallback(
-    (direction) => {
-      if (wishlistMode) return
-      const currentPage = browseMode === 'infinite' ? restorePage : page
-      if (direction < 0 && currentPage <= 1) return
-      const canRecheckTail = !!resolvedTotalPages && !tailResolving
-      if (direction > 0 && currentPage >= maxHubPage && !canRecheckTail) return
-
-      const nextPage = currentPage + direction
-      if (browseMode === 'infinite') goInfiniteStartPage(nextPage)
-      else goPagedPage(nextPage)
-    },
-    [
-      browseMode,
-      goInfiniteStartPage,
-      goPagedPage,
-      maxHubPage,
-      page,
-      resolvedTotalPages,
-      restorePage,
-      tailResolving,
-      wishlistMode,
-    ],
-  )
-
-  const handlePageDirection = useCallback(
-    (direction) => {
-      if (detailResource) {
-        if (direction < 0) closeDetail()
-        return
-      }
-      goPageDirection(direction)
-    },
-    [closeDetail, detailResource, goPageDirection],
-  )
-
-  const handleMousePageButton = useCallback(
-    (e) => {
-      const direction = getMousePageDirection(e.button)
-      if (!direction) return
-      e.preventDefault()
-      e.stopPropagation()
-      if (!detailResource && shouldIgnoreMousePageTarget(e.target)) return
-      handlePageDirection(direction)
-    },
-    [detailResource, handlePageDirection],
-  )
-
-  const handleAppCommand = useCallback(
-    (command) => {
-      const direction = getAppCommandPageDirection(command)
-      if (direction) handlePageDirection(direction)
-    },
-    [handlePageDirection],
-  )
-
-  useEffect(() => {
-    if (!active) return undefined
-    return window.api.on('app-command', handleAppCommand)
-  }, [active, handleAppCommand])
-
-  const renderPageNav = (edge) => {
-    if (!shouldRenderHubPageNav(edge, browseMode, maxHubPage, showInfinitePagerControls)) return null
-    const iconClass =
-      'h-8 w-8 rounded flex items-center justify-center text-text-tertiary hover:text-text-primary hover:bg-elevated disabled:opacity-30 cursor-pointer disabled:cursor-default'
-    const pageClass =
-      'h-8 min-w-8 px-2 rounded text-xs tabular-nums hover:bg-elevated disabled:cursor-default cursor-pointer'
-    const infiniteOffsetLabel = hubInfiniteOffsetLabel()
-    const canRecheckTail = !!resolvedTotalPages && !tailResolving
-    const controls =
-      browseMode === 'paged' ? (
-        <>
-          <button
-            type="button"
-            disabled={loading || page <= 1}
-            onClick={() => goPagedPage(1)}
-            title="First Hub page"
-            aria-label="First Hub page"
-            className={iconClass}
-          >
-            <ChevronsLeft size={17} />
-          </button>
-          <button
-            type="button"
-            disabled={loading || page <= 1}
-            onClick={() => goPagedPage(page - 1)}
-            title="Previous Hub page"
-            aria-label="Previous Hub page"
-            className={iconClass}
-          >
-            <ChevronLeft size={18} />
-          </button>
-          {pageButtons.map((p, i) =>
-            p === '...' ? (
-              <span key={`ellipsis-${i}`} className="h-8 px-1 flex items-center text-text-tertiary">
-                ...
-              </span>
-            ) : (
-              <button
-                key={p}
-                type="button"
-                disabled={loading || p === page}
-                onClick={() => goPagedPage(p)}
-                aria-current={p === page ? 'page' : undefined}
-                className={`${pageClass} ${
-                  p === page ? 'bg-hover text-text-primary font-medium' : 'text-text-tertiary hover:text-text-primary'
-                }`}
-              >
-                {p.toLocaleString()}
-              </button>
-            ),
-          )}
-          <button
-            type="button"
-            disabled={loading || (page >= maxHubPage && !canRecheckTail)}
-            onClick={() => goPagedPage(page + 1)}
-            title={page >= maxHubPage ? 'Check for more Hub pages' : 'Next Hub page'}
-            aria-label={page >= maxHubPage ? 'Check for more Hub pages' : 'Next Hub page'}
-            className={iconClass}
-          >
-            <ChevronRight size={18} />
-          </button>
-          <button
-            type="button"
-            disabled={loading || (page >= maxHubPage && !canRecheckTail)}
-            onClick={() => goPagedPage(maxHubPage)}
-            title={page >= maxHubPage ? 'Check for last Hub page' : 'Last Hub page'}
-            aria-label={page >= maxHubPage ? 'Check for last Hub page' : 'Last Hub page'}
-            className={iconClass}
-          >
-            <ChevronsRight size={17} />
-          </button>
-        </>
-      ) : (
-        <>
-          <button
-            type="button"
-            disabled={loading || restorePage <= 1}
-            onClick={() => goInfiniteStartPage(1)}
-            title="Start on page 1"
-            aria-label="Start on page 1"
-            className={iconClass}
-          >
-            <ChevronsLeft size={17} />
-          </button>
-          <button
-            type="button"
-            disabled={loading || restorePage <= 1}
-            onClick={() => goInfiniteStartPage(restorePage - 1)}
-            title="Start on previous page"
-            aria-label="Start on previous page"
-            className={iconClass}
-          >
-            <ChevronLeft size={18} />
-          </button>
-          <span className="h-8 flex items-center gap-1 rounded px-2 text-xs text-text-tertiary">
-            <span>{infiniteOffsetLabel}</span>
-            <input
-              type="number"
-              min="1"
-              max={maxHubPage}
-              value={startPageDraft}
-              disabled={loading}
-              onChange={(e) => setStartPageDraft(e.target.value)}
-              onBlur={commitInfiniteStartDraft}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') e.currentTarget.blur()
-              }}
-              aria-label="Hub start page"
-              className="h-6 w-16 rounded border border-input bg-elevated px-2 text-right text-xs tabular-nums text-text-primary outline-none focus:border-ring/50 disabled:opacity-50"
-            />
-            <span className="tabular-nums">of {pageCountLabel}</span>
-          </span>
-          <button
-            type="button"
-            disabled={loading || (restorePage >= maxHubPage && !canRecheckTail)}
-            onClick={() => goInfiniteStartPage(restorePage + 1)}
-            title={restorePage >= maxHubPage ? 'Check for more Hub pages' : 'Start on next page'}
-            aria-label={restorePage >= maxHubPage ? 'Check for more Hub pages' : 'Start on next page'}
-            className={iconClass}
-          >
-            <ChevronRight size={18} />
-          </button>
-          <button
-            type="button"
-            disabled={loading || (restorePage >= maxHubPage && !canRecheckTail)}
-            onClick={() => goInfiniteStartPage(maxHubPage)}
-            title={restorePage >= maxHubPage ? 'Check for last Hub page' : 'Start on last page'}
-            aria-label={restorePage >= maxHubPage ? 'Check for last Hub page' : 'Start on last page'}
-            className={iconClass}
-          >
-            <ChevronsRight size={17} />
-          </button>
-        </>
-      )
-    if (edge === 'toolbar') {
-      return <div className="flex min-w-0 max-w-full flex-wrap items-center justify-center gap-1">{controls}</div>
-    }
-    return (
-      <div
-        className={`flex min-w-0 flex-wrap items-center justify-center gap-x-3 gap-y-2 text-[11px] text-text-tertiary ${
-          edge === 'bottom' ? 'mt-4' : ''
-        }`}
-      >
-        {edge === 'bottom' && <div className="min-w-[1px] flex-1" />}
-        <div className="flex min-w-0 max-w-full flex-wrap items-center justify-center gap-1">{controls}</div>
-        {renderPageSummary()}
-      </div>
-    )
-  }
-
-  const renderPageSummary = () => (
-    <div className="flex min-w-[230px] flex-1 items-center justify-end gap-2">
-      <span className="text-right text-[11px] tabular-nums text-text-tertiary">{pageRange}</span>
-      <span className="text-[11px] text-text-tertiary">Page size</span>
-      <Select value={String(perPage)} onValueChange={setPerPage}>
-        <SelectTrigger size="sm" className="h-8 min-w-[72px]" aria-label="Hub page size">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent align="end" className="min-w-[72px]">
-          {HUB_PER_PAGE_OPTIONS.map((n) => (
-            <SelectItem key={n} value={String(n)}>
-              {n}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-    </div>
-  )
-
-  // Intersection observer sentinel for infinite scroll (root = gallery scroller so rootMargin
-  // prefetches below the fold; viewport root + overflow-y ancestor clips the target until late).
-  const sentinelRef = useRef(null)
-  useEffect(() => {
-    if (!active) return
-    if (wishlistMode) return
-    if (browseMode !== 'infinite') return
-    const root = galleryRef.current
-    const el = sentinelRef.current
-    if (!root || !el) return
-    const io = new IntersectionObserver(
-      ([entry]) => {
-        if (entry.isIntersecting) fetchNextPage()
-      },
-      { root, rootMargin: `0px 0px ${HUB_LOAD_MORE_MARGIN_BOTTOM_PX}px 0px` },
-    )
-    io.observe(el)
-    return () => io.disconnect()
-  }, [active, browseMode, fetchNextPage, filteredResources.length, wishlistMode])
-
-  // The observer only fires on intersection *changes*, so when the sentinel stays visible across
-  // a page load (common with cached pages) nothing re-triggers it. After each page settles, probe
-  // whether the sentinel is still in the prefetch zone and keep loading if so.
-  useEffect(() => {
-    if (!active) return
-    if (wishlistMode) return
-    if (browseMode !== 'infinite') return
-    if (loading || page >= totalPages) return
-    const root = galleryRef.current
-    const el = sentinelRef.current
-    if (!root || !el) return
-    const rootRect = root.getBoundingClientRect()
-    const elRect = el.getBoundingClientRect()
-    if (elRect.top < rootRect.bottom + HUB_LOAD_MORE_MARGIN_BOTTOM_PX && elRect.bottom > rootRect.top) {
-      fetchNextPage()
-    }
-  }, [active, browseMode, loading, page, totalPages, filteredResources.length, fetchNextPage, wishlistMode])
+    if (pageRef.current === page) return
+    pageRef.current = page
+    // Filter resets already fetch page 1 themselves. Starting an append fetch here
+    // would supersede that request without recording its filter key, leaving the
+    // freshness guard able to mistake filtered resources for a neutral result.
+    if (page === 1) return
+    useHubStore.getState().fetchResources()
+  }, [page])
 
   // When packages change (promote, download completes, uninstall), resync install status from DB.
   // The hub detail panel is refreshed at App level; here we only patch the
   // gallery's resource objects + the global installed-state store.
   useEffect(() => {
     return window.api.onPackagesUpdated(async () => {
-      void useHubWishlistStore.getState().hydrate()
+      // Re-list the wishlist so its cards' installed/dep badges reconcile too
+      // (wishlist items aren't part of hub `resources`, so the block below misses them).
+      if (useWishlistStore.getState().loaded) useWishlistStore.getState().load()
+
       const { resources } = useHubStore.getState()
       if (resources.length === 0) return
 
@@ -828,9 +408,14 @@ export default function HubView({ onNavigate, active = true }) {
 
   const handleFilterAuthor = useCallback(
     (author) => {
-      setAuthorSearch(author)
+      // Filter within the current mode: in wishlist mode this drives the local
+      // wishlist author filter, in hub mode the hub search. The gallery mode can't
+      // change while a detail overlay is open (the toggle sits behind it), so
+      // reading it live also correctly reflects where the detail was opened from.
+      if (useHubStore.getState().galleryMode === 'wishlist') setWlAuthor(author)
+      else setAuthorSearch(author)
     },
-    [setAuthorSearch],
+    [setAuthorSearch, setWlAuthor],
   )
 
   const handlePromote = useCallback((filename, hubResourceId) => {
@@ -844,6 +429,90 @@ export default function HubView({ onNavigate, active = true }) {
     }))
   }, [])
 
+  // --- Prev/Next navigation through the current gallery list ---
+  // The currently shown package: detailData once loaded, else the opening stub.
+  // The list stepped through is the filtered wishlist in wishlist mode, else hub
+  // search. A ref mirrors the filtered list so the pager callbacks (which read
+  // fresh state to dodge stale closures) can step through exactly what's shown.
+  const detailList = wishlistMode ? wishlistFiltered : resources
+  const wishlistViewRef = useRef(wishlistFiltered)
+  wishlistViewRef.current = wishlistFiltered
+  const currentDetailId = detailResource ? String(detailData?.resource_id ?? detailResource.resource_id ?? '') : ''
+  const detailIdx = currentDetailId ? detailList.findIndex((r) => String(r.resource_id) === currentDetailId) : -1
+  const canPrevDetail = detailIdx > 0
+  const canNextDetail = wishlistMode
+    ? detailIdx >= 0 && detailIdx < detailList.length - 1
+    : detailIdx >= 0 && (detailIdx < resources.length - 1 || (page < totalPages && !loading))
+  // null → pager hidden (neighbor unknown, or dep-drill history is active)
+  const detailPosition =
+    detailBackLabel || detailIdx < 0
+      ? null
+      : { n: detailIdx + 1, total: wishlistMode ? detailList.length : totalFound || resources.length }
+
+  const handleDetailPrev = useCallback(() => {
+    const { galleryMode, resources, detailResource, detailData } = useHubStore.getState()
+    const list = galleryMode === 'wishlist' ? wishlistViewRef.current : resources
+    const cur = detailResource ? String(detailData?.resource_id ?? detailResource.resource_id ?? '') : ''
+    const idx = cur ? list.findIndex((r) => String(r.resource_id) === cur) : -1
+    if (idx > 0) openDetail(list[idx - 1])
+  }, [openDetail])
+
+  // Enabled after the first Next within a panel-open session; gates neighbor detail
+  // prefetch so users who never step through don't pay extra `hub:detail` requests.
+  const detailPrefetchRef = useRef(false)
+  useEffect(() => {
+    if (!detailResource) detailPrefetchRef.current = false
+  }, [detailResource])
+
+  // When Next is pressed on the last loaded item, remember which item we advanced
+  // from and load the next page; the effect below jumps once that page arrives.
+  const pendingNextFromRef = useRef(null)
+  const handleDetailNext = useCallback(() => {
+    detailPrefetchRef.current = true
+    const { galleryMode, resources, detailResource, detailData, page, totalPages } = useHubStore.getState()
+    const cur = detailResource ? String(detailData?.resource_id ?? detailResource.resource_id ?? '') : ''
+    if (galleryMode === 'wishlist') {
+      const list = wishlistViewRef.current
+      const idx = cur ? list.findIndex((r) => String(r.resource_id) === cur) : -1
+      if (idx >= 0 && idx < list.length - 1) openDetail(list[idx + 1])
+      return
+    }
+    const idx = cur ? resources.findIndex((r) => String(r.resource_id) === cur) : -1
+    if (idx < 0) return
+    if (idx < resources.length - 1) {
+      openDetail(resources[idx + 1])
+    } else if (page < totalPages) {
+      pendingNextFromRef.current = cur
+      fetchNextPage()
+    }
+  }, [openDetail, fetchNextPage])
+
+  useEffect(() => {
+    const fromId = pendingNextFromRef.current
+    if (!fromId) return
+    const idx = resources.findIndex((r) => String(r.resource_id) === fromId)
+    if (idx >= 0 && idx < resources.length - 1) {
+      pendingNextFromRef.current = null
+      openDetail(resources[idx + 1])
+    }
+  }, [resources, openDetail])
+
+  // Proactively load the next search page when the shown item nears the end of the
+  // loaded list, so Next is rarely a dead wait.
+  useEffect(() => {
+    if (wishlistMode || detailIdx < 0 || loading) return
+    if (detailIdx >= resources.length - 2 && page < totalPages) fetchNextPage()
+  }, [wishlistMode, detailIdx, resources.length, page, totalPages, loading, fetchNextPage])
+
+  // Once stepping through, warm the next item's detail into the main-process LRU
+  // cache so the upcoming Next resolves without a network round-trip. The previous
+  // item is already cached from having been viewed.
+  useEffect(() => {
+    if (wishlistMode || !detailPrefetchRef.current || detailIdx < 0) return
+    const next = resources[detailIdx + 1]
+    if (next?.resource_id) useHubStore.getState().prefetchDetail(next.resource_id)
+  }, [wishlistMode, detailIdx, resources])
+
   const sections = useMemo(
     () => [
       {
@@ -851,6 +520,7 @@ export default function HubView({ onNavigate, active = true }) {
         label: 'Type',
         type: 'list',
         value: selectedType,
+        default: HUB_FILTER_DEFAULTS.selectedType,
         onChange: setSelectedType,
         items: [
           { value: 'All', label: 'All' },
@@ -862,12 +532,12 @@ export default function HubView({ onNavigate, active = true }) {
         label: 'Pricing',
         type: 'list',
         value: paidFilter,
+        default: HUB_FILTER_DEFAULTS.paidFilter,
         onChange: setPaidFilter,
         items: [
           { value: 'all', label: 'All' },
           { value: 'free', label: 'Free' },
           { value: 'paid', label: 'Paid' },
-          { value: 'wishlist', label: 'Wishlist', separatorBefore: true },
         ],
       },
       {
@@ -875,6 +545,7 @@ export default function HubView({ onNavigate, active = true }) {
         label: 'Tags',
         type: 'tags-autocomplete',
         value: selectedHubTags,
+        default: HUB_FILTER_DEFAULTS.selectedHubTags,
         onChange: setSelectedHubTags,
         suggestions: tagSuggestions,
         placeholder: 'Filter by tags…',
@@ -884,6 +555,7 @@ export default function HubView({ onNavigate, active = true }) {
         label: 'Author',
         type: 'text-autocomplete',
         value: authorSearch,
+        default: HUB_FILTER_DEFAULTS.authorSearch,
         onChange: setAuthorSearch,
         suggestions: userSuggestions,
         placeholder: 'Filter by author…',
@@ -893,27 +565,9 @@ export default function HubView({ onNavigate, active = true }) {
         label: 'License',
         type: 'select',
         value: license,
+        default: HUB_FILTER_DEFAULTS.license,
         onChange: setLicense,
         options: LICENSE_FILTER_OPTIONS,
-      },
-      {
-        key: 'show',
-        label: 'Show',
-        type: 'switches',
-        items: [
-          {
-            key: 'installed',
-            label: 'Installed',
-            checked: !hideInstalled,
-            onCheckedChange: (checked) => setHideInstalled(!checked),
-          },
-          {
-            key: 'hidden',
-            label: 'Hidden',
-            checked: showHidden,
-            onCheckedChange: setShowHidden,
-          },
-        ],
       },
       { key: 'sort', label: 'Sort by', type: 'select', value: sort, onChange: setSort, options: sortOptions },
     ],
@@ -923,8 +577,6 @@ export default function HubView({ onNavigate, active = true }) {
       selectedHubTags,
       authorSearch,
       license,
-      hideInstalled,
-      showHidden,
       sort,
       sortOptions,
       hubTypes,
@@ -935,1060 +587,386 @@ export default function HubView({ onNavigate, active = true }) {
       setSelectedHubTags,
       setAuthorSearch,
       setLicense,
-      setHideInstalled,
-      setShowHidden,
       setSort,
     ],
   )
 
+  // Wishlist facets. The displayed counts are proper cross-filtered facets: each
+  // dimension counts items matching all the OTHER active filters, so they update
+  // as filters toggle (standard filter-panel behaviour).
+  const wishlistFacets = useMemo(() => {
+    const preds = wishlistPredicates({
+      search: wlSearch,
+      type: wlType,
+      tags: wlTags,
+      paid: wlPaid,
+      author: wlAuthor,
+      excludedAuthors: wlExcludedAuthors,
+      license: wlLicense,
+    })
+    const bucket = (items, fn) => {
+      const m = new Map()
+      for (const r of items) fn(r, m)
+      return m
+    }
+    const addType = (r, m) => r.type && m.set(r.type, (m.get(r.type) || 0) + 1)
+    const typeFacet = bucket(wishlistItemsExcept(wishlistItems, preds, 'type'), addType)
+
+    const tagCounts = {}
+    for (const r of wishlistItemsExcept(wishlistItems, preds, 'tags'))
+      for (const t of parseSnapshotTags(r)) tagCounts[t] = (tagCounts[t] || 0) + 1
+
+    const authorCounts = {}
+    for (const r of wishlistItemsExcept(wishlistItems, preds, 'author'))
+      if (r.username) authorCounts[r.username] = (authorCounts[r.username] || 0) + 1
+
+    let free = 0
+    let paid = 0
+    for (const r of wishlistItemsExcept(wishlistItems, preds, 'paid')) {
+      if (r.category === 'Free') free++
+      else if (r.category === 'Paid') paid++
+    }
+
+    // Type list mirrors the hub shape: the fixed core categories always come
+    // first in canonical order, then extra hub types fall into the "N more"
+    // spoiler. That tail's membership + order use OVERALL counts (across the
+    // whole wishlist, not the facet) so it stays put as filters toggle; only the
+    // number shown on each row is the live facet count. With All + the core
+    // categories filling the collapse threshold, the tail hides by default like
+    // the hub sidebar.
+    const coreSet = new Set(CONTENT_TYPES)
+    const typeOverall = bucket(wishlistItems, addType)
+    const typeItems = [
+      { value: 'All', label: 'All' },
+      ...CONTENT_TYPES.map((t) => ({ value: t, label: t, color: getTypeColor(t), count: typeFacet.get(t) || 0 })),
+      ...[...typeOverall.entries()]
+        .filter(([t]) => !coreSet.has(t))
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .map(([t]) => ({ value: t, label: t, color: getTypeColor(t), count: typeFacet.get(t) || 0 })),
+    ]
+    const paidItems = [
+      { value: 'all', label: 'All' },
+      { value: 'free', label: 'Free', count: free },
+      { value: 'paid', label: 'Paid', count: paid },
+    ]
+    return { typeItems, paidItems, authorCounts, tagCounts }
+  }, [wishlistItems, wlSearch, wlType, wlTags, wlPaid, wlAuthor, wlExcludedAuthors, wlLicense])
+
+  const wishlistSections = useMemo(
+    () => [
+      {
+        key: 'wl-type',
+        label: 'Type',
+        type: 'list',
+        value: wlType,
+        default: WISHLIST_FILTER_DEFAULTS.wlType,
+        onChange: setWlType,
+        items: wishlistFacets.typeItems,
+      },
+      {
+        key: 'wl-paid',
+        label: 'Pricing',
+        type: 'list',
+        value: wlPaid,
+        default: WISHLIST_FILTER_DEFAULTS.wlPaid,
+        onChange: setWlPaid,
+        items: wishlistFacets.paidItems,
+      },
+      {
+        key: 'wl-tags',
+        label: 'Tags',
+        type: 'tags-autocomplete',
+        value: wlTags,
+        default: WISHLIST_FILTER_DEFAULTS.wlTags,
+        onChange: setWlTags,
+        suggestions: wishlistFacets.tagCounts,
+        placeholder: 'Filter by tags…',
+        allowNegate: true,
+      },
+      {
+        key: 'wl-author',
+        label: 'Author',
+        type: 'text-autocomplete',
+        value: wlAuthor,
+        default: WISHLIST_FILTER_DEFAULTS.wlAuthor,
+        onChange: setWlAuthor,
+        excluded: wlExcludedAuthors,
+        onExcludedChange: setWlExcludedAuthors,
+        suggestions: wishlistFacets.authorCounts,
+        placeholder: 'Filter by author…',
+        titleAction: wlAuthor ? <SearchOnHubButton author={wlAuthor} /> : null,
+      },
+      {
+        key: 'wl-license',
+        label: 'License',
+        type: 'select',
+        value: wlLicense,
+        default: WISHLIST_FILTER_DEFAULTS.wlLicense,
+        onChange: setWlLicense,
+        options: LICENSE_FILTER_OPTIONS,
+      },
+      { key: 'wl-sort', label: 'Sort by', type: 'select', value: wlSort, onChange: setWlSort, options: WISHLIST_SORTS },
+    ],
+    [
+      wlType,
+      wlTags,
+      wlPaid,
+      wlAuthor,
+      wlExcludedAuthors,
+      wlLicense,
+      wlSort,
+      wishlistFacets,
+      setWlType,
+      setWlTags,
+      setWlPaid,
+      setWlAuthor,
+      setWlExcludedAuthors,
+      setWlLicense,
+      setWlSort,
+    ],
+  )
+
+  const activeSections = wishlistMode ? wishlistSections : sections
+  const activeFilterCount = activeSections.filter((s) => sectionActive(s) === true).length
+
+  const refreshBusy = loading && resources.length === 0
+
   return (
-    <div className="h-full flex min-w-0 relative" onMouseUp={handleMousePageButton}>
-      <FilterPanel search={searchDraft} onSearchChange={handleSearchChange} sections={sections} />
+    <div className="h-full flex min-w-0 relative">
+      {/* Both modes use the same panel; hub filters drive the server query while
+          wishlist filters run client-side over the local snapshots. */}
+      <FilterPanel
+        search={wishlistMode ? wlSearch : searchDraft}
+        onSearchChange={wishlistMode ? setWlSearch : handleSearchChange}
+        smartSearch={
+          wishlistMode ? { authors: wishlistFacets.authorCounts, tags: wishlistFacets.tagCounts, labels: [] } : null
+        }
+        sections={wishlistMode ? wishlistSections : sections}
+      />
 
       <div className="flex-1 flex flex-col min-w-0 min-h-0">
         {/* Toolbar */}
-        <div className="min-h-10 grid grid-cols-[minmax(120px,1fr)_auto_minmax(120px,1fr)] items-center px-4 py-1 border-b border-border shrink-0 gap-2">
-          <div className="flex min-w-0 items-center gap-2">
-            <span className="text-[11px] text-text-tertiary">
-              {galleryLoading && galleryResources.length === 0
-                ? wishlistMode
-                  ? 'Loading wishlist…'
-                  : 'Searching…'
-                : hideInstalled || wishlistMode
-                  ? `${filteredResources.length.toLocaleString()} shown`
-                  : `${galleryTotalFound.toLocaleString()} packages`}
-            </span>
+        <div className="h-10 flex items-center px-4 border-b border-border shrink-0 gap-2">
+          {/* dismissTransientOverlays: the mode toggle hides one <Activity> gallery surface, which
+              would orphan any overlay (tooltip/menu) still open or animating out inside it. */}
+          <div className="flex items-center gap-px bg-elevated rounded p-0.5 text-[11px]">
             <button
               type="button"
-              onClick={() =>
-                wishlistMode
-                  ? useHubWishlistStore.getState().hydrate()
-                  : fetchResources(true, { forceRefresh: true, page: browseMode === 'paged' ? page : 1 })
-              }
-              disabled={galleryLoading}
+              onClick={() => {
+                dismissTransientOverlays()
+                setGalleryMode('hub')
+              }}
+              className={`px-2 py-1 rounded cursor-pointer transition-colors ${!wishlistMode ? 'bg-hover text-text-primary' : 'text-text-tertiary hover:text-text-secondary'}`}
+            >
+              Hub
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                dismissTransientOverlays()
+                setGalleryMode('wishlist')
+              }}
+              className={`px-2 py-1 rounded cursor-pointer transition-colors flex items-center gap-1 ${wishlistMode ? 'bg-hover text-text-primary' : 'text-text-tertiary hover:text-text-secondary'}`}
+            >
+              Wishlist
+              {wishlistCount > 0 && <span className="tabular-nums opacity-70">{wishlistCount}</span>}
+            </button>
+          </div>
+          <span className="text-[11px] text-text-tertiary">
+            {wishlistMode
+              ? wishlistLoading && !wishlistLoaded
+                ? 'Loading…'
+                : wishlistFiltered.length !== wishlistItems.length
+                  ? `${wishlistFiltered.length.toLocaleString()} of ${wishlistItems.length.toLocaleString()} wishlisted`
+                  : `${wishlistItems.length.toLocaleString()} wishlisted`
+              : loading && resources.length === 0
+                ? 'Searching…'
+                : `${totalFound.toLocaleString()} packages`}
+          </span>
+          {activeFilterCount > 0 && (
+            <span className="shrink-0 flex items-center gap-1.5 whitespace-nowrap text-[11px] text-text-tertiary">
+              <span aria-hidden="true">·</span>
+              <span>
+                {activeFilterCount} {activeFilterCount === 1 ? 'filter' : 'filters'}
+              </span>
+              <span>
+                (
+                <button
+                  type="button"
+                  onClick={() => (wishlistMode ? resetWishlistFilters() : resetFilters())}
+                  title="Reset all filters to their defaults"
+                  className="text-text-tertiary hover:text-text-secondary transition-colors cursor-pointer"
+                >
+                  Reset
+                </button>
+                )
+              </span>
+            </span>
+          )}
+          {/* Network-backed hub search gets a cache-busting refresh; the wishlist
+              is local + live, so it needs none. */}
+          {!wishlistMode && (
+            <button
+              type="button"
+              onClick={() => fetchResources(true, { forceRefresh: true })}
+              disabled={refreshBusy}
               title="Refresh"
               className="p-1 rounded text-text-tertiary hover:text-text-secondary disabled:opacity-30 cursor-pointer disabled:cursor-default"
             >
-              <RefreshCw size={13} className={galleryLoading && galleryResources.length === 0 ? 'animate-spin' : ''} />
+              <RefreshCw size={13} className={refreshBusy ? 'animate-spin' : ''} />
             </button>
-          </div>
-          {renderPageNav('toolbar')}
-          <div className="col-start-3 flex min-w-0 flex-wrap items-center justify-end gap-2">
-            {!wishlistMode && shouldRenderHubPageSummary(browseMode, showInfinitePagerControls) && renderPageSummary()}
-            <ThumbnailSizeSlider
-              cardWidth={cardWidth}
-              availableWidth={availableWidth}
-              onCardWidthChange={setCardWidth}
-            />
+          )}
+          <div className="flex-1" />
+          <ThumbnailSizeSlider cardWidth={cardWidth} availableWidth={availableWidth} onCardWidthChange={setCardWidth} />
+          <div className="flex items-center gap-px bg-elevated rounded p-0.5">
             <button
               type="button"
-              onClick={toggleBrowseMode}
-              title={browseMode === 'infinite' ? 'Infinite scroll' : 'Paged browsing'}
-              className="p-1.5 rounded cursor-pointer text-text-tertiary hover:text-text-primary hover:bg-elevated"
+              onClick={() => setCardMode('minimal')}
+              title="Small cards"
+              className={`p-1.5 rounded cursor-pointer ${cardMode === 'minimal' ? 'bg-hover text-text-primary' : 'text-text-tertiary'}`}
             >
-              {browseMode === 'infinite' ? <InfinityIcon size={14} /> : <BookOpen size={14} />}
+              <Grid3x3 size={14} />
             </button>
-            <div className="flex items-center gap-px bg-elevated rounded p-0.5">
-              <button
-                type="button"
-                onClick={() => setCardMode('minimal')}
-                title="Small cards"
-                className={`p-1.5 rounded cursor-pointer ${cardMode === 'minimal' ? 'bg-hover text-text-primary' : 'text-text-tertiary'}`}
-              >
-                <Grid3x3 size={14} />
-              </button>
-              <button
-                type="button"
-                onClick={() => setCardMode('medium')}
-                title="Large cards"
-                className={`p-1.5 rounded cursor-pointer ${cardMode === 'medium' ? 'bg-hover text-text-primary' : 'text-text-tertiary'}`}
-              >
-                <Grid2x2 size={14} />
-              </button>
-            </div>
+            <button
+              type="button"
+              onClick={() => setCardMode('medium')}
+              title="Large cards"
+              className={`p-1.5 rounded cursor-pointer ${cardMode === 'medium' ? 'bg-hover text-text-primary' : 'text-text-tertiary'}`}
+            >
+              <Grid2x2 size={14} />
+            </button>
           </div>
         </div>
 
-        {/* Gallery */}
-        <div className="relative flex-1 min-h-0">
-          <div ref={galleryRef} className="h-full overflow-y-auto p-4 relative" onWheel={handleGalleryWheel}>
-            {!wishlistMode && error && (
-              <div className="mb-4 px-4 py-3 rounded-lg bg-error/10 border border-error/20 text-error text-xs select-text cursor-text">
-                {error}
-              </div>
-            )}
-            {galleryResources.length === 0 && (galleryLoading || (!wishlistMode && !sort)) ? (
-              <div
-                className="grid gap-3 content-start"
-                style={{ gridTemplateColumns: `repeat(auto-fill,minmax(min(${cardWidth}px,100%),1fr))` }}
-              >
-                {Array.from({ length: 12 }, (_, i) => (
-                  <SkeletonCard key={i} mode={cardMode} />
-                ))}
-              </div>
-            ) : (
-              <>
-                {browseMode === 'infinite' && loadingPrevious && resources.length > 0 && (
+        {/* Gallery — cards + wishlist are two <Activity>-kept scroll surfaces, so
+            toggling modes preserves each one's scroll and DOM. */}
+        <div className="relative flex-1 min-h-0 flex flex-col min-w-0">
+          <Activity mode={wishlistMode ? 'hidden' : 'visible'}>
+            <div className="relative flex-1 min-h-0 flex flex-col min-w-0">
+              {error && (
+                <div className="shrink-0 mx-4 mt-4 px-4 py-3 rounded-lg bg-error/10 border border-error/20 text-error text-xs select-text cursor-text">
+                  {error}
+                </div>
+              )}
+              {hubShowSkeleton ? (
+                <div className="flex-1 overflow-y-auto p-4">
                   <div
-                    className="grid gap-3 content-start mb-3"
+                    className="grid gap-3 content-start"
                     style={{ gridTemplateColumns: `repeat(auto-fill,minmax(min(${cardWidth}px,100%),1fr))` }}
                   >
-                    {Array.from({ length: perPage }, (_, i) => (
+                    {Array.from({ length: 12 }, (_, i) => (
                       <SkeletonCard key={i} mode={cardMode} />
                     ))}
                   </div>
-                )}
-                <div
-                  className="grid gap-3 content-start"
-                  style={{ gridTemplateColumns: `repeat(auto-fill,minmax(min(${cardWidth}px,100%),1fr))` }}
-                >
-                  {visibleResources.map((r, i) => (
-                    <div
-                      key={r.resource_id}
-                      data-hub-resource-id={r.resource_id}
-                      data-hub-resource-index={
-                        browseMode === 'infinite' ? (startPage - 1) * perPage + i : (page - 1) * perPage + i
-                      }
-                    >
+                </div>
+              ) : (
+                <>
+                  <VirtualGrid
+                    items={visibleResources}
+                    itemWidth={cardWidth}
+                    itemHeight={compactCards ? cardWidth : cardWidth + HUB_CARD_FOOTER_PX}
+                    fixedHeight={compactCards ? 0 : HUB_CARD_FOOTER_PX}
+                    className="flex-1"
+                    scrollResetKey={hubScrollResetKey}
+                    onLayout={handleGridLayout}
+                    hideEmptyMessage
+                    onEndReached={page < totalPages ? fetchNextPage : undefined}
+                    footer={
+                      loading && resources.length > 0 ? (
+                        <div className="flex items-center justify-center -mt-3 pb-4">
+                          <Loader2 size={20} className="animate-spin text-accent-blue" />
+                          <span className="text-[11px] text-text-tertiary ml-2">Loading more…</span>
+                        </div>
+                      ) : null
+                    }
+                    renderItem={(r) => (
                       <HubCard
+                        key={r.resource_id}
                         resource={r}
                         onClick={openDetail}
                         onViewInLibrary={handleViewInLibrary}
                         onInstall={handleInstall}
                         onPromote={handlePromote}
                         onFilterAuthor={handleFilterAuthor}
-                        onToggleWishlist={(resource) => toggleWishlist(resource)}
-                        onHide={(resource) => hideHubItem(resource)}
-                        onUnhide={(resource) => useHubHiddenStore.getState().unhide(resource.resource_id)}
-                        isHidden={hiddenIds.has(String(r.resource_id))}
-                        isWishlisted={wishlistIds.has(String(r.resource_id))}
                         mode={cardMode}
                         hideType={selectedType !== 'All'}
                       />
+                    )}
+                  />
+                  {!loading && sort && resources.length === 0 && (
+                    <div className="pointer-events-none absolute inset-0 flex items-start justify-center pt-16 text-text-tertiary text-sm">
+                      No packages found
                     </div>
-                  ))}
-                </div>
-                {renderPageNav('bottom')}
-                {/* Infinite scroll sentinel */}
-                {!wishlistMode && browseMode === 'infinite' && page < totalPages && (
-                  <div ref={sentinelRef} className="h-1" />
+                  )}
+                </>
+              )}
+            </div>
+          </Activity>
+
+          <Activity mode={wishlistMode ? 'visible' : 'hidden'}>
+            <div className="relative flex-1 min-h-0 flex flex-col min-w-0">
+              <VirtualGrid
+                items={wishlistFiltered}
+                itemWidth={cardWidth}
+                itemHeight={compactCards ? cardWidth : cardWidth + HUB_CARD_FOOTER_PX}
+                fixedHeight={compactCards ? 0 : HUB_CARD_FOOTER_PX}
+                className="flex-1"
+                scrollResetKey={wlScrollResetKey}
+                onLayout={handleGridLayout}
+                hideEmptyMessage
+                renderItem={(r) => (
+                  <HubCard
+                    key={r.resource_id}
+                    resource={r}
+                    onClick={openDetail}
+                    onViewInLibrary={handleViewInLibrary}
+                    onInstall={handleInstall}
+                    onPromote={handlePromote}
+                    onFilterAuthor={handleFilterAuthor}
+                    mode={cardMode}
+                    hideType={wlType !== 'All'}
+                    wishlist
+                  />
                 )}
-                {browseMode === 'infinite' && loading && !loadingPrevious && resources.length > 0 && (
-                  <div className="flex items-center justify-center py-6">
-                    <Loader2 size={20} className="animate-spin text-accent-blue" />
-                    <span className="text-[11px] text-text-tertiary ml-2">Loading more…</span>
+              />
+              {wishlistLoaded && wishlistItems.length === 0 && (
+                <div className="pointer-events-none absolute inset-0 flex items-start justify-center pt-16">
+                  <div className="max-w-sm text-center text-text-tertiary text-sm flex flex-col items-center gap-2">
+                    <Pin size={28} className="opacity-40" />
+                    <p>Your wishlist is empty.</p>
+                    <p className="text-[12px] text-text-tertiary/80">
+                      Open a package and tap the <Pin size={12} className="inline align-[-1px]" /> button in its details
+                      to add it here.
+                    </p>
                   </div>
-                )}
-                {!galleryLoading && (wishlistMode || sort) && filteredResources.length === 0 && page >= totalPages && (
-                  <div className="text-center py-16 text-text-tertiary text-sm">No packages found</div>
-                )}
-              </>
-            )}
-          </div>
-          <BackToTopButton scrollRef={galleryRef} />
+                </div>
+              )}
+              {wishlistItems.length > 0 && wishlistFiltered.length === 0 && (
+                <div className="pointer-events-none absolute inset-0 flex items-start justify-center pt-16 text-text-tertiary text-sm">
+                  No wishlisted packages match your filters
+                </div>
+              )}
+            </div>
+          </Activity>
         </div>
       </div>
       {detailResource && (
         <HubDetail
+          key={detailNonce}
           resource={detailResource}
-          onBack={closeDetail}
+          onBack={popDetailHistory}
+          onClose={closeDetail}
           onNavigate={onNavigate}
           onInstall={handleInstall}
           onFilterAuthor={handleFilterAuthor}
+          onPrev={handleDetailPrev}
+          onNext={handleDetailNext}
+          canPrev={canPrevDetail}
+          canNext={canNextDetail}
+          position={detailPosition}
+          backLabel={detailBackLabel}
         />
       )}
-    </div>
-  )
-}
-
-function normalizeHubUrlForTabMatch(urlString) {
-  try {
-    const u = new URL(urlString)
-    const path = u.pathname.replace(/\/+$/, '') || '/'
-    return `${u.origin}${path}`
-  } catch {
-    return ''
-  }
-}
-
-/** First visible tab whose panel URL matches navigated URL (origin + path; ignores hash and query). */
-function browserTabMatchingUrl(navUrl, tabUrls, tabs) {
-  const nav = normalizeHubUrlForTabMatch(navUrl)
-  if (!nav) return null
-  for (const { key } of tabs) {
-    const panelUrl = tabUrls[key]
-    if (panelUrl && normalizeHubUrlForTabMatch(panelUrl) === nav) return key
-  }
-  return null
-}
-
-/**
- * Extract the numeric resource id from a Hub resource URL, or null for any
- * non-resource page (threads, member profiles, search, etc.). Handles both the
- * numeric `*-panel` forms we build and the slug form the Hub redirects to
- * (e.g. /resources/my-package.66186/overview-panel -> "66186").
- */
-function parseHubResourceId(urlString) {
-  try {
-    const u = new URL(urlString)
-    if (u.hostname !== 'hub.virtamate.com') return null
-    const m = u.pathname.match(/^\/resources\/(?:[^/]*\.)?(\d+)(?:\/|$)/)
-    return m ? m[1] : null
-  } catch {
-    return null
-  }
-}
-
-// --- Hub Detail ---
-
-function HubDetail({ resource, onBack, onNavigate, onInstall, onFilterAuthor }) {
-  const { detailData, detailLoading } = useHubStore()
-  const detail = detailData
-  const [browserTab, setBrowserTab] = useState('overview')
-  const webviewRef = useRef(null)
-  const [canGoBack, setCanGoBack] = useState(false)
-  const [canGoForward, setCanGoForward] = useState(false)
-  const [urlCopied, setUrlCopied] = useState(false)
-  const [webviewBackCaptureReady, setWebviewBackCaptureReady] = useState(false)
-
-  const resourceId = detail?.resource_id || resource.resource_id
-  const threadId = detail?.discussion_thread_id
-
-  // The webview key is pinned to the resource the panel was opened with. Following
-  // in-browser navigation swaps `resourceId` (above) to drive the left panel, but
-  // the guest must never remount/reload — the user is already on the page they
-  // navigated to. Captured once per mount; fresh gallery opens remount HubDetail.
-  const [browserResourceId] = useState(() => String(resource.resource_id))
-
-  const {
-    loggedIn: hubLoggedIn,
-    favorited,
-    favoriteCount,
-    bookmarked,
-    liked,
-    disliked,
-    loading: interactionsLoading,
-    toggleFavorite,
-    toggleBookmark,
-    toggleLike,
-  } = useHubInteractions(resourceId)
-
-  const tabUrls = useMemo(
-    () => ({
-      overview: `https://hub.virtamate.com/resources/${resourceId}/overview-panel`,
-      reviews: `https://hub.virtamate.com/resources/${resourceId}/review-panel`,
-      history: `https://hub.virtamate.com/resources/${resourceId}/history-panel`,
-      updates: `https://hub.virtamate.com/resources/${resourceId}/updates-panel`,
-      discussion: threadId
-        ? `https://hub.virtamate.com/threads/${threadId}/discussion-panel`
-        : `https://hub.virtamate.com/resources/${resourceId}/`,
-    }),
-    [resourceId, threadId],
-  )
-
-  const pkg = detail || resource
-  const tabs = useMemo(() => {
-    const reviewCount = parseInt(pkg.review_count || '0', 10)
-    const ratingCount = parseInt(pkg.rating_count || '0', 10)
-    const updateCount = parseInt(pkg.update_count || '0', 10)
-    const t = [{ key: 'overview', label: 'Overview' }]
-    if (updateCount > 0) t.push({ key: 'updates', label: `Updates (${updateCount})` })
-    if (reviewCount > 0 || ratingCount > 0) t.push({ key: 'reviews', label: `Reviews (${reviewCount || ratingCount})` })
-    t.push({ key: 'history', label: 'History' })
-    t.push({ key: 'discussion', label: 'Discussion' })
-    return t
-  }, [pkg.review_count, pkg.rating_count, pkg.update_count])
-
-  // URL committed to the webview. Only changes on explicit tab clicks (and at
-  // mount), never as a side effect of `resourceId` changing — otherwise following
-  // in-browser navigation would yank the guest back to a *-panel fragment.
-  const [navUrl, setNavUrl] = useState(() => tabUrls[browserTab] || tabUrls.overview)
-  // Display URL for the address bar — tracks in-page navigation independently.
-  const [displayUrl, setDisplayUrl] = useState(navUrl)
-
-  const selectTab = useCallback(
-    (key) => {
-      setBrowserTab(key)
-      const url = tabUrls[key] || tabUrls.overview
-      setWebviewBackCaptureReady(false)
-      setNavUrl(url)
-      setDisplayUrl(url)
-    },
-    [tabUrls],
-  )
-
-  const handleLoadingWebviewMousePageButton = useCallback(
-    (e) => {
-      const direction = getMousePageDirection(e.button)
-      if (direction >= 0) return
-      e.preventDefault()
-      e.stopPropagation()
-      onBack()
-    },
-    [onBack],
-  )
-
-  // When navigation swaps the displayed resource, reset the panel's tab highlight
-  // to Overview (highlight only — `setBrowserTab` no longer drives the webview).
-  const prevResourceIdRef = useRef(resourceId)
-  useEffect(() => {
-    if (prevResourceIdRef.current !== resourceId) {
-      prevResourceIdRef.current = resourceId
-      setBrowserTab('overview')
-    }
-  }, [resourceId])
-
-  useEffect(() => {
-    const wv = webviewRef.current
-    if (!wv) return
-    const syncNav = (e) => {
-      setDisplayUrl(e.url)
-      setCanGoBack(wv.canGoBack())
-      setCanGoForward(wv.canGoForward())
-      const tabKey = browserTabMatchingUrl(e.url, tabUrls, tabs)
-      if (tabKey) setBrowserTab(tabKey)
-      // Follow in-browser navigation: when the guest lands on a different
-      // resource, load it into the details panel in the background and swap once
-      // ready, so the previous resource stays visible (no skeleton flash). Skip
-      // when the target is already shown or already being fetched — this also
-      // covers tab/in-page navigation within the current resource.
-      const navId = parseHubResourceId(e.url)
-      if (navId) {
-        const store = useHubStore.getState()
-        const shown = String(store.detailData?.resource_id ?? store.detailResource?.resource_id ?? '')
-        if (navId !== shown) {
-          // Reuse the gallery row as the stub when the target is already in the
-          // results; otherwise a bare id, filled by hub:detail. followDetail
-          // self-dedupes concurrent calls for the same in-flight resource.
-          const known = store.resources?.find((r) => String(r.resource_id) === navId)
-          store.followDetail(known || { resource_id: navId })
-        }
-      }
-    }
-    const ignoreAbort = (e) => {
-      if (e.errorCode === -3 || e.errorCode === -2) e.preventDefault()
-    }
-
-    // Inject a click-interceptor into the guest page so that:
-    //  • External links (non-hub origin) open in the user's default browser via shell.openExternal.
-    //    Caught in capture phase + stopImmediatePropagation, otherwise XenForo's own external-link
-    //    confirmation handler claims them first and our handler never runs.
-    //  • Same-origin links with target="_blank" / target="_top" navigate the webview itself instead
-    //    of spawning a popup. Caught in bubble phase + bails on defaultPrevented so XenForo's
-    //    lightbox controllers (also bubble-phase) can claim image-gallery clicks first.
-    //
-    // The guest signals the host using console.warn with a magic prefix; window.open is
-    // unreliable inside XenForo's wrapped popup machinery.
-    const injectLinkHandler = () => {
-      wv.executeJavaScript(
-        `(function() {
-        if (window.__hubNavPatched) return
-        window.__hubNavPatched = true
-        var hubOrigin = location.origin
-        var EXT_TAG = '__VAM_OPEN_EXT__:'
-        var MOUSE_PAGE_BACK_TAG = '__VAM_MOUSE_PAGE_BACK__:'
-        var openExternal = function(url) { console.warn(EXT_TAG + url) }
-        var lastMousePageBackAt = 0
-
-        var sendMousePageBack = function(e) {
-          if (e.button !== 3) return
-          e.preventDefault()
-          e.stopImmediatePropagation()
-          var now = Date.now()
-          if (now - lastMousePageBackAt < 250) return
-          lastMousePageBackAt = now
-          console.warn(MOUSE_PAGE_BACK_TAG)
-        }
-        document.addEventListener('mousedown', sendMousePageBack, true)
-        document.addEventListener('mouseup', sendMousePageBack, true)
-        document.addEventListener('auxclick', sendMousePageBack, true)
-
-        // Capture phase — external links: claim the click before XenForo's link-confirm handler.
-        document.addEventListener('click', function(e) {
-          if (e.button !== 0) return
-          if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
-          var a = e.target.closest('a[href]')
-          if (!a) return
-          var href = a.getAttribute('href')
-          if (!href || href.charAt(0) === '#' || href.startsWith('javascript:')) return
-          try {
-            var url = new URL(href, location.href)
-            if (url.origin !== hubOrigin) {
-              e.preventDefault()
-              e.stopImmediatePropagation()
-              openExternal(url.href)
-            }
-          } catch(err) {}
-        }, true)
-
-        // Bubble phase — same-origin target=_blank: route to webview after page JS (lightbox, etc.) had a chance.
-        document.addEventListener('click', function(e) {
-          if (e.defaultPrevented) return
-          if (e.button !== 0) return
-          if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
-          var a = e.target.closest('a[href]')
-          if (!a) return
-          var href = a.getAttribute('href')
-          if (!href || href.charAt(0) === '#' || href.startsWith('javascript:')) return
-          try {
-            var url = new URL(href, location.href)
-            if (url.origin === hubOrigin && a.target && a.target !== '_self') {
-              e.preventDefault()
-              location.href = url.href
-            }
-          } catch(err) {}
-        }, false)
-
-        // Programmatic window.open — route hub URLs into webview, external URLs to default browser.
-        var _open = window.open.bind(window)
-        window.open = function(url) {
-          if (!url) return null
-          try {
-            var resolved = new URL(url, location.href)
-            if (resolved.origin === hubOrigin) {
-              location.href = resolved.href
-              return null
-            }
-            openExternal(resolved.href)
-            return null
-          } catch(err) {}
-          return _open(url)
-        }
-      })()`,
-      )
-        .then(() => {
-          setWebviewBackCaptureReady(true)
-        })
-        .catch(() => {
-          setWebviewBackCaptureReady(true)
-        })
-    }
-
-    const EXT_TAG = '__VAM_OPEN_EXT__:'
-    const MOUSE_PAGE_BACK_TAG = '__VAM_MOUSE_PAGE_BACK__:'
-    const onConsoleMessage = (e) => {
-      if (typeof e.message !== 'string') return
-      if (e.message.includes(MOUSE_PAGE_BACK_TAG)) {
-        onBack()
-        return
-      }
-      const i = e.message.indexOf(EXT_TAG)
-      if (i < 0) return
-      const url = e.message.slice(i + EXT_TAG.length).trim()
-      if (url) void window.api.shell.openExternal(url)
-    }
-
-    const onDidStartLoading = () => {
-      setWebviewBackCaptureReady(false)
-    }
-    wv.addEventListener('did-navigate', syncNav)
-    wv.addEventListener('did-navigate-in-page', syncNav)
-    wv.addEventListener('did-fail-load', ignoreAbort)
-    wv.addEventListener('did-start-loading', onDidStartLoading)
-    wv.addEventListener('dom-ready', injectLinkHandler)
-    wv.addEventListener('console-message', onConsoleMessage)
-    return () => {
-      wv.removeEventListener('did-navigate', syncNav)
-      wv.removeEventListener('did-navigate-in-page', syncNav)
-      wv.removeEventListener('did-fail-load', ignoreAbort)
-      wv.removeEventListener('did-start-loading', onDidStartLoading)
-      wv.removeEventListener('dom-ready', injectLinkHandler)
-      wv.removeEventListener('console-message', onConsoleMessage)
-    }
-  }, [onBack, resourceId, tabUrls, tabs])
-
-  const goBack = useCallback(() => webviewRef.current?.goBack(), [])
-  const goForward = useCallback(() => webviewRef.current?.goForward(), [])
-  const reload = useCallback(() => webviewRef.current?.reload(), [])
-  const isDev = useIsDev()
-  const openWebviewDevTools = useCallback(() => {
-    const wv = webviewRef.current
-    if (!wv) return
-    if (wv.isDevToolsOpened?.()) wv.closeDevTools()
-    else wv.openDevTools()
-  }, [])
-
-  const hubLicense = getHubResourceLicense(pkg)
-  const title = pkg.title || resource.title
-  const username = pkg.username || resource.username
-  const type = pkg.type || resource.type
-  const imgUrl = pkg.image_url || resource.image_url
-  const [heroImgFailed, setHeroImgFailed] = useState(false)
-  useEffect(() => {
-    setHeroImgFailed(false)
-  }, [imgUrl, resourceId])
-
-  const isExternal = pkg.hubDownloadable === 'false' || pkg.hubDownloadable === false
-  const hubFiles = detail?.hubFiles || []
-  const packageSize = hubFiles.reduce((sum, f) => sum + parseInt(f.file_size || '0', 10), 0)
-  const uniqueDeps = [
-    ...new Map(
-      Object.values(detail?.dependencies || {})
-        .flat()
-        .map((f) => [f.filename || f.packageName, f]),
-    ).values(),
-  ]
-  const missingDepsSize = uniqueDeps
-    .filter((f) => !f._installed)
-    .reduce((sum, f) => sum + parseInt(f.file_size || '0', 10), 0)
-  const totalInstallSize = packageSize + missingDepsSize
-  const depCount = detail ? uniqueDeps.length : parseInt(resource.dependency_count || '0', 10)
-
-  const rid = String(resourceId)
-  const { state: installState, dlInfo, installStatus } = useHubInstallState(rid, { isExternal })
-  const librarySelectRef = installStatus.filename || dlInfo?.packageRef || pkg._localFilename
-  const dlInstallDep = useDownloadStore((s) => s.installDep)
-
-  const deps = useMemo(() => {
-    const hf = detail?.hubFiles || []
-    const depGroups = detail?.dependencies || {}
-    const localName = detail?._localFilename
-    const seen = new Set()
-
-    const hasDownloadUrl = (f) => (f.downloadUrl && f.downloadUrl !== 'null') || (f.urlHosted && f.urlHosted !== 'null')
-    // Dep entries in `dependencies[*]` have `filename` set to the verbatim ref (e.g.
-    // "Creator.Package.latest", no .var). The downloads table stores `package_ref`
-    // as the concrete `packageName + "." + latest_version + ".var"`, so we prefer
-    // that form for both purposes:
-    //   1. byPackageRef lookup — matches what the downloads table inserts.
-    //   2. Install IPC `filename` — the version we actually want from hub.
-    // Falling back to `_resolved` first was wrong for `fallback` resolutions: it
-    // pointed at the older local file we already have, so `enqueueInstallRef` hit
-    // the silent `{ already: true }` branch and the row snapped back to Install.
-    const concreteDownloadRef = (f) => {
-      const ver = f.latest_version
-      if (f.packageName && ver != null && /^\d+$/.test(String(ver))) return `${f.packageName}.${ver}.var`
-      if (f._resolved) return /\.var$/i.test(f._resolved) ? f._resolved : f._resolved + '.var'
-      if (f.filename) return /\.var$/i.test(f.filename) ? f.filename : f.filename + '.var'
-      return null
-    }
-    const toDepRow = (f, group) => {
-      const r = f._resolution
-      const dl = hasDownloadUrl(f)
-      const resolution =
-        r === 'exact' || r === 'latest'
-          ? 'exact'
-          : r === 'fallback'
-            ? dl
-              ? 'hub'
-              : 'fallback'
-            : r === 'missing'
-              ? dl
-                ? 'hub'
-                : 'missing'
-              : f._installed
-                ? 'exact'
-                : dl
-                  ? 'hub'
-                  : 'missing'
-      return {
-        ref: f.filename || group,
-        downloadRef: concreteDownloadRef(f),
-        resourceId: f.resource_id,
-        resolved: f._resolved || (f._installed ? f.filename : null),
-        sizeBytes: parseInt(f.file_size || '0', 10),
-        resolution,
-      }
-    }
-
-    const roots = hf.map((f) => {
-      const installed = f._installed || localName === f.filename
-      const stem = f.filename?.replace(/\.\d+\.var$/, '').replace(/\.\d+$/, '')
-      const groupFiles = (stem && depGroups[stem]) || []
-      const children = []
-      for (const dep of groupFiles) {
-        const key = dep.filename || dep.packageName
-        if (seen.has(key)) continue
-        seen.add(key)
-        children.push(toDepRow(dep, key))
-      }
-      return {
-        ref: f.filename,
-        isRoot: true,
-        downloadRef: f.filename,
-        resourceId: detail?.resource_id,
-        resolved: installed ? f.filename : null,
-        sizeBytes: parseInt(f.file_size || '0', 10),
-        resolution: installed ? 'exact' : 'hub',
-        children,
-      }
-    })
-
-    // Orphan deps whose group key didn't match any hubFile
-    for (const [group, files] of Object.entries(depGroups)) {
-      if (!group) continue
-      for (const f of files) {
-        const key = f.filename || group
-        if (seen.has(key)) continue
-        seen.add(key)
-        roots.at(-1)?.children.push(toDepRow(f, group))
-      }
-      if (files.length === 0 && !seen.has(group)) {
-        seen.add(group)
-        roots.at(-1)?.children.push({ ref: group, resolved: false })
-      }
-    }
-
-    return roots
-  }, [detail])
-
-  const handleInstallDep = useCallback(
-    (dep) => {
-      const filename = dep.downloadRef || dep.ref
-      if (!filename) return
-      const rid = dep.resourceId != null ? String(dep.resourceId) : String(resourceId)
-      dlInstallDep({ filename, resource_id: rid, asDependency: !dep.isRoot })
-    },
-    [resourceId, dlInstallDep],
-  )
-
-  const hubUrl = `https://hub.virtamate.com/resources/${resourceId}`
-  const externalOpenUrl = pkg.download_url || pkg.external_url || hubUrl
-
-  useEffect(() => {
-    if (!tabs.some((t) => t.key === browserTab)) setBrowserTab('overview')
-  }, [tabs, browserTab])
-
-  const [panelWidth, setPanelWidth] = usePersistedPanelWidth('panel_width_hub_detail', {
-    min: 260,
-    max: 500,
-    defaultWidth: 320,
-  })
-  const startWidthRef = useRef(panelWidth)
-  const onResizeStart = useCallback(() => {
-    startWidthRef.current = panelWidth
-  }, [panelWidth])
-  const onPanelResize = useCallback(
-    (delta) => setPanelWidth(Math.min(500, Math.max(260, startWidthRef.current + delta))),
-    [setPanelWidth],
-  )
-  const [hubPanelResizeDrag, setHubPanelResizeDrag] = useState(false)
-
-  return (
-    <div className="absolute inset-0 z-20 flex flex-col min-w-0 bg-base overflow-hidden">
-      {/* Back bar */}
-      <div className="h-10 flex items-center px-4 border-b border-border shrink-0 gap-2">
-        <Button variant="ghost" size="sm" onClick={onBack} className="text-text-secondary hover:text-text-primary">
-          <ArrowLeft size={14} /> Back
-        </Button>
-        <ChevronRight size={12} className="text-text-tertiary shrink-0" />
-        <span className="text-xs text-text-primary font-medium truncate flex-1 min-w-0">{title}</span>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          onClick={onBack}
-          aria-label="Close detail"
-          className="shrink-0 text-text-tertiary/45 hover:text-text-tertiary hover:bg-muted/35"
-        >
-          <X size={12} strokeWidth={1.75} />
-        </Button>
-      </div>
-
-      <div className="flex-1 flex min-h-0">
-        {/* Left: Package info panel */}
-        <div className="flex shrink-0" style={{ width: panelWidth }}>
-          <div className="flex-1 min-w-0 border-r border-border overflow-y-auto p-4">
-            {/* Hero */}
-            <div className="aspect-square rounded-lg overflow-hidden mb-3 relative">
-              <div className="absolute inset-0" style={{ background: getGradient(String(resourceId)) }} />
-              {imgUrl && !heroImgFailed ? (
-                <img
-                  src={imgUrl}
-                  className="thumb absolute inset-0 w-full h-full object-cover"
-                  alt=""
-                  onError={() => setHeroImgFailed(true)}
-                />
-              ) : null}
-            </div>
-
-            <div className="flex items-baseline gap-2">
-              <h2 className="text-[16px] font-semibold text-text-primary select-text cursor-text">{title}</h2>
-              {detailLoading ? (
-                <div className="h-3.5 w-12 skeleton rounded" />
-              ) : pkg.version_string ? (
-                <span className="text-xs text-text-tertiary font-mono select-text cursor-text">
-                  {pkg.version_string}
-                </span>
-              ) : null}
-            </div>
-
-            {/* Author card — skeleton while a nav-driven detail with no stub author loads */}
-            {username ? (
-              <button
-                type="button"
-                onClick={() => {
-                  onFilterAuthor?.(username)
-                  onBack()
-                }}
-                className="w-full flex items-center gap-2.5 mt-2.5 p-2 rounded-lg bg-elevated/50 text-left transition-colors hover:bg-elevated"
-              >
-                <AuthorAvatar author={username} userId={pkg.user_id} size={32} />
-                <div>
-                  <div className="text-xs text-text-primary font-medium">{username}</div>
-                  <div className="text-[10px] text-text-tertiary">Package author</div>
-                </div>
-              </button>
-            ) : (
-              <div className="w-full flex items-center gap-2.5 mt-2.5 p-2 rounded-lg bg-elevated/50">
-                <div className="h-8 w-8 skeleton rounded-md shrink-0" />
-                <div className="flex-1 min-w-0">
-                  <div className="h-3 w-24 skeleton rounded" />
-                  <div className="h-2.5 w-16 skeleton rounded mt-1" />
-                </div>
-              </div>
-            )}
-
-            {pkg.promotional_link && (
-              <a
-                title={pkg.promotional_link}
-                onClick={(e) => {
-                  e.preventDefault()
-                  void window.api.shell.openExternal(pkg.promotional_link)
-                }}
-                className="flex items-center gap-1.5 mt-1.5 px-2 py-1 text-[10px] text-accent-blue hover:brightness-125 transition-[filter] cursor-pointer"
-              >
-                <Heart size={10} /> Support this creator
-              </a>
-            )}
-
-            {/* Badges */}
-            <div className="flex items-center gap-1.5 mt-2 flex-wrap">
-              <Tag
-                className="text-[9px] font-semibold text-white"
-                style={{ background: (TYPE_COLORS[type] || '#6366f1') + 'cc' }}
-              >
-                {type}
-              </Tag>
-              {pkg.category && (
-                <Tag
-                  variant={pkg.category === 'Free' || pkg.category === 'Paid' ? 'filled' : 'outlined'}
-                  className={
-                    pkg.category === 'Free' || pkg.category === 'Paid'
-                      ? 'text-[9px] font-semibold text-white'
-                      : 'text-[9px] font-semibold border-border bg-elevated/80 text-text-tertiary'
-                  }
-                  style={
-                    pkg.category === 'Free' || pkg.category === 'Paid'
-                      ? { background: (HUB_CATEGORY_COLORS[pkg.category] || '#6366f1') + 'cc' }
-                      : undefined
-                  }
-                >
-                  {pkg.category}
-                </Tag>
-              )}
-              {hubLicense && <LicenseTag license={hubLicense} />}
-            </div>
-
-            {/* Description */}
-            {pkg.tag_line && (
-              <p className="text-xs text-text-secondary leading-relaxed mt-3 select-text cursor-text">{pkg.tag_line}</p>
-            )}
-
-            {/* Stats */}
-            <div className="flex items-center gap-4 mt-3 py-2.5 border-y border-border text-[12px]">
-              <span className="flex items-center gap-1.5 text-text-tertiary">
-                <Download size={13} />
-                <span className="text-text-primary font-medium">
-                  {formatNumber(parseInt(pkg.download_count || '0', 10))}
-                </span>
-              </span>
-              <span className="flex items-center gap-1.5 text-text-tertiary">
-                <Star size={13} />
-                <span className="text-text-primary font-medium">{formatStarRating(pkg.rating_avg)}</span>
-              </span>
-              {hubLoggedIn ? (
-                <button
-                  type="button"
-                  onClick={toggleLike}
-                  disabled={interactionsLoading}
-                  title={disliked ? 'Disliked — click to like' : liked ? 'Remove like' : 'Like'}
-                  className={`flex items-center gap-1.5 transition-colors disabled:cursor-default cursor-pointer ${
-                    disliked
-                      ? 'text-error hover:text-accent-blue'
-                      : liked
-                        ? 'text-accent-blue'
-                        : 'text-text-tertiary hover:text-accent-blue'
-                  }`}
-                >
-                  {disliked ? (
-                    <ThumbsDown size={13} className="fill-current" />
-                  ) : (
-                    <ThumbsUp size={13} className={liked ? 'fill-current' : ''} />
-                  )}
-                  <span
-                    className={`font-medium ${disliked ? 'text-error' : liked ? 'text-accent-blue' : 'text-text-primary'}`}
-                  >
-                    {formatNumber(parseInt(pkg.reaction_score || '0', 10))}
-                  </span>
-                </button>
-              ) : (
-                <span className="flex items-center gap-1.5 text-text-tertiary" title="Likes">
-                  <ThumbsUp size={13} />
-                  <span className="text-text-primary font-medium">
-                    {formatNumber(parseInt(pkg.reaction_score || '0', 10))}
-                  </span>
-                </span>
-              )}
-              {hubLoggedIn && (
-                <>
-                  <button
-                    type="button"
-                    onClick={toggleFavorite}
-                    disabled={interactionsLoading}
-                    title={favorited ? 'Remove favorite' : 'Add to favorites'}
-                    className="flex items-center gap-1.5 text-text-tertiary transition-colors hover:text-accent-pink disabled:hover:text-text-tertiary disabled:cursor-default cursor-pointer"
-                  >
-                    <Heart size={13} className={favorited ? 'fill-current text-accent-pink' : ''} />
-                    {favoriteCount == null ? (
-                      <span className="h-3 w-4 skeleton rounded" />
-                    ) : (
-                      <span className={`font-medium ${favorited ? 'text-accent-pink' : 'text-text-primary'}`}>
-                        {formatNumber(favoriteCount)}
-                      </span>
-                    )}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={toggleBookmark}
-                    disabled={interactionsLoading}
-                    title={bookmarked ? 'Remove bookmark' : 'Bookmark'}
-                    className="flex items-center text-text-tertiary transition-colors hover:text-accent-blue disabled:opacity-50 cursor-pointer"
-                  >
-                    <Bookmark size={14} className={bookmarked ? 'fill-current text-accent-blue' : ''} />
-                  </button>
-                </>
-              )}
-            </div>
-
-            {/* Dates */}
-            <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 mt-3 text-[11px]">
-              <div className="flex items-center gap-1.5 text-text-tertiary">
-                <Calendar size={11} /> Released
-              </div>
-              {detailLoading ? (
-                <div className="h-3 w-20 skeleton rounded self-center" />
-              ) : (
-                <div className="text-text-primary">{formatDate(pkg.resource_date)}</div>
-              )}
-              <div className="flex items-center gap-1.5 text-text-tertiary">
-                <Clock size={11} /> Updated
-              </div>
-              <div className="text-text-primary">{formatDate(pkg.last_update)}</div>
-            </div>
-
-            {/* Action */}
-            <div className="mt-3">
-              {installState === 'downloading' ? (
-                <div className="w-full">
-                  <div className="relative py-2 rounded-lg overflow-hidden bg-white/6">
-                    <div
-                      className="absolute inset-y-0 left-0 progress-bar rounded-lg transition-[width] duration-200"
-                      style={{ width: `${Math.max(dlInfo.progress, 2)}%` }}
-                    />
-                    <span className="relative z-10 flex items-center justify-center text-xs text-white font-medium gap-1.5">
-                      Downloading {dlInfo.completed}/{dlInfo.total} · {dlInfo.progress}%
-                    </span>
-                  </div>
-                  {dlInfo.failed > 0 && (
-                    <div className="text-[10px] text-error mt-1 text-center">{dlInfo.failed} failed</div>
-                  )}
-                </div>
-              ) : installState === 'queued' ? (
-                <div className="w-full py-2 rounded-lg text-xs border border-border text-text-tertiary flex items-center justify-center gap-1.5">
-                  <Clock size={14} /> Queuing…
-                </div>
-              ) : installState === 'installed' ? (
-                <Button
-                  variant="outline"
-                  size="lg"
-                  onClick={() => onNavigate('library', { selectPackage: librarySelectRef })}
-                  disabled={!librarySelectRef}
-                  className="w-full text-xs border-accent-blue/30 text-accent-blue bg-accent-blue/5 hover:bg-accent-blue/10"
-                >
-                  <LibraryIcon size={14} /> View in Library
-                </Button>
-              ) : installState === 'installed-dep' ? (
-                <Button
-                  variant="gradient"
-                  size="lg"
-                  onClick={() => {
-                    if (!installStatus.filename) return
-                    window.api.packages.promote(installStatus.filename, resourceId)
-                    useInstalledStore.getState().update(rid, true, true, installStatus.filename)
-                    useHubStore.setState((s) => ({
-                      resources: s.resources.map((r) =>
-                        String(r.resource_id) === rid ? { ...r, _isDirect: true } : r,
-                      ),
-                      detailData:
-                        s.detailData && String(s.detailData.resource_id) === rid
-                          ? { ...s.detailData, _isDirect: true }
-                          : s.detailData,
-                    }))
-                  }}
-                  className="w-full text-xs"
-                >
-                  <Plus size={14} /> Add to Library
-                </Button>
-              ) : installState === 'external' ? (
-                <Button
-                  variant="outline"
-                  size="lg"
-                  title={externalOpenUrl}
-                  onClick={() => void window.api.shell.openExternal(externalOpenUrl)}
-                  className="w-full text-xs"
-                >
-                  <ExternalLink size={14} /> {extractDomainLabel(externalOpenUrl)}
-                </Button>
-              ) : detailLoading ? (
-                <div className="w-full h-[34px] skeleton rounded-lg" />
-              ) : (
-                <Button
-                  variant="gradient"
-                  size="lg"
-                  onClick={() => onInstall?.(pkg, detail)}
-                  className="w-full text-xs"
-                >
-                  <Download size={14} /> Install{depCount > 0 ? ' All' : ''}
-                  {totalInstallSize ? ` · ${formatBytes(totalInstallSize)}` : ''}
-                </Button>
-              )}
-            </div>
-
-            {/* Dependencies */}
-            {depCount > 0 ? (
-              <div className="mt-4">
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="text-[10px] uppercase tracking-wider text-text-tertiary font-medium">
-                    Package files <span className="normal-case">({depCount + deps.length})</span>
-                  </span>
-                </div>
-                {detailLoading ? (
-                  <div className="border border-border rounded-lg overflow-hidden divide-y divide-border">
-                    {Array.from({ length: Math.min(depCount || 3, 6) }, (_, i) => (
-                      <div
-                        key={i}
-                        className="flex items-center gap-2 py-2"
-                        style={{ paddingLeft: 10, paddingRight: 10 }}
-                      >
-                        <div className="h-3 skeleton rounded flex-1" />
-                        <div className="h-3 w-12 skeleton rounded shrink-0" />
-                        <div className="h-4 w-16 skeleton rounded shrink-0" />
-                      </div>
-                    ))}
-                  </div>
-                ) : deps.length > 0 ? (
-                  <div className="border border-border rounded-lg overflow-hidden divide-y divide-border">
-                    <DepTree deps={deps} onInstall={handleInstallDep} />
-                  </div>
-                ) : null}
-              </div>
-            ) : !detailLoading ? (
-              <div className="mt-3 text-[11px] text-text-tertiary">No dependencies</div>
-            ) : null}
-          </div>
-          <ResizeHandle
-            side="right"
-            onResizeStart={onResizeStart}
-            onResize={onPanelResize}
-            onDraggingChange={setHubPanelResizeDrag}
-          />
-        </div>
-
-        {/* Right: Webview browser — pointer-events off on webview while resizing so the guest view does not steal the drag */}
-        <div className={`flex-1 flex flex-col min-w-0 bg-base ${hubPanelResizeDrag ? 'select-none' : ''}`}>
-          {/* Browser toolbar */}
-          <div className="h-10 flex items-center gap-1.5 px-3 border-b border-border bg-surface shrink-0">
-            <Button variant="ghost" size="icon-sm" onClick={goBack} disabled={!canGoBack}>
-              <ArrowLeft size={14} />
-            </Button>
-            <Button variant="ghost" size="icon-sm" onClick={goForward} disabled={!canGoForward}>
-              <ArrowRight size={14} />
-            </Button>
-            <Button variant="ghost" size="icon-sm" onClick={reload}>
-              <RotateCw size={13} />
-            </Button>
-            <div className="flex-1 min-w-0 h-7 bg-elevated border border-border rounded px-2.5 flex items-center gap-2 text-[11px] text-text-secondary font-mono truncate ml-1 select-text cursor-text">
-              <Globe size={12} className="text-text-tertiary shrink-0" />
-              {displayUrl}
-            </div>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              title={urlCopied ? 'Copied!' : 'Copy URL'}
-              className="shrink-0 relative"
-              onClick={() => {
-                // Strip trailing *-panel segment so the copied URL is shareable (e.g. …/overview-panel → …/).
-                const url = displayUrl.replace(
-                  /^(https:\/\/hub\.virtamate\.com\/(?:resources|threads)\/[^/]+)\/[^/]+-panel\/?$/,
-                  '$1/',
-                )
-                navigator.clipboard.writeText(url).then(() => {
-                  setUrlCopied(true)
-                  setTimeout(() => setUrlCopied(false), 1500)
-                })
-              }}
-            >
-              <Copy
-                size={14}
-                className={`transition-all duration-200 ${urlCopied ? 'opacity-0 scale-50' : 'opacity-100 scale-100'}`}
-              />
-              <Check
-                size={14}
-                className={`absolute transition-all duration-200 text-success ${urlCopied ? 'opacity-100 scale-100' : 'opacity-0 scale-50'}`}
-              />
-            </Button>
-            {isDev && (
-              <Button variant="ghost" size="icon-sm" title="Open webview DevTools" onClick={openWebviewDevTools}>
-                <Bug size={14} />
-              </Button>
-            )}
-            <Button variant="ghost" size="icon-sm" className="ml-1" asChild>
-              <a
-                href={hubUrl}
-                target="_blank"
-                rel="noreferrer"
-                onClick={(e) => {
-                  e.preventDefault()
-                  void window.api.shell.openExternal(hubUrl)
-                }}
-              >
-                <ExternalLink size={14} />
-              </a>
-            </Button>
-          </div>
-
-          {/* Tab bar */}
-          <div className="flex items-center border-b border-border bg-surface shrink-0">
-            {tabs.map((tab) => (
-              <button
-                type="button"
-                key={tab.key}
-                onClick={() => selectTab(tab.key)}
-                className={`px-4 py-2 text-xs border-b-2 transition-colors cursor-pointer ${browserTab === tab.key ? 'border-accent-blue text-text-primary' : 'border-transparent text-text-tertiary hover:text-text-secondary'}`}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Webview */}
-          <div className="relative flex-1 min-h-0">
-            <webview
-              key={browserResourceId}
-              ref={webviewRef}
-              src={navUrl}
-              partition="persist:hub"
-              allowpopups="true"
-              className="w-full h-full"
-              style={{ display: 'flex', pointerEvents: hubPanelResizeDrag ? 'none' : 'auto' }}
-            />
-            {!webviewBackCaptureReady && (
-              <div className="absolute inset-0 bg-transparent" onMouseUp={handleLoadingWebviewMousePageButton} />
-            )}
-          </div>
-        </div>
-      </div>
     </div>
   )
 }
@@ -2018,28 +996,5 @@ function SkeletonCard({ mode = 'medium' }) {
         </div>
       )}
     </div>
-  )
-}
-
-// --- Expandable dep list for hub detail ---
-
-function DepTree({ deps, onInstall }) {
-  const flat = useMemo(() => {
-    const rows = []
-    for (const root of deps) {
-      rows.push({ dep: root, depth: 0 })
-      for (const child of root.children || []) {
-        rows.push({ dep: child, depth: 1 })
-      }
-    }
-    return rows
-  }, [deps])
-
-  return (
-    <>
-      {flat.map(({ dep, depth }, i) => (
-        <DepRow key={dep.ref || i} dep={dep} depth={depth} renderChildren={false} onInstall={onInstall} />
-      ))}
-    </>
   )
 }

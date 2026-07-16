@@ -1,5 +1,12 @@
 import { ipcMain } from 'electron'
-import { probeScene, probePackage, runExtract, runExtractBatch } from '../scenes/extract.js'
+import {
+  probeScene,
+  probePackage,
+  resolveExtractedSource,
+  runExtract,
+  runExtractBatch,
+  runExtractForPackageFilenames,
+} from '../scenes/extract.js'
 import { runLocalScan } from '../scanner/local.js'
 import { buildFromDb } from '../store.js'
 import { getSetting } from '../db.js'
@@ -33,18 +40,33 @@ export function registerExtractHandlers() {
     return await probePackage(filename)
   })
 
+  ipcMain.handle('extract:resolve-source', (_, { packageFilename, presetInternalPath }) => {
+    return resolveExtractedSource({ packageFilename, presetInternalPath })
+  })
+
   ipcMain.handle('extract:run', async (_, payload) => {
     if (!payload || typeof payload !== 'object') throw new Error('invalid payload')
     const { kind } = payload
     if (kind !== 'appearance' && kind !== 'outfit') throw new Error('kind must be appearance|outfit')
+    const mode = payload.mode === 'overwrite' || payload.mode === 'refresh' ? payload.mode : 'create'
     const result = Array.isArray(payload.items)
-      ? await runExtractBatch({ items: payload.items, kind })
+      ? await runExtractBatch({ items: payload.items, kind, mode })
       : await runExtract({
           packageFilename: payload.packageFilename,
           internalPath: payload.internalPath,
           atomIds: payload.atomIds,
           kind,
+          mode,
         })
+    if (result.written.length > 0) await refreshAfterExtract()
+    return result
+  })
+
+  ipcMain.handle('extract:run-for-packages', async (_, { filenames, kind, sourceTypes }) => {
+    if (!Array.isArray(filenames) || !filenames.length) throw new Error('filenames required')
+    if (kind !== 'appearance' && kind !== 'outfit') throw new Error('kind must be appearance|outfit')
+    if (!Array.isArray(sourceTypes) || !sourceTypes.length) throw new Error('sourceTypes required')
+    const result = await runExtractForPackageFilenames({ filenames, kind, sourceTypes })
     if (result.written.length > 0) await refreshAfterExtract()
     return result
   })

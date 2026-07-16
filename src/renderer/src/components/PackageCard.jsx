@@ -3,7 +3,6 @@ import {
   AlertTriangle,
   Archive,
   HardDrive,
-  Heart,
   Layers,
   Eye,
   EyeOff,
@@ -16,6 +15,8 @@ import {
   Clock,
   ExternalLink,
   Check,
+  Pin,
+  Trash2,
 } from 'lucide-react'
 import {
   getGradient,
@@ -39,11 +40,11 @@ import { isPackageActive } from '@shared/storage-state-predicates.js'
 import { Button } from '@/components/ui/button'
 import { Avatar, AvatarImage, AvatarFallback } from '@/components/ui/avatar'
 import { TruncateWithTooltip } from './TruncateWithTooltip'
-import { useThumbnail } from '@/hooks/useThumbnail'
+import { useThumbnail, useAvatar } from '@/hooks/createBlobCacheHook'
 import { useHubInstallState } from '@/hooks/useHubInstallState'
 import { useDownloadStore } from '@/stores/useDownloadStore'
 import { useLibraryStore } from '@/stores/useLibraryStore'
-import { useAvatar } from '@/hooks/useAvatar'
+import { useWishlistStore } from '@/stores/useWishlistStore'
 import { LabelDots } from '@/components/labels/LabelDots'
 import { useLabelObjects } from '@/components/labels/useLabelObjects'
 
@@ -61,6 +62,50 @@ function useInactiveStyle(pkg) {
 
 const inactiveTitle = (isOffloaded) => (isOffloaded ? 'Package offloaded' : 'Package disabled')
 
+/**
+ * Describe a package's dependency problems (missing and/or disabled+offloaded)
+ * in two shapes so each surface renders consistently:
+ *  - `summary`: one consolidated worded label for contexts that show words —
+ *    `N missing`, `N disabled`, or `N issues` (total) when mixed, with the
+ *    highest-severity icon.
+ *  - `segments`: per-type icon+count pairs for icon-only contexts (minimal
+ *    card, table, compressed footer), where no words means no crowding.
+ * `packageActive` gates the inactive signal — an already-inactive package's
+ * inactive deps are expected, not a flag. Returns null when there are no issues.
+ */
+export function depIssues(pkg, packageActive) {
+  const missing = pkg.missingDeps || 0
+  const inactive = packageActive ? pkg.inactiveDeps || 0 : 0
+  if (!missing && !inactive) return null
+  const plural = (n) => (n === 1 ? 'y' : 'ies')
+  const segments = []
+  // Disabled/offloaded (fixable locally) sits left; missing (may be unresolvable) sits right.
+  if (inactive) {
+    segments.push({
+      key: 'inactive',
+      Icon: Power,
+      count: inactive,
+      tone: 'text-warning',
+      title: `${inactive} disabled or offloaded dependenc${plural(inactive)}`,
+    })
+  }
+  if (missing) {
+    segments.push({
+      key: 'missing',
+      Icon: AlertTriangle,
+      count: missing,
+      tone: 'text-warning',
+      title: `${missing} missing dependenc${plural(missing)}`,
+    })
+  }
+  let summary
+  if (missing && inactive)
+    summary = { Icon: AlertTriangle, count: missing + inactive, word: 'issues', tone: 'text-warning' }
+  else if (missing) summary = { Icon: AlertTriangle, count: missing, word: 'missing', tone: 'text-warning' }
+  else summary = { Icon: Power, count: inactive, word: 'disabled', tone: 'text-warning' }
+  return { segments, summary, title: segments.map((s) => s.title).join(' · ') }
+}
+
 /** Drop-shadow for outline/stroke glyphs sitting directly on a thumbnail (Power, Eye, EyeOff, Archive). */
 const THUMB_OUTLINE_ICON_SHADOW =
   '[&_svg]:filter-[drop-shadow(0_0_1px_rgba(0,0,0,1))_drop-shadow(0_0_2.5px_rgba(0,0,0,1))_drop-shadow(0_0_5px_rgba(0,0,0,1))_drop-shadow(0_1px_10px_rgba(0,0,0,0.85))]'
@@ -71,6 +116,16 @@ const THUMB_FILLED_ICON_SHADOW =
 
 /** LibraryCard top-right corner glyph layout. Caller adds the color and the appropriate shadow. */
 const LIB_CARD_CORNER_ICON = 'shrink-0 size-[18px] inline-flex items-center justify-center'
+
+/** Eased bottom scrim: gentle top tail (no visible start line), steepest mid, soft vignette into peak. */
+const scrimGradient = (peak) =>
+  `linear-gradient(to top, rgba(0,0,0,${peak}) 0%, rgba(0,0,0,${peak * 0.91}) 15%, rgba(0,0,0,${peak * 0.81}) 28%, rgba(0,0,0,${peak * 0.7}) 40%, rgba(0,0,0,${peak * 0.59}) 51%, rgba(0,0,0,${peak * 0.47}) 61%, rgba(0,0,0,${peak * 0.35}) 70%, rgba(0,0,0,${peak * 0.24}) 78%, rgba(0,0,0,${peak * 0.15}) 85%, rgba(0,0,0,${peak * 0.08}) 91%, rgba(0,0,0,${peak * 0.03}) 96%, transparent 100%)`
+
+/** Subtle drop-shadow lift so a compact action button reads as a control floating over the thumbnail. */
+const THUMB_ACTION_BTN_SHADOW = 'shadow-[0_1px_2px_rgba(0,0,0,0.55),0_2px_6px_rgba(0,0,0,0.35)]'
+
+/** Lift + inset white edge for borderless (gradient) action buttons that would otherwise blend into bright thumbnails. */
+const THUMB_ACTION_BTN_POP = `${THUMB_ACTION_BTN_SHADOW} ring-1 ring-inset ring-white/15`
 
 /** Non-interactive bulk-selection marker; whole card handles clicks */
 function BulkSelectChip({ checked }) {
@@ -138,14 +193,11 @@ export function HubCard({
   onInstall,
   onPromote,
   onFilterAuthor,
-  onToggleWishlist,
-  onHide,
-  onUnhide,
-  isHidden = false,
-  isWishlisted = false,
   mode = 'medium',
   hideType,
   linkAction,
+  /** Wishlist gallery card: render from the disk-cached hub thumbnail and show an "unavailable" chip. */
+  wishlist = false,
 }) {
   const minimal = mode === 'minimal'
   const isPaid = resource.category === 'Paid'
@@ -155,6 +207,10 @@ export function HubCard({
   const rid = String(resource.resource_id)
   const { state: installState, dlInfo, installStatus } = useHubInstallState(rid, { isExternal })
   const libRef = installStatus.filename || resource._localFilename
+
+  const wishlisted = useWishlistStore((s) => s.ids.has(rid))
+  const toggleWishlist = useWishlistStore((s) => s.toggle)
+  const showWishlistToggle = !linkAction
 
   let actionBtn
   if (installState === 'downloading') {
@@ -188,7 +244,7 @@ export function HubCard({
       <div
         className={
           minimal
-            ? 'px-2 py-1 rounded text-[10px] text-white/60 border border-white/10 bg-black/50 backdrop-blur-sm flex items-center gap-1'
+            ? `px-2 py-1 rounded text-[10px] text-white/60 border border-white/10 bg-black/50 backdrop-blur-sm flex items-center gap-1 ${THUMB_ACTION_BTN_SHADOW}`
             : 'w-full py-1.5 rounded text-[10px] text-text-tertiary border border-border flex items-center justify-center gap-1.5 whitespace-nowrap'
         }
       >
@@ -205,7 +261,7 @@ export function HubCard({
         disabled={!libRef}
         className={
           minimal
-            ? 'px-2 py-1 rounded text-[10px] text-accent-blue border border-accent-blue/25 bg-black/50 backdrop-blur-sm hover:bg-accent-blue/20 flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-40 disabled:pointer-events-none'
+            ? `px-2 py-1 rounded text-[10px] text-accent-blue border border-accent-blue/25 bg-black/50 backdrop-blur-sm hover:bg-accent-blue/20 flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-40 disabled:pointer-events-none ${THUMB_ACTION_BTN_SHADOW}`
             : 'w-full py-1.5 rounded text-[10px] text-accent-blue border border-accent-blue/25 hover:bg-accent-blue/10 flex items-center justify-center gap-1.5 cursor-pointer transition-colors whitespace-nowrap disabled:opacity-40 disabled:pointer-events-none'
         }
       >
@@ -233,7 +289,7 @@ export function HubCard({
         }}
         className={
           minimal
-            ? 'px-2 py-1 h-auto rounded text-[10px] gap-1'
+            ? `px-2 py-1 h-auto rounded text-[10px] gap-1 ${THUMB_ACTION_BTN_POP}`
             : 'w-full py-1.5 h-auto rounded text-[10px] gap-1.5 whitespace-nowrap'
         }
       >
@@ -264,7 +320,7 @@ export function HubCard({
         }}
         className={
           minimal
-            ? 'max-w-[min(100%,9rem)] px-2 py-1 rounded text-[10px] text-accent-blue border border-accent-blue/25 bg-black/50 backdrop-blur-sm hover:bg-accent-blue/20 flex items-center gap-1 cursor-pointer transition-colors min-w-0'
+            ? `max-w-[min(100%,9rem)] px-2 py-1 rounded text-[10px] text-accent-blue border border-accent-blue/25 bg-black/50 backdrop-blur-sm hover:bg-accent-blue/20 flex items-center gap-1 cursor-pointer transition-colors min-w-0 ${THUMB_ACTION_BTN_SHADOW}`
             : 'w-full py-1.5 rounded text-[10px] text-accent-blue border border-accent-blue/25 hover:bg-accent-blue/10 flex items-center justify-center gap-1.5 cursor-pointer transition-colors whitespace-nowrap'
         }
       >
@@ -283,7 +339,7 @@ export function HubCard({
         }}
         className={
           minimal
-            ? 'px-2 py-1 rounded text-[10px] text-error border border-error/25 bg-black/50 backdrop-blur-sm flex items-center gap-1 cursor-pointer'
+            ? `px-2 py-1 rounded text-[10px] text-error border border-error/25 bg-black/50 backdrop-blur-sm flex items-center gap-1 cursor-pointer ${THUMB_ACTION_BTN_SHADOW}`
             : 'w-full py-1.5 rounded text-[10px] text-error border border-error/25 hover:bg-error/10 flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap'
         }
       >
@@ -302,7 +358,7 @@ export function HubCard({
         }}
         className={
           minimal
-            ? 'px-2 py-1 h-auto rounded text-[10px] gap-1'
+            ? `px-2 py-1 h-auto rounded text-[10px] gap-1 ${THUMB_ACTION_BTN_POP}`
             : 'w-full py-1.5 h-auto rounded text-[10px] gap-1.5 tracking-wide whitespace-nowrap'
         }
       >
@@ -319,6 +375,12 @@ export function HubCard({
   useEffect(() => {
     setThumbFailed(false)
   }, [imgUrl])
+  // Wishlist cards read the disk-cached (resource-id keyed) thumbnail so they
+  // still render after the resource disappears from the Hub; hub search cards
+  // hotlink image_url with a gradient fallback on load error.
+  const hubResThumb = useThumbnail(wishlist ? `hub-icon:${rid}` : null)
+  const shownThumb = wishlist ? hubResThumb : imgUrl && !thumbFailed ? imgUrl : null
+  const unavailable = wishlist && !!resource._unavailable
 
   return (
     <div
@@ -329,57 +391,32 @@ export function HubCard({
       <div onClick={linkAction ? undefined : () => onClick?.(resource)} className="flex-1">
         <div className="relative aspect-square">
           <div className="absolute inset-0" style={{ background: getGradient(String(gradientId)) }} />
-          {imgUrl && !thumbFailed ? <div className="absolute inset-0 bg-elevated" /> : null}
-          {imgUrl && !thumbFailed ? (
+          {shownThumb ? <div className="absolute inset-0 bg-elevated" /> : null}
+          {shownThumb ? (
             <img
-              src={imgUrl}
-              className="thumb absolute inset-0 w-full h-full object-cover"
+              src={shownThumb}
+              className={`thumb absolute inset-0 w-full h-full object-cover ${unavailable ? 'grayscale opacity-60' : ''}`}
               alt=""
               loading="lazy"
-              onError={() => setThumbFailed(true)}
+              onError={wishlist ? undefined : () => setThumbFailed(true)}
             />
           ) : null}
           <div className="absolute inset-0 bg-linear-to-t from-black/40 to-transparent" />
-          {!hideType && (
-            <div
-              className={`absolute top-2 left-2 ${THUMB_OVERLAY_CHIP} text-white`}
-              style={{ background: typeColor + 'cc' }}
-            >
-              {resource.type}
-            </div>
-          )}
-          {(onHide || isPaid) && (
-            <div className="absolute top-2 right-2 flex items-center gap-1">
-              {(onHide || onUnhide) && (
-                <button
-                  type="button"
-                  title={isHidden ? 'Show in Hub' : 'Hide from Hub'}
-                  aria-label={isHidden ? 'Show in Hub' : 'Hide from Hub'}
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    if (isHidden) onUnhide?.(resource)
-                    else onHide?.(resource)
-                  }}
-                  className="size-6 rounded-full bg-black/55 backdrop-blur-sm border border-white/15 inline-flex items-center justify-center cursor-pointer text-white/80 hover:text-white opacity-0 group-hover:opacity-100 transition"
+          {(unavailable || !hideType || isPaid) && (
+            <div className="absolute top-2 left-2 z-2 flex max-w-[calc(100%-2.75rem)] items-center gap-1 overflow-x-auto scrollbar-hide flex-nowrap">
+              {unavailable ? (
+                <div
+                  className={`${THUMB_OVERLAY_CHIP} bg-warning/25 text-warning backdrop-blur-sm`}
+                  title="No longer available on the Hub — showing your saved snapshot"
                 >
-                  {isHidden ? <Eye size={13} /> : <EyeOff size={13} />}
-                </button>
-              )}
-              {isPaid && onToggleWishlist && (
-                <button
-                  type="button"
-                  title={isWishlisted ? 'Remove from wishlist' : 'Add to wishlist'}
-                  aria-label={isWishlisted ? 'Remove from wishlist' : 'Add to wishlist'}
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    onToggleWishlist(resource)
-                  }}
-                  className={`size-6 rounded-full bg-black/55 backdrop-blur-sm border border-white/15 inline-flex items-center justify-center cursor-pointer transition-colors ${
-                    isWishlisted ? 'text-accent-pink hover:text-accent-pink/80' : 'text-white/80 hover:text-white'
-                  }`}
-                >
-                  <Heart size={13} fill={isWishlisted ? 'currentColor' : 'none'} />
-                </button>
+                  unavailable
+                </div>
+              ) : (
+                !hideType && (
+                  <div className={`${THUMB_OVERLAY_CHIP} text-white`} style={{ background: typeColor + 'cc' }}>
+                    {resource.type}
+                  </div>
+                )
               )}
               {isPaid && (
                 <div
@@ -391,8 +428,35 @@ export function HubCard({
               )}
             </div>
           )}
+          {showWishlistToggle && (
+            <div className="absolute top-1.5 right-1.5 z-2">
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  toggleWishlist(resource)
+                }}
+                title={wishlist || wishlisted ? 'Remove from wishlist' : 'Add to wishlist'}
+                aria-label={wishlist || wishlisted ? 'Remove from wishlist' : 'Add to wishlist'}
+                className={
+                  wishlist
+                    ? 'size-7 shrink-0 inline-flex items-center justify-center rounded transition cursor-pointer text-white/70 bg-black/50 backdrop-blur-sm opacity-0 group-hover:opacity-100 hover:text-error'
+                    : `size-7 shrink-0 inline-flex items-center justify-center rounded transition cursor-pointer ${
+                        wishlisted
+                          ? `text-accent-blue opacity-100 bg-transparent ${THUMB_FILLED_ICON_SHADOW} group-hover:bg-black/50 group-hover:backdrop-blur-sm`
+                          : 'text-white/60 bg-black/50 backdrop-blur-sm opacity-0 group-hover:opacity-100'
+                      }`
+                }
+              >
+                {wishlist ? <Trash2 size={13} /> : <Pin size={13} fill={wishlisted ? 'currentColor' : 'none'} />}
+              </button>
+            </div>
+          )}
           {minimal && (
-            <div className="absolute bottom-0 inset-x-0 flex items-end gap-2 px-2.5 pb-2 pt-6 bg-linear-to-t from-black/70 to-transparent">
+            <div
+              className="absolute bottom-0 inset-x-0 flex items-end gap-2 px-2.5 pb-2 pt-8"
+              style={{ background: scrimGradient(0.58) }}
+            >
               <div className="min-w-0 flex-1">
                 <div className="text-[12px] font-medium text-white truncate leading-tight" title={resource.title}>
                   {resource.title}
@@ -458,7 +522,6 @@ export function LibraryCard({
   onClick,
   selected,
   onFilterAuthor,
-  onToggleHidden,
   mode = 'medium',
   hideType,
   bulkMode = false,
@@ -469,6 +532,7 @@ export function LibraryCard({
   const inactiveStyle = useInactiveStyle(pkg)
   const { isOffloaded, inactive } = inactiveStyle
   const dim = inactiveStyle.dim || dimmed
+  const depIssue = depIssues(pkg, !inactive)
   const name = displayName(pkg)
   const thumbUrl = useThumbnail(`pkg:${pkg.filename}`)
   const versionStr = pkg.version != null && pkg.version !== '' ? String(pkg.version) : null
@@ -479,8 +543,9 @@ export function LibraryCard({
     <button
       type="button"
       data-grid-card
+      tabIndex={-1}
       onClick={(e) => onClick?.(pkg, e)}
-      className={`@container w-full bg-surface border rounded-lg overflow-hidden text-left transition-all duration-150 card-glow cursor-pointer shrink-0 group
+      className={`@container w-full bg-surface border rounded-lg overflow-hidden text-left transition-all duration-150 card-glow cursor-pointer shrink-0 group outline-none
         ${selected || bulkSelected ? 'border-accent-blue/40 bg-elevated' : 'border-border hover:bg-elevated'}
         ${dim ? 'opacity-60 hover:opacity-90' : ''}`}
     >
@@ -497,7 +562,7 @@ export function LibraryCard({
           !pkg.isDirect ||
           pkg.isLocalOnly ||
           pkg.noLookPresetTag ||
-          (minimal && pkg.missingDeps > 0)) && (
+          (minimal && !!depIssue)) && (
           <div className="absolute top-2 left-2 z-2 flex max-w-[calc(100%-2.75rem)] items-center gap-1 overflow-x-auto scrollbar-hide flex-nowrap">
             {bulkMode && <BulkSelectChip checked={bulkSelected} />}
             {!hideType && (
@@ -537,41 +602,20 @@ export function LibraryCard({
                 LOCAL
               </div>
             )}
-            {minimal && pkg.missingDeps > 0 && !bulkMode && (
-              <div
-                className={`${THUMB_OVERLAY_CHIP} bg-warning/20 text-warning backdrop-blur-sm flex items-center gap-0.5`}
-                title={`${pkg.missingDeps} missing dependencies`}
-              >
-                <AlertTriangle size={10} className="shrink-0" /> {pkg.missingDeps}
-              </div>
-            )}
+            {minimal &&
+              depIssue &&
+              depIssue.segments.map((s) => (
+                <div
+                  key={s.key}
+                  className={`${THUMB_OVERLAY_CHIP} bg-warning/15 backdrop-blur-sm flex items-center gap-0.5 ${s.tone}`}
+                  title={s.title}
+                >
+                  <s.Icon size={10} className="shrink-0" /> {s.count}
+                </div>
+              ))}
           </div>
         )}
         <div className="absolute top-2 right-2 flex items-center gap-1 z-1">
-          {onToggleHidden && !bulkMode && (
-            <span
-              role="button"
-              title={
-                pkg.hidden && !pkg.hiddenDirect
-                  ? pkg.hiddenReason === 'creator'
-                    ? 'Hidden by creator'
-                    : 'Hidden by tag'
-                  : pkg.hiddenDirect
-                    ? 'Unhide'
-                    : 'Hide'
-              }
-              aria-label={pkg.hiddenDirect ? 'Unhide' : 'Hide'}
-              onClick={(e) => {
-                e.stopPropagation()
-                onToggleHidden(pkg)
-              }}
-              className={`size-6 rounded-full bg-black/55 backdrop-blur-sm border border-white/15 inline-flex items-center justify-center cursor-pointer opacity-0 group-hover:opacity-100 transition ${
-                pkg.hidden ? 'text-error hover:text-error/75' : 'text-white/80 hover:text-white'
-              }`}
-            >
-              {pkg.hidden ? <Eye size={13} /> : <EyeOff size={13} />}
-            </span>
-          )}
           {inactive && (
             <span
               className={`${LIB_CARD_CORNER_ICON} text-error ${THUMB_OUTLINE_ICON_SHADOW}`}
@@ -598,7 +642,7 @@ export function LibraryCard({
           )}
         </div>
         {minimal && (
-          <div className="absolute bottom-0 inset-x-0 px-2.5 pb-2 pt-6 bg-linear-to-t from-black/70 to-transparent">
+          <div className="absolute bottom-0 inset-x-0 px-2.5 pb-2 pt-8" style={{ background: scrimGradient(0.58) }}>
             <div className="flex items-baseline gap-1.5 min-w-0">
               <span className="text-[12px] font-medium text-white truncate leading-tight">{name}</span>
             </div>
@@ -658,14 +702,21 @@ export function LibraryCard({
                 <span className="@max-[158px]:hidden"> items</span>
               </span>
             </span>
-            {pkg.missingDeps > 0 && (
-              <span
-                className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap text-warning tabular-nums @max-[138px]:hidden"
-                title={`${pkg.missingDeps} missing dependencies`}
-              >
-                <AlertTriangle size={10} className="shrink-0" />
-                <span>{pkg.missingDeps}</span>
-                <span className="@max-[228px]:hidden">missing</span>
+            {depIssue && (
+              <span className="inline-flex shrink-0 items-center whitespace-nowrap tabular-nums" title={depIssue.title}>
+                <span className={`hidden items-center gap-1 @min-[228px]:inline-flex ${depIssue.summary.tone}`}>
+                  <depIssue.summary.Icon size={10} className="shrink-0" />
+                  <span>{depIssue.summary.count}</span>
+                  <span>{depIssue.summary.word}</span>
+                </span>
+                <span className="inline-flex items-center gap-2 @min-[228px]:hidden">
+                  {depIssue.segments.map((s) => (
+                    <span key={s.key} className={`inline-flex items-center gap-1 ${s.tone}`}>
+                      <s.Icon size={10} className="shrink-0" />
+                      <span>{s.count}</span>
+                    </span>
+                  ))}
+                </span>
               </span>
             )}
           </div>
@@ -690,6 +741,7 @@ export function LibraryTableRow({
   const inactiveStyle = useInactiveStyle(pkg)
   const { isOffloaded, inactive } = inactiveStyle
   const dim = inactiveStyle.dim || dimmed
+  const depIssue = depIssues(pkg, !inactive)
   const name = displayName(pkg)
   const versionStr = pkg.version != null && pkg.version !== '' ? String(pkg.version) : null
   const thumbUrl = useThumbnail(`pkg:${pkg.filename}`)
@@ -797,9 +849,13 @@ export function LibraryTableRow({
         <span className="tabular-nums">{pkg.contentCount}</span>
       </div>
       <div className="w-14 py-2 px-3">
-        {pkg.missingDeps > 0 ? (
-          <span className="text-[10px] text-warning">
-            <AlertTriangle size={10} className="inline" /> {pkg.missingDeps}
+        {depIssue ? (
+          <span className="inline-flex items-center gap-1.5 text-[10px]" title={depIssue.title}>
+            {depIssue.segments.map((s) => (
+              <span key={s.key} className={`inline-flex items-center gap-0.5 ${s.tone}`}>
+                <s.Icon size={10} className="shrink-0" /> {s.count}
+              </span>
+            ))}
           </span>
         ) : (
           <span className="text-[10px] text-text-tertiary">{pkg.depCount}</span>
@@ -825,14 +881,16 @@ export function ContentTableRow({
 }) {
   const typeColor = TYPE_COLORS[item.category] || '#6366f1'
   const isHidden = item.hidden
-  const isDisabledPkg = !isPackageActive(item.package?.storageState ?? 'enabled')
+  const isExtracted = !!item.extractedFrom
+  const ownerPkg = item.sourcePackage ?? item.package
+  const isDisabledPkg = item.localDisabled || !isPackageActive(ownerPkg?.storageState ?? 'enabled')
   const dimInactive = useLibraryStore((s) => s.dimInactive)
   const dimHiddenChrome = (isHidden && !suppressHiddenDimming) || (isDisabledPkg && dimInactive)
   const thumbKey = item.thumbnailPath ? `ct:${item.packageFilename}\0${item.thumbnailPath}` : null
   const thumbUrl = useThumbnail(thumbKey)
   const isLocalContent = isLocalPackage(item.packageFilename)
   const pkgLabel = contentPackageLabel(item)
-  const creator = item.package?.creator
+  const creator = ownerPkg?.creator
 
   return (
     <div
@@ -910,13 +968,22 @@ export function ContentTableRow({
               {item.hasExtractedAppearancePreset && <Check size={11} strokeWidth={3} className="shrink-0" />}
             </span>
           )}
-          {isLocalContent && (
+          {isExtracted ? (
             <span
-              className={`${THUMB_OVERLAY_CHIP} bg-white/12 text-white/80 shrink-0`}
-              title="Loose file in your VaM folder, not from a .var package"
+              className={`${THUMB_OVERLAY_CHIP} bg-cyan-400/15 text-cyan-300 shrink-0`}
+              title="Preset extracted from this package's scene; follows the package lifecycle"
             >
-              local
+              extracted
             </span>
+          ) : (
+            isLocalContent && (
+              <span
+                className={`${THUMB_OVERLAY_CHIP} bg-white/12 text-white/80 shrink-0`}
+                title="Loose file in your VaM folder, not from a .var package"
+              >
+                local
+              </span>
+            )
           )}
         </div>
       </div>
@@ -973,7 +1040,9 @@ export function ContentCard({
 }) {
   const typeColor = TYPE_COLORS[item.category] || '#6366f1'
   const isHidden = item.hidden
-  const isDisabledPkg = !isPackageActive(item.package?.storageState ?? 'enabled')
+  const isExtracted = !!item.extractedFrom
+  const ownerPkg = item.sourcePackage ?? item.package
+  const isDisabledPkg = item.localDisabled || !isPackageActive(ownerPkg?.storageState ?? 'enabled')
   const dimInactive = useLibraryStore((s) => s.dimInactive)
   const dimHiddenChrome = (isHidden && !suppressHiddenDimming) || (isDisabledPkg && dimInactive)
   const pkgLabel = contentPackageLabel(item)
@@ -991,7 +1060,7 @@ export function ContentCard({
     <div
       data-grid-card
       onClick={(e) => onClick?.(item, e)}
-      className={`w-full bg-surface border rounded-lg overflow-hidden transition-all duration-150 card-glow cursor-pointer shrink-0 group
+      className={`w-full bg-surface border rounded-lg overflow-hidden transition-all duration-150 card-glow cursor-pointer shrink-0 group outline-none
         ${selected || bulkSelected ? 'border-accent-blue/40 bg-elevated' : 'border-border hover:bg-elevated'}
         ${dimHiddenChrome ? 'opacity-75 hover:opacity-100' : ''}`}
     >
@@ -1036,18 +1105,35 @@ export function ContentCard({
                 {item.hasExtractedAppearancePreset && <Check size={11} strokeWidth={3} className="shrink-0" />}
               </span>
             )}
-            {isLocalContent && (
+            {isExtracted ? (
               <span
-                className={`${THUMB_OVERLAY_CHIP} bg-white/15 text-white/80 backdrop-blur-sm`}
-                title="Loose file in your VaM folder, not from a .var package"
+                className={`${THUMB_OVERLAY_CHIP} bg-cyan-400/20 text-cyan-200 backdrop-blur-sm`}
+                title="Preset extracted from this package's scene; follows the package lifecycle"
               >
-                local
+                extracted
               </span>
+            ) : (
+              isLocalContent && (
+                <span
+                  className={`${THUMB_OVERLAY_CHIP} bg-white/15 text-white/80 backdrop-blur-sm`}
+                  title="Loose file in your VaM folder, not from a .var package"
+                >
+                  local
+                </span>
+              )
             )}
           </div>
         )}
         {/* Corner slot: disabled indicator; visibility/favorite are interactive except in bulk (static badges, like disabled) */}
         <div className="absolute top-1.5 right-1.5 flex items-center gap-0.5 z-2">
+          {isDisabledPkg && (
+            <div
+              title="Package disabled"
+              className={`size-7 shrink-0 inline-flex items-center justify-center rounded text-error ${THUMB_OUTLINE_ICON_SHADOW}`}
+            >
+              <Power size={13} />
+            </div>
+          )}
           <button
             type="button"
             disabled={bulkMode}
@@ -1057,7 +1143,7 @@ export function ContentCard({
             }}
             className={`size-7 shrink-0 inline-flex items-center justify-center rounded transition ${bulkMode ? 'pointer-events-none' : 'cursor-pointer'} ${
               isHidden
-                ? `opacity-0 text-error bg-transparent ${THUMB_OUTLINE_ICON_SHADOW} ${bulkMode ? '' : 'group-hover:opacity-100 group-hover:text-error/70 group-hover:bg-black/50 group-hover:backdrop-blur-sm'}`
+                ? `opacity-100 text-error bg-transparent ${THUMB_OUTLINE_ICON_SHADOW} ${bulkMode ? '' : 'group-hover:text-error/70 group-hover:bg-black/50 group-hover:backdrop-blur-sm'}`
                 : `opacity-0 text-white/70 bg-black/50 backdrop-blur-sm ${bulkMode ? '' : 'group-hover:opacity-100'}`
             }`}
           >
@@ -1072,22 +1158,14 @@ export function ContentCard({
             }}
             className={`size-7 shrink-0 inline-flex items-center justify-center rounded transition ${bulkMode ? 'pointer-events-none' : 'cursor-pointer'} ${
               item.favorite
-                ? `text-warning opacity-0 bg-transparent ${THUMB_FILLED_ICON_SHADOW} ${bulkMode ? '' : 'group-hover:opacity-100 group-hover:bg-black/50 group-hover:backdrop-blur-sm'}`
+                ? `text-warning opacity-100 bg-transparent ${THUMB_FILLED_ICON_SHADOW} ${bulkMode ? '' : 'group-hover:bg-black/50 group-hover:backdrop-blur-sm'}`
                 : `text-white/50 bg-black/50 backdrop-blur-sm opacity-0 ${bulkMode ? '' : 'group-hover:opacity-100'}`
             }`}
           >
             <Star size={13} fill={item.favorite ? 'currentColor' : 'none'} />
           </button>
-          {isDisabledPkg && (
-            <div
-              title="Package disabled"
-              className={`size-7 shrink-0 inline-flex items-center justify-center rounded text-error ${THUMB_OUTLINE_ICON_SHADOW}`}
-            >
-              <Power size={13} />
-            </div>
-          )}
         </div>
-        <div className="absolute bottom-0 inset-x-0 px-2.5 pb-2 pt-8 bg-linear-to-t from-black/80 to-transparent">
+        <div className="absolute bottom-0 inset-x-0 px-2.5 pb-2 pt-8" style={{ background: scrimGradient(0.66) }}>
           <div className="text-[11px] font-medium text-white truncate leading-tight">{item.displayName}</div>
           <div className="text-[9px] text-white/50 truncate">{pkgLabel}</div>
         </div>
@@ -1170,13 +1248,16 @@ export function DepRow({ dep, depth = 0, renderChildren = true, onNavigate, onIn
   const pendingDep = useDownloadStore((s) => s.pendingDepInstalls.has(lookupKey))
   const dlStatus = dl?.startsWith('active') ? 'active' : dl || (pendingDep ? 'queued' : null)
   const dlProgress = dl?.startsWith('active') ? Number(dl.split('|')[1]) || 0 : 0
-  const canNavigate = !!dep.filename && !!onNavigate
+  // Library rows navigate by `filename`; Hub rows by `resourceId` (Hub-available deps).
+  // Roots carry the parent package's resourceId — never treat those as links.
+  const hubNavId = !dep.isRoot && dep.resourceId != null && dep.resourceId !== '' ? String(dep.resourceId) : null
+  const navTarget = dep.filename || hubNavId
+  const canNavigate = !!onNavigate && !!navTarget
 
   return (
     <>
       <div
-        onClick={canNavigate ? () => onNavigate(dep.filename) : undefined}
-        className={`flex items-center gap-2 py-1.5 transition-colors ${canNavigate ? 'cursor-pointer' : ''} ${dep.isRoot ? 'bg-elevated/30' : 'hover:bg-elevated/50'}`}
+        className={`flex items-center gap-2 py-1.5 transition-colors ${dep.isRoot ? 'bg-elevated/30' : 'hover:bg-elevated/50'}`}
         style={{ paddingLeft: `${10 + depth * 16}px`, paddingRight: 10 }}
       >
         {dep.filename &&
@@ -1187,7 +1268,10 @@ export function DepRow({ dep, depth = 0, renderChildren = true, onNavigate, onIn
           ) : null)}
         <TruncateWithTooltip
           text={dep.ref}
-          className={`flex-1 min-w-0 truncate ${canNavigate ? '' : 'select-text cursor-text'} ${dep.isRoot ? 'text-[11px] font-medium text-text-primary' : `text-[11px] ${dep.resolution === 'exact' || dep.resolution === 'latest' ? 'text-text-primary' : 'text-text-secondary'}`}`}
+          onClick={canNavigate ? () => onNavigate(navTarget) : undefined}
+          className={`flex-1 min-w-0 truncate ${
+            canNavigate ? 'cursor-pointer hover:brightness-150 transition-[filter]' : 'select-text cursor-text'
+          } ${dep.isRoot ? 'text-[11px] font-medium text-text-primary' : `text-[11px] ${dep.resolution === 'exact' || dep.resolution === 'latest' ? 'text-text-primary' : 'text-text-secondary'}`}`}
         />
         {dep.sizeBytes != null && (
           <span className="text-[10px] text-text-tertiary font-mono shrink-0">{formatBytes(dep.sizeBytes)}</span>

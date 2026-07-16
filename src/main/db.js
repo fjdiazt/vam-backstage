@@ -2,9 +2,9 @@ import Database from 'better-sqlite3'
 import { existsSync, unlinkSync } from 'fs'
 import { app } from 'electron'
 import { join } from 'path'
-import { LOCAL_PACKAGE_FILENAME } from '@shared/local-package.js'
+import { LOCAL_PACKAGE_FILENAME, LOCAL_PACKAGE_DISPLAY_NAME } from '@shared/local-package.js'
 
-const SCHEMA_VERSION = 28
+export const SCHEMA_VERSION = 28
 
 /**
  * Normalize a value to a non-negative integer string, or null. Hub resource/user
@@ -92,15 +92,81 @@ export function closeDatabase() {
 /** Pre-release DBs with version 1–15 cannot be upgraded; delete backstage.db and restart. */
 const LEGACY_SCHEMA_CUTOFF = 16
 
+/** Read the on-disk schema version. 0 (the SQLite default) means "brand-new DB". */
+function getSchemaVersion() {
+  return db.pragma('user_version', { simple: true })
+}
+
+/**
+ * Stamp the schema version into the DB header. `PRAGMA user_version` is a
+ * header-field write that participates in the surrounding transaction (it rolls
+ * back with it), so pairing it with each migration step keeps the step atomic.
+ * The value is interpolated because PRAGMA doesn't bind parameters — it's always
+ * our own trusted integer (a MIGRATIONS target or SCHEMA_VERSION), never input.
+ */
+function setSchemaVersion(version) {
+  db.pragma(`user_version = ${version}`)
+}
+
+/**
+ * Older builds tracked the version in a `schema_version` table rather than
+ * `PRAGMA user_version`. On first open under the new scheme such a DB reports
+ * user_version 0 (the default) and would be mistaken for a fresh install, so we
+ * adopt the table's value into user_version and drop the table — once. The
+ * table's presence is the legacy marker; a genuinely fresh DB never has it.
+ */
+function adoptLegacySchemaVersion() {
+  const hasTable = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'`).get()
+  if (!hasTable) return
+  db.transaction(() => {
+    const row = db.prepare('SELECT version FROM schema_version').get()
+    if (row?.version) setSchemaVersion(row.version)
+    db.exec('DROP TABLE schema_version')
+  })()
+}
+
+/**
+ * Ordered incremental migrations: `[targetVersion, apply]`. Each step is run by
+ * migrate() inside its own transaction together with the matching
+ * `setSchemaVersion` bump, so a step is all-or-nothing. A crash mid-step rolls
+ * the whole step back (SQLite DDL is transactional) and the next launch retries
+ * from the same version boundary against an unchanged schema — never a
+ * half-applied step layered on a partially-mutated table. To add a migration,
+ * append a row here and reflect the same shape in createSchema().
+ */
+export const MIGRATIONS = [
+  [17, applyV17],
+  [18, applyV18],
+  [19, applyV19],
+  [20, applyV20],
+  [21, applyV21],
+  [22, applyV22],
+  [23, applyV23],
+  [24, applyV24],
+  [25, applyV25],
+  [26, applyV26],
+  [27, applyV27],
+  [28, applyV28],
+]
+
 function migrate() {
-  db.exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)`)
-  const row = db.prepare('SELECT version FROM schema_version').get()
-  const current = row?.version ?? 0
+  if (getSchemaVersion() === 0) adoptLegacySchemaVersion()
+  const current = getSchemaVersion()
 
   if (current === SCHEMA_VERSION) return
 
+  if (current > SCHEMA_VERSION) {
+    throw new Error(
+      `Schema version ${current} is newer than this app supports (v${SCHEMA_VERSION}). ` +
+        `Update the app to open this database.`,
+    )
+  }
+
   if (current === 0) {
-    createSchema()
+    db.transaction(() => {
+      createSchema()
+      setSchemaVersion(SCHEMA_VERSION)
+    })()
   } else {
     if (current < LEGACY_SCHEMA_CUTOFF) {
       throw new Error(
@@ -108,24 +174,17 @@ function migrate() {
           `Delete "${getDatabasePath()}" and restart the app.`,
       )
     }
-    if (current < 17) applyV17()
-    if (current < 18) applyV18()
-    if (current < 19) applyV19()
-    if (current < 20) applyV20()
-    if (current < 21) applyV21()
-    if (current < 22) applyV22()
-    if (current < 23) applyV23()
-    if (current < 24) applyV24()
-    if (current < 25) applyV25()
-    if (current < 26) applyV26()
-    if (current < 27) applyV27()
-    if (current < 28) applyV28()
+    for (const [version, apply] of MIGRATIONS) {
+      if (current < version) {
+        db.transaction(() => {
+          apply()
+          setSchemaVersion(version)
+        })()
+      }
+    }
   }
 
   ensureLocalPackage()
-
-  db.prepare('DELETE FROM schema_version').run()
-  db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(SCHEMA_VERSION)
 }
 
 function applyV17() {
@@ -247,9 +306,22 @@ function applyV21() {
  * key the `hub_resources` cache on, so this column records "already asked the
  * Hub for this package's name" — stamped on a definitive answer (hit or
  * authoritative not-found) and left NULL on transient errors so they retry.
+ *
+ * The column-existence guard is recovery scaffolding, not a pattern for new
+ * migrations: this step shipped on the dev channel under the old non-atomic
+ * migrate(), which could leave the column added but schema_version stuck below
+ * 22 after a crash. Such a DB re-runs applyV22, so a bare ADD COLUMN would throw
+ * "duplicate column name" and wedge the upgrade forever. Now that migrate() runs
+ * each step atomically with its version bump, fresh migrations don't need this.
  */
 function applyV22() {
-  db.exec(`ALTER TABLE packages ADD COLUMN hub_name_checked_at INTEGER`)
+  const cols = db
+    .prepare(`PRAGMA table_info(packages)`)
+    .all()
+    .map((c) => c.name)
+  if (!cols.includes('hub_name_checked_at')) {
+    db.exec(`ALTER TABLE packages ADD COLUMN hub_name_checked_at INTEGER`)
+  }
 }
 
 /**
@@ -261,127 +333,141 @@ function applyV22() {
  * (b) rebuilds the two cache tables (`hub_resources`, `hub_users`) with a
  * numeric-only PK CHECK, dropping invalid-PK rows (pure cache, regenerable).
  * The cache tables have no foreign keys in either direction, so no FK dance is
- * needed. Wrapped in one transaction so an unexpected failure rolls back clean
- * and retries next launch. Code-side, every DB writer of a hub id now runs it
- * through `toIntString` (the `setHub*` setters, `insertDownload`, and the
- * `upsertHub*` cache writers fed by raw Hub API responses), so junk ids — most
- * often a `String(null)` from an API field — can't be reintroduced.
+ * needed. migrate() runs this (like every step) inside a transaction, so an
+ * unexpected failure rolls back clean and retries next launch. Code-side, every
+ * DB writer of a hub id now runs it through `toIntString` (the `setHub*`
+ * setters, `insertDownload`, and the `upsertHub*` cache writers fed by raw Hub
+ * API responses), so junk ids — most often a `String(null)` from an API field —
+ * can't be reintroduced.
  */
 function applyV23() {
-  const tx = db.transaction(() => {
-    const bad = (col) => `${col} IS NOT NULL AND NOT (${intCheckSql(col)})`
-    const p1 = db.prepare(`UPDATE packages SET hub_resource_id = NULL WHERE ${bad('hub_resource_id')}`).run()
-    const p2 = db.prepare(`UPDATE packages SET hub_user_id = NULL WHERE ${bad('hub_user_id')}`).run()
-    const d1 = db.prepare(`UPDATE downloads SET hub_resource_id = NULL WHERE ${bad('hub_resource_id')}`).run()
+  const bad = (col) => `${col} IS NOT NULL AND NOT (${intCheckSql(col)})`
+  const p1 = db.prepare(`UPDATE packages SET hub_resource_id = NULL WHERE ${bad('hub_resource_id')}`).run()
+  const p2 = db.prepare(`UPDATE packages SET hub_user_id = NULL WHERE ${bad('hub_user_id')}`).run()
+  const d1 = db.prepare(`UPDATE downloads SET hub_resource_id = NULL WHERE ${bad('hub_resource_id')}`).run()
 
-    db.exec(`
-      CREATE TABLE hub_resources_new (
-        resource_id TEXT PRIMARY KEY CHECK (${intCheckSql('resource_id')}),
-        hub_json TEXT,
-        search_json TEXT,
-        find_json TEXT,
-        updated_at INTEGER NOT NULL DEFAULT (unixepoch())
-      );
-      INSERT INTO hub_resources_new (resource_id, hub_json, search_json, find_json, updated_at)
-        SELECT resource_id, hub_json, search_json, find_json, updated_at
-        FROM hub_resources WHERE ${intCheckSql('resource_id')};
-      DROP TABLE hub_resources;
-      ALTER TABLE hub_resources_new RENAME TO hub_resources;
-
-      CREATE TABLE hub_users_new (
-        user_id TEXT PRIMARY KEY CHECK (${intCheckSql('user_id')}),
-        username TEXT,
-        hub_json TEXT,
-        updated_at INTEGER NOT NULL DEFAULT (unixepoch())
-      );
-      INSERT INTO hub_users_new (user_id, username, hub_json, updated_at)
-        SELECT user_id, username, hub_json, updated_at
-        FROM hub_users WHERE ${intCheckSql('user_id')};
-      DROP TABLE hub_users;
-      ALTER TABLE hub_users_new RENAME TO hub_users;
-      CREATE INDEX IF NOT EXISTS idx_hub_users_username ON hub_users(username);
-    `)
-
-    const scrubbed = p1.changes + p2.changes + d1.changes
-    if (scrubbed > 0) console.info(`[migrate v23] nulled ${scrubbed} non-numeric hub id(s) across packages/downloads`)
-  })
-  tx()
-}
-
-function hubWishlistSchemaSql() {
-  return `
-    CREATE TABLE IF NOT EXISTS hub_wishlist (
-      resource_id TEXT PRIMARY KEY CHECK (${intCheckSql('resource_id')}),
-      title TEXT,
-      url TEXT,
-      image_url TEXT,
-      image_blob BLOB,
-      image_mime TEXT,
-      username TEXT,
-      type TEXT,
-      category TEXT,
-      license TEXT,
-      snapshot_json TEXT,
-      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-      updated_at INTEGER NOT NULL DEFAULT (unixepoch())
-    );
-  `
-}
-
-function applyV24() {
-  db.exec(hubWishlistSchemaSql())
-}
-
-function hubHiddenSchemaSql() {
-  return `
-    CREATE TABLE IF NOT EXISTS hub_hidden (
-      resource_id TEXT PRIMARY KEY CHECK (${intCheckSql('resource_id')}),
-      title TEXT,
-      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-      updated_at INTEGER NOT NULL DEFAULT (unixepoch())
-    );
-  `
-}
-
-function applyV25() {
-  db.exec(hubHiddenSchemaSql())
-}
-
-function labelContentSourcesSchemaSql() {
-  return `
-    CREATE TABLE IF NOT EXISTS label_content_sources (
-      label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
-      package_filename TEXT NOT NULL REFERENCES packages(filename) ON DELETE CASCADE,
-      internal_path TEXT NOT NULL,
-      source_mask INTEGER NOT NULL,
-      ba_category TEXT,
-      PRIMARY KEY (label_id, package_filename, internal_path)
-    );
-    CREATE INDEX IF NOT EXISTS idx_label_content_sources_pkgpath
-      ON label_content_sources(package_filename, internal_path);
-  `
-}
-
-function applyV26() {
   db.exec(`
-    CREATE TABLE IF NOT EXISTS label_content_sources (
-      label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
-      package_filename TEXT NOT NULL REFERENCES packages(filename) ON DELETE CASCADE,
-      internal_path TEXT NOT NULL,
-      source_mask INTEGER NOT NULL,
-      PRIMARY KEY (label_id, package_filename, internal_path)
+    CREATE TABLE hub_resources_new (
+      resource_id TEXT PRIMARY KEY CHECK (${intCheckSql('resource_id')}),
+      hub_json TEXT,
+      search_json TEXT,
+      find_json TEXT,
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch())
     );
-    CREATE INDEX IF NOT EXISTS idx_label_content_sources_pkgpath
-      ON label_content_sources(package_filename, internal_path);
+    INSERT INTO hub_resources_new (resource_id, hub_json, search_json, find_json, updated_at)
+      SELECT resource_id, hub_json, search_json, find_json, updated_at
+      FROM hub_resources WHERE ${intCheckSql('resource_id')};
+    DROP TABLE hub_resources;
+    ALTER TABLE hub_resources_new RENAME TO hub_resources;
+
+    CREATE TABLE hub_users_new (
+      user_id TEXT PRIMARY KEY CHECK (${intCheckSql('user_id')}),
+      username TEXT,
+      hub_json TEXT,
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    INSERT INTO hub_users_new (user_id, username, hub_json, updated_at)
+      SELECT user_id, username, hub_json, updated_at
+      FROM hub_users WHERE ${intCheckSql('user_id')};
+    DROP TABLE hub_users;
+    ALTER TABLE hub_users_new RENAME TO hub_users;
+    CREATE INDEX IF NOT EXISTS idx_hub_users_username ON hub_users(username);
+  `)
+
+  const scrubbed = p1.changes + p2.changes + d1.changes
+  if (scrubbed > 0) console.info(`[migrate v23] nulled ${scrubbed} non-numeric hub id(s) across packages/downloads`)
+}
+
+/**
+ * v24 — track each package's subpath within its library dir. A `.var` is valid
+ * anywhere under a library root (main `AddonPackages` or an aux/offload dir),
+ * not just at the top level. `subpath` is the POSIX-style relative directory
+ * ('' at the root) of the file's containing folder, so `pkgVarPath` can resolve
+ * nested files for enable/disable/offload, thumbnails, integrity, redownload
+ * and uninstall — every operation that previously assumed a flat library dir.
+ *
+ * Existing rows backfill to '' (the historical flat assumption). `needs_rescan`
+ * is set so the next startup scan re-derives the real subpath of any nested file
+ * via runScan's stat-cache reconciliation (a cache hit now also compares
+ * `subpath` and corrects it without re-reading the archive).
+ */
+function applyV24() {
+  db.exec(`ALTER TABLE packages ADD COLUMN subpath TEXT NOT NULL DEFAULT ''`)
+  db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('needs_rescan', '1')`).run()
+}
+
+/**
+ * v25 — local wishlist for hub packages. Unlike `hub_resources` (a disposable,
+ * regenerable cache), this table is the feature's own durable copy of the
+ * detail-shaped resource JSON: paid/removed packages have no `.var` filename and
+ * can vanish from the Hub, so we can't re-fetch a gallery from ids alone.
+ * `snapshot_json` stores raw hub fields only (app-injected `_`-prefixed
+ * annotations are stripped at write time and recomputed at read time).
+ * `unavailable_at` is stamped when the Hub definitively reports the resource
+ * gone, and cleared on any later successful refresh. Numeric-only PK CHECK
+ * matches the hub-id hygiene of the other hub tables.
+ */
+function applyV25() {
+  db.exec(`
+    CREATE TABLE hub_wishlist (
+      resource_id TEXT PRIMARY KEY CHECK (${intCheckSql('resource_id')}),
+      snapshot_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      snapshot_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      unavailable_at INTEGER
+    );
   `)
 }
 
-function applyV27() {
-  db.exec(`ALTER TABLE label_content_sources ADD COLUMN ba_category TEXT`)
+/**
+ * v26 — per-offload-dir BrowserAssist mode. When enabled on an aux dir, offloading
+ * a package into it also drops a `<pkg>.var.json` sidecar recording the package's
+ * `OriginalFolder` (its home relative to `AddonPackages`), matching JayJayWon's
+ * BrowserAssist convention so BA can restore packages we offloaded — and so we can
+ * restore packages BA offloaded (which flattens content to the aux root and relies
+ * on the sidecar for the restore location). Off (0) by default: existing aux dirs
+ * keep the plain suffix-less mirror layout with no sidecars.
+ */
+function applyV26() {
+  db.exec(`ALTER TABLE library_dirs ADD COLUMN browser_assist INTEGER NOT NULL DEFAULT 0`)
 }
 
+/**
+ * v27 — soft-delete tombstones. `missing_since` (unix seconds) marks a package
+ * whose `.var` is no longer on disk. Rather than DELETE the row (which cascades
+ * through contents + label links, destroying the user's identity-keyed settings),
+ * the watcher and full-scan reconciler now stamp `missing_since`. The row is kept
+ * so that when the file reappears anywhere under a library root — moved, restored
+ * from a removed dir, or a remounted drive — its hub link, labels, type override
+ * and content visibility are transparently restored (setStorageState / upsertPackage
+ * clear the stamp). Enumerating getters filter `missing_since IS NULL` so tombstones
+ * are invisible to the gallery; the dev "Forget deleted packages" button hard-deletes
+ * them. NULL = present (the historical assumption for every existing row).
+ */
+function applyV27() {
+  db.exec(`ALTER TABLE packages ADD COLUMN missing_since INTEGER`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_packages_missing_since ON packages(missing_since)`)
+}
+
+/**
+ * v28 — normalize accidental `.disabled` content labels (data-only, no schema
+ * change). Earlier builds keyed a loose extracted preset's content label on
+ * whatever path it had when applied, so labeling a *disabled* preset stored
+ * `…/X.vap.disabled`; labels now bind to the live path, orphaning those rows.
+ * Fold each `__local__` marker row onto its canonical path — merging into an
+ * existing canonical row (INSERT OR IGNORE), then dropping the marker row. Scoped
+ * to `__local__` because the `.disabled` marker only ever exists on loose presets.
+ */
 function applyV28() {
-  db.exec('ALTER TABLE packages ADD COLUMN hidden INTEGER')
+  db.prepare(
+    `INSERT OR IGNORE INTO label_contents (label_id, package_filename, internal_path)
+       SELECT label_id, package_filename, substr(internal_path, 1, length(internal_path) - length('.disabled'))
+       FROM label_contents
+       WHERE package_filename = ? AND internal_path LIKE '%.disabled'`,
+  ).run(LOCAL_PACKAGE_FILENAME)
+  db.prepare(`DELETE FROM label_contents WHERE package_filename = ? AND internal_path LIKE '%.disabled'`).run(
+    LOCAL_PACKAGE_FILENAME,
+  )
 }
 
 /**
@@ -398,8 +484,8 @@ export function ensureLocalPackage() {
     `INSERT OR IGNORE INTO packages (
       filename, creator, package_name, version, type, title, description, license,
       size_bytes, file_mtime, is_direct, storage_state, library_dir_id, dep_refs, first_seen_at
-    ) VALUES (?, '', '', '', NULL, 'Local content', NULL, NULL, 0, 0, 1, 'enabled', NULL, '[]', unixepoch())`,
-  ).run(LOCAL_PACKAGE_FILENAME)
+    ) VALUES (?, '', '', '', NULL, ?, NULL, NULL, 0, 0, 1, 'enabled', NULL, '[]', unixepoch())`,
+  ).run(LOCAL_PACKAGE_FILENAME, LOCAL_PACKAGE_DISPLAY_NAME)
 }
 
 /** Full schema as of current SCHEMA_VERSION — new installs skip incremental migrations. */
@@ -408,7 +494,8 @@ function createSchema() {
     CREATE TABLE IF NOT EXISTS library_dirs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       path TEXT UNIQUE NOT NULL,
-      created_at INTEGER NOT NULL DEFAULT (unixepoch())
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      browser_assist INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS packages (
@@ -425,6 +512,7 @@ function createSchema() {
       is_direct INTEGER NOT NULL DEFAULT 0,
       storage_state TEXT NOT NULL DEFAULT 'enabled',
       library_dir_id INTEGER NULL REFERENCES library_dirs(id) ON DELETE RESTRICT,
+      subpath TEXT NOT NULL DEFAULT '',
       hub_resource_id TEXT,
       dep_refs TEXT NOT NULL DEFAULT '[]',
       first_seen_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -439,11 +527,12 @@ function createSchema() {
       is_corrupted INTEGER NOT NULL DEFAULT 0,
       hub_detail_applied_at INTEGER,
       hub_name_checked_at INTEGER,
-      hidden INTEGER
+      missing_since INTEGER
     );
 
     CREATE INDEX IF NOT EXISTS idx_packages_package_name ON packages(package_name);
     CREATE INDEX IF NOT EXISTS idx_packages_creator ON packages(creator);
+    CREATE INDEX IF NOT EXISTS idx_packages_missing_since ON packages(missing_since);
 
     CREATE TABLE IF NOT EXISTS contents (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -494,8 +583,13 @@ function createSchema() {
     );
     CREATE INDEX IF NOT EXISTS idx_hub_users_username ON hub_users(username);
 
-    ${hubWishlistSchemaSql()}
-    ${hubHiddenSchemaSql()}
+    CREATE TABLE IF NOT EXISTS hub_wishlist (
+      resource_id TEXT PRIMARY KEY CHECK (${intCheckSql('resource_id')}),
+      snapshot_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      snapshot_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      unavailable_at INTEGER
+    );
 
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
@@ -523,8 +617,6 @@ function createSchema() {
       PRIMARY KEY (label_id, package_filename, internal_path)
     );
     CREATE INDEX IF NOT EXISTS idx_label_contents_pkgpath ON label_contents(package_filename, internal_path);
-
-    ${labelContentSourcesSchemaSql()}
   `)
 }
 
@@ -541,37 +633,55 @@ function stmt(sql) {
 }
 
 // Packages
+/**
+ * Upsert a package row. `firstSeenAt` (unix seconds) is written on INSERT only —
+ * it is deliberately absent from the ON CONFLICT UPDATE so re-scans never move a
+ * package's discovery time. Callers that ingest a whole scan run pass one shared
+ * timestamp so every package discovered in that run shares an identical
+ * `first_seen_at`; that keeps the "Recently installed" sort ordering whole batches
+ * by file mtime within the run, and keeps the inheritance donor gate
+ * (`first_seen_at < self`) excluding same-run peers. Defaults to now when omitted.
+ */
 export function upsertPackage(pkg) {
   stmt(`
-    INSERT INTO packages (filename, creator, package_name, version, type, title, description, license, size_bytes, file_mtime, is_direct, storage_state, library_dir_id, dep_refs, scanned_at)
-    VALUES (@filename, @creator, @packageName, @version, @type, @title, @description, @license, @sizeBytes, @fileMtime, @isDirect, @storageState, @libraryDirId, @depRefs, unixepoch())
+    INSERT INTO packages (filename, creator, package_name, version, type, title, description, license, size_bytes, file_mtime, is_direct, storage_state, library_dir_id, subpath, dep_refs, first_seen_at, scanned_at)
+    VALUES (@filename, @creator, @packageName, @version, @type, @title, @description, @license, @sizeBytes, @fileMtime, @isDirect, @storageState, @libraryDirId, @subpath, @depRefs, @firstSeenAt, unixepoch())
     ON CONFLICT(filename) DO UPDATE SET
       creator = excluded.creator, package_name = excluded.package_name, version = excluded.version,
       type = excluded.type, title = excluded.title, description = excluded.description,
       license = excluded.license, size_bytes = excluded.size_bytes, file_mtime = excluded.file_mtime,
       storage_state = excluded.storage_state,
       library_dir_id = excluded.library_dir_id,
-      dep_refs = excluded.dep_refs, scanned_at = excluded.scanned_at
-  `).run(pkg)
+      subpath = excluded.subpath,
+      dep_refs = excluded.dep_refs, scanned_at = excluded.scanned_at,
+      missing_since = NULL
+  `).run({ subpath: '', firstSeenAt: Math.floor(Date.now() / 1000), ...pkg })
 }
 
 export function deletePackage(filename) {
   stmt('DELETE FROM packages WHERE filename = ?').run(filename)
 }
 
+/**
+ * Soft-delete: stamp `missing_since` so the package drops out of every
+ * enumerating getter (gallery, hub scan, counts) without cascading away its
+ * contents and label links. `AND missing_since IS NULL` keeps the stamp
+ * idempotent — re-observing an already-missing file never moves the timestamp,
+ * so "first went missing" stays stable. Returns rows changed (0 if already a
+ * tombstone or the row doesn't exist).
+ */
+export function markPackageMissing(filename) {
+  return stmt('UPDATE packages SET missing_since = unixepoch() WHERE filename = ? AND missing_since IS NULL').run(
+    filename,
+  ).changes
+}
+
 export function setPackageDirect(filename, isDirect) {
   stmt('UPDATE packages SET is_direct = ? WHERE filename = ?').run(isDirect ? 1 : 0, filename)
 }
 
-export function getPackageHidden(filename) {
-  const row = stmt('SELECT hidden FROM packages WHERE filename = ?').get(filename)
-  if (!row || row.hidden == null) return null
-  return !!row.hidden
-}
-
-export function setPackageHidden(filename, hidden) {
-  const value = hidden == null ? null : hidden ? 1 : 0
-  return stmt('UPDATE packages SET hidden = ? WHERE filename = ?').run(value, filename).changes
+export function touchPackageFirstSeen(filename) {
+  stmt('UPDATE packages SET first_seen_at = unixepoch() WHERE filename = ?').run(filename)
 }
 
 /** @param {string | null} typeOverride — null clears override (use scanned / Hub type) */
@@ -593,21 +703,49 @@ export function setPackageTypeFromHub(filename, hubType) {
 }
 
 /**
- * Update storage_state and library_dir_id for a package. The on-disk suffix is implied by
- * storage_state (`.disabled` only when storage_state==='disabled', and only ever in main).
+ * Update storage_state and library_dir_id for a package. The physical byte
+ * location (bare `.var` vs a legacy `.var.disabled` sibling) is never stored —
+ * it is re-derived from disk on demand by `resolveContentPath`, so there is no
+ * on-disk-name column to keep in sync here.
+ *
+ * `subpath` (the package's relative dir within its library dir) is updated only when
+ * provided — pass it whenever the physical file moved (cross-dir move recovery, or a
+ * scan/watch cache hit that detected a different subfolder). Omit it for in-place
+ * state flips that don't relocate the file (enable/disable/offload preserve subpath
+ * and pass the existing value explicitly).
  */
-export function setStorageState(filename, storageState, libraryDirId) {
-  stmt('UPDATE packages SET storage_state = ?, library_dir_id = ? WHERE filename = ?').run(
-    storageState,
-    libraryDirId ?? null,
-    filename,
-  )
+export function setStorageState(filename, storageState, libraryDirId, subpath) {
+  // Clearing `missing_since` here is what resurrects a tombstoned package when the
+  // watcher's relocation walk finds its `.var` again (moved, restored, remounted):
+  // the file is back on disk, so the row is present again and its identity/settings
+  // survive intact.
+  if (subpath === undefined) {
+    stmt('UPDATE packages SET storage_state = ?, library_dir_id = ?, missing_since = NULL WHERE filename = ?').run(
+      storageState,
+      libraryDirId ?? null,
+      filename,
+    )
+  } else {
+    stmt(
+      'UPDATE packages SET storage_state = ?, library_dir_id = ?, subpath = ?, missing_since = NULL WHERE filename = ?',
+    ).run(storageState, libraryDirId ?? null, subpath, filename)
+  }
 }
 
-export function getPackageCacheInfo(filename) {
-  return stmt('SELECT file_mtime, size_bytes, storage_state, library_dir_id FROM packages WHERE filename = ?').get(
-    filename,
-  )
+/**
+ * Reconciliation snapshot of a single package row, keyed by PK. This is the one
+ * reader that DELIBERATELY sees tombstones: it does not filter `missing_since IS
+ * NULL` (that filter only belongs on the enumerating getters that feed the
+ * gallery). Both cache-hit call sites — the full scan (`runScan`) and the watcher
+ * (`scanSingleVar`) — rely on that: when the returned `missing_since` is non-null
+ * the file has reappeared byte-identical, and the caller MUST clear the tombstone
+ * (via `setStorageState`/`scanAndUpsert`) to resurrect it, even when its
+ * storage_state/dir/subpath are otherwise unchanged. `undefined` = no row at all.
+ */
+export function getPackageReconcileInfo(filename) {
+  return stmt(
+    'SELECT file_mtime, size_bytes, storage_state, library_dir_id, subpath, missing_since FROM packages WHERE filename = ?',
+  ).get(filename)
 }
 
 /**
@@ -625,7 +763,7 @@ export function getPackageCacheInfo(filename) {
 export function getDonorVersionsByPackageName(packageName, filename) {
   return stmt(
     `SELECT filename, version, type_override FROM packages
-     WHERE package_name = ? AND filename != ? AND package_name != ''
+     WHERE package_name = ? AND filename != ? AND package_name != '' AND missing_since IS NULL
        AND first_seen_at < (SELECT first_seen_at FROM packages WHERE filename = ?)
      ORDER BY CAST(version AS INTEGER) DESC`,
   ).all(packageName, filename, filename)
@@ -634,15 +772,15 @@ export function getDonorVersionsByPackageName(packageName, filename) {
 // Library directories (aux only — main is implicit via vam_dir setting + NULL pointer)
 
 export function listLibraryDirs() {
-  return stmt('SELECT id, path, created_at FROM library_dirs ORDER BY created_at ASC').all()
+  return stmt('SELECT id, path, created_at, browser_assist FROM library_dirs ORDER BY created_at ASC').all()
 }
 
 export function getLibraryDir(id) {
-  return stmt('SELECT id, path, created_at FROM library_dirs WHERE id = ?').get(id)
+  return stmt('SELECT id, path, created_at, browser_assist FROM library_dirs WHERE id = ?').get(id)
 }
 
 export function getLibraryDirByPath(path) {
-  return stmt('SELECT id, path, created_at FROM library_dirs WHERE path = ?').get(path)
+  return stmt('SELECT id, path, created_at, browser_assist FROM library_dirs WHERE path = ?').get(path)
 }
 
 export function insertLibraryDir(path) {
@@ -650,28 +788,66 @@ export function insertLibraryDir(path) {
   return info.lastInsertRowid
 }
 
+/** Toggle the BrowserAssist sidecar mode flag on an aux dir (see applyV26 / storage-state.js). */
+export function setLibraryDirBrowserAssist(id, enabled) {
+  stmt('UPDATE library_dirs SET browser_assist = ? WHERE id = ?').run(enabled ? 1 : 0, id)
+}
+
 export function deleteLibraryDir(id) {
   stmt('DELETE FROM library_dirs WHERE id = ?').run(id)
+}
+
+/**
+ * Force-remove an offload dir that still holds packages, atomically. The on-disk
+ * `.var` files are untouched — they simply sit in a now-unregistered folder — so
+ * rather than DELETE the rows (destroying labels / type overrides / content
+ * visibility) we TOMBSTONE them: stamp `missing_since` so they drop out of the
+ * gallery, and detach `library_dir_id` (→ NULL) so the FK RESTRICT on the dir row
+ * lifts. Re-adding the folder later re-scans the files and `upsertPackage`
+ * resurrects each row with its identity intact (clearing the tombstone and
+ * restoring the correct dir id), so this is recoverable, consistent with the
+ * relocation-survival model. Returns the number of (present) packages tombstoned.
+ */
+export function removeLibraryDirTombstoningPackages(id) {
+  const tx = db.transaction((dirId) => {
+    const { changes } = stmt(
+      `UPDATE packages SET missing_since = unixepoch(), library_dir_id = NULL
+       WHERE library_dir_id = ? AND missing_since IS NULL`,
+    ).run(dirId)
+    // Detach any rows already tombstoned while pointing here too, so the dir delete isn't
+    // blocked by a lingering FK reference.
+    stmt('UPDATE packages SET library_dir_id = NULL WHERE library_dir_id = ?').run(dirId)
+    stmt('DELETE FROM library_dirs WHERE id = ?').run(dirId)
+    return changes
+  })
+  return tx(id)
 }
 
 export function countPackagesInLibraryDir(id) {
   if (id == null) {
     return stmt(
-      'SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS bytes FROM packages WHERE library_dir_id IS NULL',
+      'SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS bytes FROM packages WHERE library_dir_id IS NULL AND missing_since IS NULL',
     ).get()
   }
-  return stmt('SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS bytes FROM packages WHERE library_dir_id = ?').get(
-    id,
-  )
+  return stmt(
+    'SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS bytes FROM packages WHERE library_dir_id = ? AND missing_since IS NULL',
+  ).get(id)
 }
 
+/**
+ * Every present package. `missing_since IS NULL` is the single filtering
+ * chokepoint that hides tombstones (soft-deleted rows whose `.var` left disk) —
+ * this feeds `buildFromDb`/`buildGraphOnly`, so the in-memory `packageIndex` and
+ * every consumer downstream of it are ghost-free without each having to know
+ * about tombstones.
+ */
 export function getAllPackages() {
-  return stmt('SELECT * FROM packages').all()
+  return stmt('SELECT * FROM packages WHERE missing_since IS NULL').all()
 }
 
-/** All local packages for hub metadata scan (direct + dependencies). */
+/** All present local packages for hub metadata scan (direct + dependencies). */
 export function getAllPackagesForHubScan() {
-  return stmt('SELECT filename, package_name, is_direct FROM packages').all()
+  return stmt('SELECT filename, package_name, is_direct FROM packages WHERE missing_since IS NULL').all()
 }
 
 /**
@@ -685,6 +861,7 @@ export function getPackagesNeedingHubDetailApply() {
     FROM packages p
     JOIN hub_resources hr ON hr.resource_id = p.hub_resource_id
     WHERE p.hub_resource_id IS NOT NULL
+      AND p.missing_since IS NULL
       AND hr.hub_json IS NOT NULL
       AND (p.hub_detail_applied_at IS NULL OR p.hub_detail_applied_at < hr.updated_at)
   `).all()
@@ -701,24 +878,34 @@ export function getPackagesNeedingHubDetailFetch() {
     SELECT p.filename, p.hub_resource_id AS rid
     FROM packages p
     LEFT JOIN hub_resources hr ON hr.resource_id = p.hub_resource_id
-    WHERE p.hub_resource_id IS NOT NULL AND hr.hub_json IS NULL
+    WHERE p.hub_resource_id IS NOT NULL AND p.missing_since IS NULL AND hr.hub_json IS NULL
   `).all()
 }
 
 /**
- * Work-list for the name-based Hub resolution pass: packages that the
- * `packages.json` index couldn't link (`hub_resource_id IS NULL`) and that we
- * haven't yet asked the Hub about by name (`hub_name_checked_at IS NULL`).
- * Excludes the synthetic local-content sentinel. Each is looked up once per
- * lifetime; `markHubNameChecked` retires it whether it resolves or not.
+ * Work-list for the name-based Hub resolution pass: packages absent from
+ * `packages.json`, plus packages whose indexed resource now authoritatively
+ * returns "Resource not found" (usually re-published under a new id).
+ *
+ * A dead link is retained until lookup finds a replacement, preserving useful
+ * metadata for genuinely removed resources. Each state is checked once:
+ * `hub_name_checked_at` retires unresolved packages until their tombstone moves.
  */
 export function getPackagesNeedingHubNameLookup() {
   return stmt(`
-    SELECT filename, package_name AS packageName
-    FROM packages
-    WHERE hub_resource_id IS NULL
-      AND hub_name_checked_at IS NULL
-      AND filename != ?
+    SELECT p.filename, p.package_name AS packageName
+    FROM packages p
+    LEFT JOIN hub_resources hr ON hr.resource_id = p.hub_resource_id
+    WHERE p.filename != ?
+      AND p.missing_since IS NULL
+      AND (
+        (p.hub_resource_id IS NULL AND p.hub_name_checked_at IS NULL)
+        OR (
+          json_extract(hr.hub_json, '$._unavailable') = 1
+          AND lower(COALESCE(json_extract(hr.hub_json, '$._error'), '')) LIKE '%resource not found%'
+          AND (p.hub_name_checked_at IS NULL OR p.hub_name_checked_at < hr.updated_at)
+        )
+      )
   `).all(LOCAL_PACKAGE_FILENAME)
 }
 
@@ -823,8 +1010,16 @@ export function deleteContentsForPackagePaths(packageFilename, paths) {
   tx(paths)
 }
 
+/**
+ * Every content row of a present package. Joined against `packages` so rows
+ * belonging to a tombstoned package (soft-deleted, `.var` gone from disk) are
+ * excluded — their `contents` rows survive the tombstone (no cascade) to
+ * preserve identity, but must stay out of the gallery until the file reappears.
+ */
 export function getAllContents() {
-  return stmt('SELECT * FROM contents').all()
+  return stmt(
+    'SELECT c.* FROM contents c JOIN packages p ON p.filename = c.package_filename WHERE p.missing_since IS NULL',
+  ).all()
 }
 
 // Settings
@@ -849,115 +1044,6 @@ export function trySetSetting(key, value) {
   } catch {
     return false
   }
-}
-
-// Hub wishlist
-export function listHubWishlist() {
-  return stmt(
-    `SELECT resource_id, title, url, image_url, image_blob, image_mime, username, type, category, license, snapshot_json, created_at, updated_at
-     FROM hub_wishlist
-     ORDER BY updated_at DESC, created_at DESC`,
-  ).all()
-}
-
-export function getHubWishlistIds() {
-  return stmt('SELECT resource_id FROM hub_wishlist')
-    .all()
-    .map((r) => r.resource_id)
-}
-
-export function isHubWishlisted(resourceId) {
-  const rid = toIntString(resourceId)
-  if (!rid) return false
-  return !!stmt('SELECT 1 FROM hub_wishlist WHERE resource_id = ?').get(rid)
-}
-
-export function upsertHubWishlist(resource, thumb = {}) {
-  const rid = toIntString(resource?.resource_id ?? resource?.resourceId)
-  if (!rid) throw new Error('Hub wishlist resource_id is required')
-  const entry = {
-    resourceId: rid,
-    title: resource.title ?? null,
-    url: resource.url ?? null,
-    imageUrl: resource.image_url ?? resource.imageUrl ?? null,
-    imageBlob: thumb.buffer ?? resource.image_blob ?? resource.imageBlob ?? null,
-    imageMime: thumb.mime ?? resource.image_mime ?? resource.imageMime ?? null,
-    username: resource.username ?? null,
-    type: resource.type ?? null,
-    category: resource.category ?? null,
-    license: resource.license ?? null,
-    snapshotJson: resource.snapshot_json ?? resource.snapshotJson ?? JSON.stringify(resource),
-  }
-  stmt(
-    `INSERT INTO hub_wishlist (
-      resource_id, title, url, image_url, image_blob, image_mime, username, type, category, license, snapshot_json
-    ) VALUES (
-      @resourceId, @title, @url, @imageUrl, @imageBlob, @imageMime, @username, @type, @category, @license, @snapshotJson
-    )
-    ON CONFLICT(resource_id) DO UPDATE SET
-      title = excluded.title,
-      url = excluded.url,
-      image_url = excluded.image_url,
-      image_blob = excluded.image_blob,
-      image_mime = excluded.image_mime,
-      username = excluded.username,
-      type = excluded.type,
-      category = excluded.category,
-      license = excluded.license,
-      snapshot_json = excluded.snapshot_json,
-      updated_at = unixepoch()`,
-  ).run(entry)
-  return stmt('SELECT * FROM hub_wishlist WHERE resource_id = ?').get(rid)
-}
-
-export function deleteHubWishlist(resourceId) {
-  const rid = toIntString(resourceId)
-  if (!rid) return 0
-  return stmt('DELETE FROM hub_wishlist WHERE resource_id = ?').run(rid).changes
-}
-
-// Hub hidden resources
-export function listHubHidden() {
-  return stmt(
-    `SELECT resource_id, title, created_at, updated_at
-     FROM hub_hidden
-     ORDER BY updated_at DESC, created_at DESC`,
-  ).all()
-}
-
-export function getHubHiddenIds() {
-  return stmt('SELECT resource_id FROM hub_hidden')
-    .all()
-    .map((r) => r.resource_id)
-}
-
-export function isHubHidden(resourceId) {
-  const rid = toIntString(resourceId)
-  if (!rid) return false
-  return !!stmt('SELECT 1 FROM hub_hidden WHERE resource_id = ?').get(rid)
-}
-
-export function upsertHubHidden(resource) {
-  const rid = toIntString(resource?.resource_id ?? resource?.resourceId)
-  if (!rid) throw new Error('Hub hidden resource_id is required')
-  stmt(
-    `INSERT INTO hub_hidden (resource_id, title)
-     VALUES (?, ?)
-     ON CONFLICT(resource_id) DO UPDATE SET
-       title = excluded.title,
-       updated_at = unixepoch()`,
-  ).run(rid, resource?.title ?? null)
-  return stmt('SELECT * FROM hub_hidden WHERE resource_id = ?').get(rid)
-}
-
-export function deleteHubHidden(resourceId) {
-  const rid = toIntString(resourceId)
-  if (!rid) return 0
-  return stmt('DELETE FROM hub_hidden WHERE resource_id = ?').run(rid).changes
-}
-
-export function clearHubHidden() {
-  return stmt('DELETE FROM hub_hidden').run().changes
 }
 
 /**
@@ -988,6 +1074,19 @@ export function setHubResourceId(filename, resourceId) {
  */
 export function markHubNameChecked(filename) {
   stmt('UPDATE packages SET hub_name_checked_at = unixepoch() WHERE filename = ?').run(filename)
+}
+
+/** Hub ids with an authoritative "Resource not found" response, loaded once per operation. */
+export function getNotFoundHubResourceIds() {
+  return new Set(
+    stmt(`
+      SELECT resource_id FROM hub_resources
+      WHERE json_extract(hub_json, '$._unavailable') = 1
+        AND lower(COALESCE(json_extract(hub_json, '$._error'), '')) LIKE '%resource not found%'
+    `)
+      .pluck()
+      .all(),
+  )
 }
 
 export function setHubUserId(filename, userId) {
@@ -1074,7 +1173,7 @@ export function deleteDownload(id) {
 
 // Bulk operations
 export function getAllDbFilenamesWithDir() {
-  return stmt('SELECT filename, library_dir_id FROM packages').all()
+  return stmt('SELECT filename, library_dir_id FROM packages WHERE missing_since IS NULL').all()
 }
 
 // Thumbnail resolution.
@@ -1083,7 +1182,21 @@ export function getAllDbFilenamesWithDir() {
 // The thumb_checked column is kept for schema compatibility but is no longer
 // consulted for fetch decisions.
 export function getPackagesNeedingThumbnail() {
-  return stmt('SELECT filename, package_name, hub_resource_id FROM packages WHERE image_url IS NULL').all()
+  return stmt(
+    'SELECT filename, package_name, hub_resource_id FROM packages WHERE image_url IS NULL AND missing_since IS NULL',
+  ).all()
+}
+
+/**
+ * filename → hub_resource_id for every package. Used by the one-time thumb-cache
+ * layout migration. Deliberately NOT filtered by `missing_since`: the migration
+ * treats any cached `{filename}.jpg` with no matching row here as an orphan and
+ * deletes it, so excluding tombstones would wrongly discard the cached thumbnails
+ * of packages that are only temporarily gone — they'd have to re-fetch on
+ * reappearance. Tombstones keep their place in this map so their thumbs survive.
+ */
+export function getAllPackageHubIds() {
+  return stmt('SELECT filename, hub_resource_id FROM packages').all()
 }
 
 export function setPackageThumbnail(filename, imageUrl) {
@@ -1115,12 +1228,74 @@ export function getContentThumbnailPath(packageFilename) {
   )
 }
 
-export function deletePackages(filenames) {
+/**
+ * Batch tombstone (see `markPackageMissing`). Used by the full-scan reconciler
+ * to soft-delete every DB row whose `.var` wasn't seen on disk this scan, in one
+ * transaction. Idempotent per row via the `missing_since IS NULL` guard.
+ */
+export function markPackagesMissing(filenames) {
   const tx = db.transaction((names) => {
-    const del = stmt('DELETE FROM packages WHERE filename = ?')
-    for (const f of names) del.run(f)
+    const upd = stmt('UPDATE packages SET missing_since = unixepoch() WHERE filename = ? AND missing_since IS NULL')
+    for (const f of names) upd.run(f)
   })
   tx(filenames)
+}
+
+/**
+ * Reclaim every scrap of identity-keyed memory the app retains for content that
+ * is no longer present, in one transaction:
+ *   1. hard-delete tombstoned packages (cascading their contents + label links),
+ *   2. prune orphaned content labels left behind by in-place package replacements
+ *      on packages that are themselves still present. Unlike package-level state,
+ *      these are NOT reachable by cascade — a rescan that replaces a package in
+ *      place with fewer items deletes+reinserts its `contents` (see ingest.js), but
+ *      `label_contents` keys on `packages(filename)`, not `contents.id`, so the
+ *      labels of dropped internal paths simply dangle.
+ *
+ * This is the single cleanup escape hatch (dev "Forget deleted packages" button)
+ * from what are otherwise permanent, deliberately-retained records. Ordered
+ * packages-first so a tombstoned package's own content labels are cascaded away
+ * (not counted as orphans). Returns `{ packages, contentLabels }` rows removed.
+ */
+export function forgetDeletedData() {
+  const tx = db.transaction(() => {
+    const packages = stmt('DELETE FROM packages WHERE missing_since IS NOT NULL').run().changes
+    // Labels bind to the canonical (live) path, but a disabled loose preset's
+    // contents row keeps the `.disabled` marker (`X.vap` labeled ↔ `X.vap.disabled`
+    // on disk), so match that form too (scoped to `__local__`) — otherwise a merely
+    // disabled preset's label would look orphaned and get pruned.
+    const contentLabels = stmt(
+      `DELETE FROM label_contents WHERE NOT EXISTS (
+         SELECT 1 FROM contents c
+         WHERE c.package_filename = label_contents.package_filename
+           AND (c.internal_path = label_contents.internal_path
+                OR (label_contents.package_filename = '${LOCAL_PACKAGE_FILENAME}'
+                    AND c.internal_path = label_contents.internal_path || '.disabled'))
+       )`,
+    ).run().changes
+    return { packages, contentLabels }
+  })
+  return tx()
+}
+
+/** Count of tombstoned packages — drives the dev button's label/enabled state. */
+export function countMissingPackages() {
+  return stmt('SELECT COUNT(*) AS n FROM packages WHERE missing_since IS NOT NULL').get().n
+}
+
+/** Count of orphaned content labels (present package, internal_path no longer in `contents`) that `forgetDeletedData` would prune. */
+export function countOrphanContentLabels() {
+  // Canonical-path aware, matching forgetDeletedData: a disabled loose preset's
+  // canonical label row is backed by its `.disabled` contents row.
+  return stmt(
+    `SELECT COUNT(*) AS n FROM label_contents WHERE NOT EXISTS (
+       SELECT 1 FROM contents c
+       WHERE c.package_filename = label_contents.package_filename
+         AND (c.internal_path = label_contents.internal_path
+              OR (label_contents.package_filename = '${LOCAL_PACKAGE_FILENAME}'
+                  AND c.internal_path = label_contents.internal_path || '.disabled'))
+     )`,
+  ).get().n
 }
 
 export function batchSetDirect(filenameMap) {
@@ -1161,13 +1336,32 @@ export function clearAllCorrupted() {
 
 export function upsertHubResourceDetail(resourceId, json) {
   const rid = toIntString(resourceId)
-  if (rid === null) return
+  if (rid === null) return false
+
+  // The scanner writes `_unavailable` tombstones for failed fetches purely to make
+  // hub_json non-NULL (so the row drops out of getPackagesNeedingHubDetailFetch).
+  // The extra `hub_json IS NULL` clause enforces that a stub only fills an empty
+  // slot, never overwrites real detail.
+  const isUnavailableStub = !!(json && json._unavailable)
   stmt(`INSERT INTO hub_resources (resource_id, hub_json, updated_at)
     VALUES (?, ?, unixepoch())
     ON CONFLICT(resource_id) DO UPDATE SET
       hub_json = excluded.hub_json, updated_at = excluded.updated_at
     WHERE hub_resources.hub_json IS NOT excluded.hub_json
+      ${isUnavailableStub ? 'AND hub_resources.hub_json IS NULL' : ''}
   `).run(rid, JSON.stringify(json))
+
+  // Piggyback wishlist maintenance: a real payload refreshes the durable snapshot;
+  // a stub must never reach refreshWishlistSnapshot (would clobber it). Returns
+  // whether a wishlist row changed so the caller can emit `wishlist:updated` —
+  // db stays event-free. (The stub branch is a safety net: wishlisting requires
+  // opening the detail, which caches hub_json non-NULL, so the scanner never
+  // re-stubs a wishlisted rid.)
+  try {
+    return isUnavailableStub ? markWishlistItemUnavailable(rid) : refreshWishlistSnapshot(rid, json)
+  } catch {
+    return false
+  }
 }
 
 export function upsertHubResourceSearch(resourceId, json) {
@@ -1194,6 +1388,97 @@ export function upsertHubResourceFind(resourceId, json) {
 
 export function getAllHubResourceJsons() {
   return stmt('SELECT resource_id, hub_json, search_json, find_json FROM hub_resources').all()
+}
+
+// --- Wishlist (local, durable snapshots of hub resources) ---
+//
+// This is NOT a cache: paid/removed packages can't be re-fetched from ids alone,
+// so the wishlist owns its copy of the detail-shaped resource JSON. The renderer
+// passes the fully-annotated detail object on add; `_`-prefixed annotations are
+// stripped here and recomputed at read time (see ipc/wishlist.js).
+//
+// Background mutations (refresh / unavailability stamp) return whether a row
+// changed; the hub client emits `wishlist:updated` on that so the renderer
+// re-lists — no manual refresh, and db stays event-free.
+
+/** JSON.stringify replacer dropping every `_`-prefixed key at any depth. */
+function stripUnderscoreKeys(key, value) {
+  return key.startsWith('_') ? undefined : value
+}
+
+function stringifyWishlistSnapshot(snapshot) {
+  return JSON.stringify(snapshot, stripUnderscoreKeys)
+}
+
+/** Add or replace a wishlist item, refreshing its snapshot and clearing any prior unavailability. */
+export function addWishlistItem(resourceId, snapshot, { createdAt } = {}) {
+  const rid = toIntString(resourceId)
+  if (rid === null) return
+  const created = createdAt != null ? Number(createdAt) : null
+  stmt(`INSERT INTO hub_wishlist (resource_id, snapshot_json, created_at, snapshot_at)
+    VALUES (?, ?, COALESCE(?, unixepoch()), unixepoch())
+    ON CONFLICT(resource_id) DO UPDATE SET
+      snapshot_json = excluded.snapshot_json,
+      snapshot_at = excluded.snapshot_at,
+      unavailable_at = NULL
+  `).run(rid, stringifyWishlistSnapshot(snapshot), created)
+}
+
+export function removeWishlistItem(resourceId) {
+  const rid = toIntString(resourceId)
+  if (rid === null) return
+  stmt('DELETE FROM hub_wishlist WHERE resource_id = ?').run(rid)
+}
+
+/** All wishlist rows, newest first. Snapshot JSON is returned raw for the caller to parse + annotate. */
+export function getAllWishlistItems() {
+  return stmt(
+    'SELECT resource_id, snapshot_json, created_at, unavailable_at FROM hub_wishlist ORDER BY created_at DESC',
+  ).all()
+}
+
+export function getWishlistIds() {
+  return stmt('SELECT resource_id FROM hub_wishlist')
+    .all()
+    .map((r) => r.resource_id)
+}
+
+export function isWishlisted(resourceId) {
+  const rid = toIntString(resourceId)
+  if (rid === null) return false
+  return !!stmt('SELECT 1 FROM hub_wishlist WHERE resource_id = ?').get(rid)
+}
+
+/**
+ * Refresh an existing wishlist item's snapshot (no-op if not wishlisted). Called
+ * opportunistically from `upsertHubResourceDetail` on every fresh detail payload,
+ * so a wishlisted resource that reappears also clears its unavailability flag.
+ * Returns true when a row actually changed (caller emits `wishlist:updated`).
+ */
+export function refreshWishlistSnapshot(resourceId, snapshot) {
+  const rid = toIntString(resourceId)
+  if (rid === null) return false
+  const json = stringifyWishlistSnapshot(snapshot)
+  // Only write on a real change (or when clearing unavailability) so a
+  // byte-identical detail re-open doesn't churn snapshot_at or the event.
+  const info = stmt(`UPDATE hub_wishlist
+    SET snapshot_json = ?, snapshot_at = unixepoch(), unavailable_at = NULL
+    WHERE resource_id = ? AND (snapshot_json IS NOT ? OR unavailable_at IS NOT NULL)
+  `).run(json, rid, json)
+  return info.changes > 0
+}
+
+/**
+ * Stamp a wishlisted item as gone from the Hub (no-op if not wishlisted or already
+ * stamped). Returns true when a row changed (caller emits `wishlist:updated`).
+ */
+export function markWishlistItemUnavailable(resourceId) {
+  const rid = toIntString(resourceId)
+  if (rid === null) return false
+  const info = stmt(
+    'UPDATE hub_wishlist SET unavailable_at = unixepoch() WHERE resource_id = ? AND unavailable_at IS NULL',
+  ).run(rid)
+  return info.changes > 0
 }
 
 export function upsertHubUser(userId, username, json) {
@@ -1280,53 +1565,6 @@ export function getAllLabelPackages() {
 
 export function getAllLabelContents() {
   return stmt('SELECT label_id, package_filename, internal_path FROM label_contents').all()
-}
-
-// Label sync source bits for label_content_sources.source_mask.
-// 0 means local removal is pending export to BrowserAssist.
-// 1 means the assignment is owned by Backstage UI.
-// 2 means the assignment was imported from BrowserAssist User tags.
-// 3 means both sides currently own the assignment.
-export const LABEL_SOURCE_BACKSTAGE = 1
-export const LABEL_SOURCE_BROWSERASSIST = 2
-export const LABEL_SOURCE_BOTH = LABEL_SOURCE_BACKSTAGE | LABEL_SOURCE_BROWSERASSIST
-
-function validLabelSourceMask(mask) {
-  const n = Number(mask)
-  return Number.isInteger(n) && n >= 0 ? n : 0
-}
-
-export function setLabelContentSource(labelId, packageFilename, internalPath, sourceMask, baCategory = null) {
-  const mask = validLabelSourceMask(sourceMask)
-  stmt(
-    `INSERT INTO label_content_sources (label_id, package_filename, internal_path, source_mask, ba_category)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(label_id, package_filename, internal_path) DO UPDATE SET
-       source_mask = excluded.source_mask,
-       ba_category = COALESCE(excluded.ba_category, label_content_sources.ba_category)`,
-  ).run(labelId, packageFilename, internalPath, mask, baCategory)
-  return mask
-}
-
-export function getLabelContentSource(labelId, packageFilename, internalPath) {
-  const row = stmt(
-    `SELECT source_mask FROM label_content_sources
-     WHERE label_id = ? AND package_filename = ? AND internal_path = ?`,
-  ).get(labelId, packageFilename, internalPath)
-  return row?.source_mask ?? 0
-}
-
-export function clearLabelContentSource(labelId, packageFilename, internalPath) {
-  return stmt(
-    `DELETE FROM label_content_sources
-     WHERE label_id = ? AND package_filename = ? AND internal_path = ?`,
-  ).run(labelId, packageFilename, internalPath).changes
-}
-
-export function listLabelContentSources() {
-  return stmt(
-    'SELECT label_id, package_filename, internal_path, source_mask, ba_category FROM label_content_sources',
-  ).all()
 }
 
 export function getLabelById(id) {

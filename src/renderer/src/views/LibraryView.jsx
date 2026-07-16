@@ -5,7 +5,6 @@ import {
   List,
   AlertTriangle,
   Eye,
-  EyeOff,
   Power,
   Plus,
   Trash2,
@@ -24,6 +23,7 @@ import {
   X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { HoverCard, HoverCardTrigger, HoverCardContent } from '@/components/ui/hover-card'
 import { toast } from '@/components/Toast'
 import {
   AlertDialog,
@@ -49,6 +49,8 @@ import {
   cn,
   THUMB_CHIP_BOX,
   THUMB_OVERLAY_CHIP,
+  isPromotionalLink,
+  openExternalLink,
 } from '@/lib/utils'
 import { toastIfBulkToggleFailures, toastIfSingleToggleFailed } from '@/lib/packageStorageToggleResults'
 import {
@@ -60,20 +62,21 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { LabelApplyPopover } from '@/components/labels/LabelApplyPopover'
-import { bulkStateMap } from '@/components/labels/labelApplyState'
+import { bulkStateMap } from '@/components/labels/labelHelpers'
 import { Tag } from 'lucide-react'
-import { useThumbnail } from '@/hooks/useThumbnail'
-import { useLibraryStore } from '@/stores/useLibraryStore'
+import { useThumbnail } from '@/hooks/createBlobCacheHook'
+import { useLibraryStore, FILTER_DEFAULTS } from '@/stores/useLibraryStore'
 import { useLabelsStore } from '@/stores/useLabelsStore'
 import { useContentStore } from '@/stores/useContentStore'
 import { useDownloadStore } from '@/stores/useDownloadStore'
-import FilterPanel from '@/components/FilterPanel'
+import FilterPanel, { sectionActive } from '@/components/FilterPanel'
+import { SearchOnHubButton } from '@/components/SearchOnHubButton'
 import ResizeHandle from '@/components/ResizeHandle'
 import { LibraryCard, LibraryTableRow, DepRow, AuthorAvatar, AuthorLink } from '@/components/PackageCard'
 import { LabelsRow } from '@/components/labels/LabelsRow'
 import { AddLabelButton } from '@/components/labels/AddLabelButton'
 import { StorageStateChip } from '@/components/StorageStateChip'
-import { ContentCategory } from '@/components/ContentCategory'
+import { ContentCategory, buildContentGallery } from '@/components/ContentCategory'
 import FileTreeDialog from '@/components/FileTreeDialog'
 import { openLightbox } from '@/components/ThumbnailLightbox'
 import { VirtualGrid, VirtualList } from '@/components/VirtualGrid'
@@ -81,22 +84,10 @@ import { ThumbnailSizeSlider } from '@/components/ThumbnailSizeSlider'
 import { useKeyboardNav } from '@/hooks/useKeyboardNav'
 import { usePersistedPanelWidth } from '@/hooks/usePersistedPanelWidth'
 import { useLibraryUpdateState } from '@/hooks/useLibraryUpdateState'
-import {
-  COMMERCIAL_USE_ALLOWED_LICENSE_FILTER,
-  NONCOMMERCIAL_USE_ALLOWED_LICENSE_FILTER,
-  LICENSE_FILTER_OPTIONS,
-  canonicalizeLicense,
-  isCommercialUseAllowed,
-  isNonCommercialUseAllowed,
-} from '@/lib/licenses'
-import { resolveLibraryRestoreIndex, shouldIgnoreTransientTop, shouldRestoreOnActivate } from '@/lib/view-scroll-anchor'
-import {
-  getAppCommandPageDirection,
-  getMousePageDirection,
-  scrollMousePage,
-  shouldIgnoreMousePageTarget,
-} from '@/lib/mouse-page-nav'
-import { haystacksMatchAllTerms, searchAndTerms } from '@shared/search-text.js'
+import { LICENSE_FILTER_OPTIONS } from '@/lib/licenses'
+import { matchesSmartQuery, parseSmartQuery } from '@/lib/smart-search'
+import { matchesPolarityList, matchesAuthorFilter, matchesLicenseFilter, polarityScrollKey } from '@/lib/filter-match'
+import { haystacksMatchAllTerms, packageSearchExtras, searchAndTerms } from '@/lib/search-text'
 import { isPackageActive } from '@shared/storage-state-predicates.js'
 import { LicenseTag } from '@/components/LicenseTag'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
@@ -109,60 +100,55 @@ import {
 import { packageNeedsDisableConfirmation } from '@/lib/package-disable-confirm'
 
 const SORT_OPTIONS = ['Recently installed', 'Type', 'Name', 'Size', 'Content', 'Deps', 'Morphs']
-export const LAZY_LABEL_LOADING = false
+
+function packageHubTags(p) {
+  return p.hubTags
+    ? p.hubTags
+        .toLowerCase()
+        .split(',')
+        .map((t) => t.trim())
+        .filter(Boolean)
+    : []
+}
 
 function packageMatchesSelectedTags(p, selectedTags) {
-  if (selectedTags.length === 0) return true
-  if (!p.hubTags) return false
-  const tags = p.hubTags
-    .toLowerCase()
-    .split(',')
-    .map((t) => t.trim())
-  return selectedTags.every((st) => tags.includes(st))
+  return matchesPolarityList(selectedTags, packageHubTags(p), { normalize: true })
 }
 
-function packageLabelMatchesTypes(p, id, selectedTypes) {
-  if (selectedTypes.length === 0) return true
-  if (p.labelIds?.includes(id)) return true
-  const typeSet = new Set(selectedTypes)
-  return (p.contentLabelCategories?.[id] || []).some((cat) => typeSet.has(cat))
+function packageMatchesSelectedLabels(p, selectedLabelIds) {
+  return matchesPolarityList(selectedLabelIds, p.labelIds || [])
 }
 
-function packageHasLabel(p, id, selectedTypes) {
-  return p.labelIds?.includes(id) || (p.contentLabelIds?.includes(id) && packageLabelMatchesTypes(p, id, selectedTypes))
-}
-
-function packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes = []) {
-  if (selectedLabelIds.length === 0) return true
-  for (const id of selectedLabelIds) if (!packageHasLabel(p, id, selectedTypes)) return false
-  return true
-}
-
-export function labelsForPackages(labels, items, selectedLabelIds, selectedTypes = []) {
-  const available = new Set(selectedLabelIds)
-  for (const p of items) {
-    for (const id of p.labelIds || []) available.add(id)
-    for (const id of p.contentLabelIds || []) {
-      if (packageLabelMatchesTypes(p, id, selectedTypes)) available.add(id)
-    }
-  }
-  return labels.filter((l) => available.has(l.id))
-}
-
-/** True when an update entry is on the hub but not directly downloadable (paid/external),
- *  i.e. enrichment finished and reported no `downloadUrl`. While enrichment is still in
- *  flight, callers should treat this as `false` (still checking) by passing `detailsLoading`. */
-function isUpdateUnavailable(updateInfo, detailsLoading) {
+/** True when an update entry has been definitively marked as not directly
+ *  downloadable — paid/external, or hub couldn't be reached and enrichment
+ *  marked it null as the fallback state. `downloadUrl === undefined` means
+ *  enrichment hasn't completed yet and is treated as "checking" by the UI
+ *  (separate state, not unavailable). */
+function isUpdateUnavailable(updateInfo) {
   if (!updateInfo || updateInfo.localNewerFilename) return false
-  if (detailsLoading) return false
   return updateInfo.downloadUrl === null
+}
+
+/** True when the update entry hasn't been enriched yet — only happens on the
+ *  first check before findPackages returns, since later checks merge prior
+ *  enrichment forward. */
+function isUpdateChecking(updateInfo) {
+  if (!updateInfo || updateInfo.localNewerFilename) return false
+  return updateInfo.downloadUrl === undefined
+}
+
+/** A package counts as "broken" when it's corrupted, has missing deps, or — while
+ *  active — has dependencies that are installed but disabled/offloaded (VaM won't
+ *  load them). Inactive packages aren't flagged: their inactive deps are expected. */
+function isBrokenPackage(p) {
+  return p.missingDeps > 0 || p.isCorrupted || (p.inactiveDeps > 0 && isPackageActive(p.storageState))
 }
 
 function filterPackagesByStatus(items, statusFilter, updateCheckResults) {
   if (statusFilter === 'missing') return []
   if (statusFilter === 'direct') return items.filter((p) => p.isDirect)
   if (statusFilter === 'dependency') return items.filter((p) => !p.isDirect)
-  if (statusFilter === 'broken') return items.filter((p) => p.missingDeps > 0 || p.isCorrupted)
+  if (statusFilter === 'broken') return items.filter(isBrokenPackage)
   if (statusFilter === 'orphan') return items.filter((p) => p.isOrphan)
   if (statusFilter === 'updates') return items.filter((p) => updateCheckResults?.[p.filename])
   if (statusFilter === 'local') return items.filter((p) => p.isLocalOnly)
@@ -184,23 +170,15 @@ function filterPackagesByEnabledStorage(items, enabledFilter) {
   return items.filter((p) => p.storageState === enabledFilter)
 }
 
-function filterPackagesByVisibility(items, visibilityFilter) {
-  if (visibilityFilter === 'hidden') return items.filter((p) => p.hidden)
-  if (visibilityFilter === 'all') return items
-  return items.filter((p) => !p.hidden)
-}
-
-export default function LibraryView({ onNavigate, navContext, active = true }) {
+export default function LibraryView({ onNavigate, navContext }) {
   const {
     packages,
     selectedDetail,
-    pendingRestoreFilename,
-    scrollAnchorFilename,
     search,
     authorSearch,
+    excludedAuthors,
     statusFilter,
     enabledFilter,
-    visibilityFilter,
     selectedTypes,
     selectedTags,
     selectedLabelIds,
@@ -216,14 +194,13 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     updateCheckResults,
     updateCheckLoading,
     updateCheckLastChecked,
-    updateDetailsLoading,
     backendCounts,
     packagesLoaded,
     setSearch,
     setAuthorSearch,
+    setExcludedAuthors,
     setStatusFilter,
     setEnabledFilter,
-    setVisibilityFilter,
     toggleType,
     selectSingleType,
     setSelectedTags,
@@ -231,6 +208,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     setPrimarySort,
     setSecondarySort,
     setLicense,
+    resetFilters,
     setViewMode,
     setCardWidth,
     setCompactCards,
@@ -238,9 +216,6 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     fetchMissingDeps,
     refreshUpdateCheck,
     selectPackage,
-    clearSelection,
-    consumePendingRestoreFilename,
-    setScrollAnchorFilename,
     bulkSelectedFilenames,
     toggleBulkSelect,
     rangeBulkSelect,
@@ -248,22 +223,17 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     clearBulkSelection,
   } = useLibraryStore()
   const labels = useLabelsStore((s) => s.labels)
+  const labelNameById = useMemo(() => {
+    const m = new Map()
+    for (const l of labels) m.set(l.id, l.name)
+    return m
+  }, [labels])
 
   const [gridLayout, setGridLayout] = useState({ cols: 1, availableWidth: 0 })
   const [tagCounts, setTagCounts] = useState({})
   const [authorCounts, setAuthorCounts] = useState({})
-  const [restoreScrollKey, setRestoreScrollKey] = useState(() =>
-    scrollAnchorFilename
-      ? `anchor:${scrollAnchorFilename}`
-      : pendingRestoreFilename
-        ? `selected:${pendingRestoreFilename}`
-        : '',
-  )
   const [detailPanelWidth] = usePersistedPanelWidth('panel_width_detail', { min: 260, max: 500, defaultWidth: 340 })
   const selectingRef = useRef(false)
-  const wasActiveRef = useRef(active)
-  const restoreNonceRef = useRef(0)
-  const ignoreTransientTopRef = useRef(false)
 
   useEffect(() => {
     const getLibraryStore = () => useLibraryStore.getState()
@@ -305,7 +275,6 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
   }, [])
 
   useEffect(() => {
-    if (!active) return
     const ctx = navContext?.current
     if (!ctx) return
     if (ctx.selectPackage) {
@@ -315,47 +284,44 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
       })
     }
     navContext.current = null
-  }, [active, navContext, selectPackage])
+  }, [navContext, selectPackage])
 
   // Lazy-load missing deps data + hub availability when missing filter activates (cached)
   useEffect(() => {
-    if (!active) return
     if (statusFilter !== 'missing') return
     const store = useLibraryStore.getState()
     if (!store.missingDeps && !store.missingDepsLoading) store.fetchMissingDeps()
-  }, [active, statusFilter])
+  }, [statusFilter])
 
   const baseFiltered = useMemo(() => {
     let result = packages
     if (search?.trim()) {
-      const terms = searchAndTerms(search)
-      result = result.filter((p) => haystacksMatchAllTerms([p.title, p.packageName, p.filename], terms))
+      const { tokens } = parseSmartQuery(search)
+      result = result.filter((p) =>
+        matchesSmartQuery(tokens, {
+          text: () => [p.title, p.packageName, p.filename, ...packageSearchExtras(p)],
+          author: () => p.creator || '',
+          tags: () => packageHubTags(p),
+          labels: () => (p.labelIds || []).map((id) => labelNameById.get(id)).filter(Boolean),
+        }),
+      )
     }
-    if (authorSearch) {
-      const aq = authorSearch.toLowerCase()
-      result = result.filter((p) => (p.creator || '').toLowerCase().includes(aq))
+    if (authorSearch || excludedAuthors.length > 0) {
+      result = result.filter((p) => matchesAuthorFilter(p.creator, authorSearch, excludedAuthors))
     }
     if (license !== 'Any') {
-      if (license === COMMERCIAL_USE_ALLOWED_LICENSE_FILTER) {
-        result = result.filter((p) => isCommercialUseAllowed(p.license) === true)
-      } else if (license === NONCOMMERCIAL_USE_ALLOWED_LICENSE_FILTER) {
-        result = result.filter((p) => isNonCommercialUseAllowed(p.license) === true)
-      } else {
-        const want = canonicalizeLicense(license)
-        result = result.filter((p) => canonicalizeLicense(p.license) === want)
-      }
+      result = result.filter((p) => matchesLicenseFilter(p.license, license))
     }
     return result
-  }, [packages, search, authorSearch, license])
+  }, [packages, search, authorSearch, excludedAuthors, license, labelNameById])
 
   const statusCounts = useMemo(() => {
     if (!packagesLoaded) return { direct: '…', dependency: '…', broken: '…', orphan: '…', local: '…' }
     let items = baseFiltered
-    items = filterPackagesByVisibility(items, visibilityFilter)
     items = filterPackagesBySelectedTypes(items, selectedTypes)
     items = filterPackagesByEnabledStorage(items, enabledFilter)
     items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
-    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes))
+    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds))
     let direct = 0,
       dependency = 0,
       broken = 0,
@@ -364,21 +330,20 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     for (const p of items) {
       if (p.isDirect) direct++
       else dependency++
-      if (p.missingDeps > 0 || p.isCorrupted) broken++
+      if (isBrokenPackage(p)) broken++
       if (!p.isDirect && p.isOrphan) orphan++
       if (p.isLocalOnly) local++
     }
     return { direct, dependency, broken, orphan, local }
-  }, [packagesLoaded, baseFiltered, visibilityFilter, selectedTypes, enabledFilter, selectedTags, selectedLabelIds])
+  }, [packagesLoaded, baseFiltered, selectedTypes, enabledFilter, selectedTags, selectedLabelIds])
 
   const updateFacetCount = useMemo(() => {
     if (!updateCheckResults) return updateCheckLoading ? '…' : '?'
     let items = baseFiltered
-    items = filterPackagesByVisibility(items, visibilityFilter)
     items = filterPackagesBySelectedTypes(items, selectedTypes)
     items = filterPackagesByEnabledStorage(items, enabledFilter)
     items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
-    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes))
+    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds))
     let n = 0
     for (const p of items) {
       if (updateCheckResults[p.filename]) n++
@@ -386,7 +351,6 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     return n
   }, [
     baseFiltered,
-    visibilityFilter,
     selectedTypes,
     enabledFilter,
     selectedTags,
@@ -397,34 +361,23 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
 
   const typeCounts = useMemo(() => {
     let items = filterPackagesByStatus(baseFiltered, statusFilter, updateCheckResults)
-    items = filterPackagesByVisibility(items, visibilityFilter)
     items = filterPackagesByEnabledStorage(items, enabledFilter)
     items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
-    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes))
+    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds))
     const counts = { _total: items.length }
     for (const p of items) {
       const label = libraryTypeBadgeLabel(p.type)
       counts[label] = (counts[label] || 0) + 1
     }
     return counts
-  }, [
-    baseFiltered,
-    statusFilter,
-    visibilityFilter,
-    enabledFilter,
-    selectedTypes,
-    selectedTags,
-    selectedLabelIds,
-    updateCheckResults,
-  ])
+  }, [baseFiltered, statusFilter, enabledFilter, selectedTags, selectedLabelIds, updateCheckResults])
 
   /** Facet counts for Enabled filter: respects status/type/tags/labels but not enabled itself */
   const enabledFilterCounts = useMemo(() => {
     let items = filterPackagesByStatus(baseFiltered, statusFilter, updateCheckResults)
-    items = filterPackagesByVisibility(items, visibilityFilter)
     items = filterPackagesBySelectedTypes(items, selectedTypes)
     items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
-    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes))
+    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds))
     let enabled = 0,
       disabled = 0,
       offloaded = 0
@@ -434,49 +387,17 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
       else if (p.storageState === 'enabled') enabled++
     }
     return { all: items.length, enabled, disabled, offloaded }
-  }, [baseFiltered, statusFilter, visibilityFilter, selectedTypes, selectedTags, selectedLabelIds, updateCheckResults])
-
-  const visibilityCounts = useMemo(() => {
-    let items = filterPackagesByStatus(baseFiltered, statusFilter, updateCheckResults)
-    items = filterPackagesByEnabledStorage(items, enabledFilter)
-    items = filterPackagesBySelectedTypes(items, selectedTypes)
-    items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
-    items = items.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes))
-    let hidden = 0
-    for (const p of items) {
-      if (p.hidden) hidden++
-    }
-    return { all: items.length, visible: items.length - hidden, hidden }
-  }, [baseFiltered, statusFilter, enabledFilter, selectedTypes, selectedTags, selectedLabelIds, updateCheckResults])
-
-  const visibleLabels = useMemo(() => {
-    let items = filterPackagesByStatus(baseFiltered, statusFilter, updateCheckResults)
-    items = filterPackagesByVisibility(items, visibilityFilter)
-    items = filterPackagesByEnabledStorage(items, enabledFilter)
-    items = filterPackagesBySelectedTypes(items, selectedTypes)
-    items = items.filter((p) => packageMatchesSelectedTags(p, selectedTags))
-    return labelsForPackages(labels, items, selectedLabelIds, selectedTypes)
-  }, [
-    baseFiltered,
-    statusFilter,
-    visibilityFilter,
-    updateCheckResults,
-    enabledFilter,
-    selectedTypes,
-    selectedTags,
-    labels,
-    selectedLabelIds,
-  ])
+  }, [baseFiltered, statusFilter, selectedTypes, selectedTags, selectedLabelIds, updateCheckResults])
 
   const filtered = useMemo(() => {
     let result = filterPackagesByStatus(baseFiltered, statusFilter, updateCheckResults)
-    result = filterPackagesByVisibility(result, visibilityFilter)
     result = filterPackagesByEnabledStorage(result, enabledFilter)
     result = filterPackagesBySelectedTypes(result, selectedTypes)
     result = result.filter((p) => packageMatchesSelectedTags(p, selectedTags))
-    result = result.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds, selectedTypes))
+    result = result.filter((p) => packageMatchesSelectedLabels(p, selectedLabelIds))
     const sortFns = {
-      'Recently installed': (a, b) => (b.firstSeenAt || 0) - (a.firstSeenAt || 0),
+      'Recently installed': (a, b) =>
+        (b.firstSeenAt || 0) - (a.firstSeenAt || 0) || (b.fileMtime || 0) - (a.fileMtime || 0),
       Name: (a, b) => displayName(a).localeCompare(displayName(b)),
       Type: (a, b) => compareLibraryPackageTypes(a.type, b.type),
       Size: (a, b) => b.sizeBytes + (b.removableSize || 0) - (a.sizeBytes + (a.removableSize || 0)),
@@ -491,7 +412,6 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
   }, [
     baseFiltered,
     statusFilter,
-    visibilityFilter,
     enabledFilter,
     selectedTypes,
     selectedTags,
@@ -508,6 +428,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
         label: 'Status',
         type: 'list',
         value: statusFilter,
+        // Omit `default` so Status never highlights or counts toward Reset (like sort).
         onChange: setStatusFilter,
         listCollapsible: false,
         items: [
@@ -547,23 +468,11 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
         ],
       },
       {
-        key: 'visibility',
-        label: 'Visibility',
-        type: 'list',
-        value: visibilityFilter,
-        onChange: setVisibilityFilter,
-        listCollapsible: false,
-        items: [
-          { value: 'visible', label: 'Visible', count: visibilityCounts.visible },
-          { value: 'hidden', label: 'Hidden', count: visibilityCounts.hidden },
-          { value: 'all', label: 'All', count: visibilityCounts.all },
-        ],
-      },
-      {
         key: 'type',
         label: 'Type',
         type: 'tags',
         value: new Set(selectedTypes),
+        default: FILTER_DEFAULTS.selectedTypes,
         onChange: selectSingleType,
         onToggle: toggleType,
         items: [
@@ -590,6 +499,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
         label: 'Enabled',
         type: 'list',
         value: enabledFilter,
+        default: FILTER_DEFAULTS.enabledFilter,
         onChange: setEnabledFilter,
         listCollapsible: false,
         items: [
@@ -599,16 +509,18 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
           { value: 'offloaded', label: 'Offloaded', count: enabledFilterCounts.offloaded },
         ],
       },
-      ...(visibleLabels.length
+      ...(labels.length
         ? [
             {
               key: 'labels',
               label: 'Labels',
               type: 'labels-autocomplete',
               value: selectedLabelIds,
+              default: FILTER_DEFAULTS.selectedLabelIds,
               onChange: setSelectedLabelIds,
-              labels: visibleLabels,
+              labels,
               placeholder: 'Filter by label…',
+              allowNegate: true,
             },
           ]
         : []),
@@ -617,24 +529,31 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
         label: 'Tags',
         type: 'tags-autocomplete',
         value: selectedTags,
+        default: FILTER_DEFAULTS.selectedTags,
         onChange: setSelectedTags,
         suggestions: tagCounts,
         placeholder: 'Filter by tags…',
+        allowNegate: true,
       },
       {
         key: 'author',
         label: 'Author',
         type: 'text-autocomplete',
         value: authorSearch,
+        default: FILTER_DEFAULTS.authorSearch,
         onChange: setAuthorSearch,
+        excluded: excludedAuthors,
+        onExcludedChange: setExcludedAuthors,
         suggestions: authorCounts,
         placeholder: 'Filter by author…',
+        titleAction: authorSearch ? <SearchOnHubButton author={authorSearch} onNavigate={onNavigate} /> : null,
       },
       {
         key: 'license',
         label: 'License',
         type: 'select',
         value: license,
+        default: FILTER_DEFAULTS.license,
         onChange: setLicense,
         options: LICENSE_FILTER_OPTIONS,
       },
@@ -658,18 +577,17 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     [
       statusFilter,
       enabledFilter,
-      visibilityFilter,
       selectedTypes,
       typeCounts,
       statusCounts,
       enabledFilterCounts,
-      visibilityCounts,
       backendCounts,
       updateFacetCount,
       authorSearch,
+      excludedAuthors,
       selectedTags,
       selectedLabelIds,
-      visibleLabels,
+      labels,
       tagCounts,
       authorCounts,
       license,
@@ -678,54 +596,33 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
       updateCheckLoading,
       updateCheckResults,
       setStatusFilter,
-      setVisibilityFilter,
       toggleType,
       selectSingleType,
       setEnabledFilter,
       setAuthorSearch,
+      setExcludedAuthors,
       setSelectedTags,
       setSelectedLabelIds,
       setLicense,
       setPrimarySort,
       setSecondarySort,
+      onNavigate,
     ],
   )
+
+  const activeFilterCount = sections.filter((s) => sectionActive(s) === true).length
 
   const orderedLibraryFilenames = useMemo(() => filtered.map((p) => p.filename), [filtered])
   const bulkActive = bulkSelectedFilenames.length > 0
   const bulkToggleIntent = useLibraryStore((s) => s.bulkToggleIntent)
   const selectedBulkSet = useMemo(() => new Set(bulkSelectedFilenames), [bulkSelectedFilenames])
 
-  const scrollResetKey = `${search}\0${authorSearch}\0${statusFilter}\0${enabledFilter}\0${visibilityFilter}\0${selectedTypes.join(',')}\0${selectedTags.join(',')}\0${selectedLabelIds.join(',')}\0${primarySort}\0${secondarySort}\0${license}`
+  const scrollResetKey = `${search}\0${authorSearch}\0${excludedAuthors.join(',')}\0${statusFilter}\0${enabledFilter}\0${selectedTypes.join(',')}\0${polarityScrollKey(selectedTags)}\0${polarityScrollKey(selectedLabelIds)}\0${primarySort}\0${secondarySort}\0${license}`
 
   const lastSelectedIdxRef = useRef(0)
   const prevScrollResetKeyRef = useRef(scrollResetKey)
   const selectedIdx = selectedDetail ? filtered.findIndex((p) => p.filename === selectedDetail.filename) : -1
-  const restoreIdx = resolveLibraryRestoreIndex(filtered, scrollAnchorFilename, selectedDetail?.filename)
   if (selectedIdx >= 0) lastSelectedIdxRef.current = selectedIdx
-  if (shouldRestoreOnActivate(wasActiveRef.current, active, scrollAnchorFilename)) {
-    ignoreTransientTopRef.current = true
-  }
-
-  useLayoutEffect(() => {
-    const wasActive = wasActiveRef.current
-    wasActiveRef.current = active
-    if (!shouldRestoreOnActivate(wasActive, active, scrollAnchorFilename)) return
-    ignoreTransientTopRef.current = true
-    restoreNonceRef.current += 1
-    setRestoreScrollKey(`anchor:${scrollAnchorFilename}:${restoreNonceRef.current}`)
-  }, [active, scrollAnchorFilename, restoreIdx])
-
-  const handleFirstVisibleIndexChange = useCallback(
-    (index) => {
-      if (!active) return
-      if (shouldIgnoreTransientTop(ignoreTransientTopRef.current, index, restoreIdx)) return
-      ignoreTransientTopRef.current = false
-      const pkg = filtered[index]
-      if (pkg) setScrollAnchorFilename(pkg.filename)
-    },
-    [active, filtered, restoreIdx, setScrollAnchorFilename],
-  )
 
   const runSelectPackage = useCallback(
     (filename) => {
@@ -739,25 +636,6 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
   )
 
   useEffect(() => {
-    if (!active || !packagesLoaded || !pendingRestoreFilename || filtered.length === 0) return
-    const target = filtered.find((p) => p.filename === pendingRestoreFilename)
-    consumePendingRestoreFilename()
-    if (!target) return
-    if (!scrollAnchorFilename) setRestoreScrollKey(`selected:${target.filename}`)
-    void runSelectPackage(target.filename)
-  }, [
-    active,
-    packagesLoaded,
-    pendingRestoreFilename,
-    filtered,
-    scrollAnchorFilename,
-    consumePendingRestoreFilename,
-    runSelectPackage,
-  ])
-
-  useEffect(() => {
-    if (!active) return
-    if (pendingRestoreFilename) return
     if (bulkActive || statusFilter === 'missing' || filtered.length === 0) {
       prevScrollResetKeyRef.current = scrollResetKey
       return
@@ -775,16 +653,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     const target = filtered[idx]
     if (!target) return
     void runSelectPackage(target.filename)
-  }, [
-    active,
-    pendingRestoreFilename,
-    bulkActive,
-    filtered,
-    selectedDetail,
-    statusFilter,
-    scrollResetKey,
-    runSelectPackage,
-  ])
+  }, [bulkActive, filtered, selectedDetail, statusFilter, scrollResetKey, runSelectPackage])
 
   const handleLibraryClick = useCallback(
     (pkg, e) => {
@@ -823,18 +692,6 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     },
     [toggleBulkSelect],
   )
-
-  const handlePackageHiddenToggle = useCallback(async (pkg) => {
-    if (pkg.hidden && !pkg.hiddenDirect) {
-      toast(`Package is hidden by BrowserAssist ${pkg.hiddenReason === 'creator' ? 'creator' : 'tag'} rule`)
-      return
-    }
-    try {
-      await useLibraryStore.getState().setPackageHidden(pkg.filename, !pkg.hiddenDirect)
-    } catch (err) {
-      toast(`Failed to toggle hidden: ${err.message}`)
-    }
-  }, [])
 
   const bulkEnabledState = useMemo(() => {
     const items = filtered.filter((p) => bulkSelectedFilenames.includes(p.filename))
@@ -976,55 +833,17 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
   )
 
   useKeyboardNav({
-    items: !active || bulkActive ? [] : filtered,
+    items: bulkActive ? [] : filtered,
     selectedId: selectedDetail?.filename,
     onSelect: handleKeyboardSelectLibrary,
     onClose: () => {
       if (bulkActive) clearBulkSelection()
     },
     getId: (p) => p.filename,
+    columnCount: viewMode !== 'table' ? gridLayout.cols : 1,
   })
 
-  const pageNavRootRef = useRef(null)
-  const handlePageDirection = useCallback(
-    (direction, target, root) => {
-      if (direction < 0 && selectedDetail && !bulkActive) {
-        clearSelection()
-        return
-      }
-
-      if (target && shouldIgnoreMousePageTarget(target)) return
-      scrollMousePage(target || root, root, direction)
-    },
-    [bulkActive, clearSelection, selectedDetail],
-  )
-
-  const handleMousePageButton = useCallback(
-    (e) => {
-      const direction = getMousePageDirection(e.button)
-      if (!direction) return
-      e.preventDefault()
-      e.stopPropagation()
-      handlePageDirection(direction, e.target, e.currentTarget)
-    },
-    [handlePageDirection],
-  )
-
-  const handleAppCommand = useCallback(
-    (command) => {
-      const direction = getAppCommandPageDirection(command)
-      if (direction) handlePageDirection(direction, pageNavRootRef.current, pageNavRootRef.current)
-    },
-    [handlePageDirection],
-  )
-
   useEffect(() => {
-    if (!active) return undefined
-    return window.api.on('app-command', handleAppCommand)
-  }, [active, handleAppCommand])
-
-  useEffect(() => {
-    if (!active) return
     function onKeyDown(e) {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return
       if ((e.metaKey || e.ctrlKey) && e.key === 'a') {
@@ -1034,10 +853,9 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [active, orderedLibraryFilenames, selectAllBulk])
+  }, [orderedLibraryFilenames, selectAllBulk])
 
   useEffect(() => {
-    if (!active) return
     if (!bulkActive) return
     function onSpace(e) {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return
@@ -1049,7 +867,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
     }
     window.addEventListener('keydown', onSpace, true)
     return () => window.removeEventListener('keydown', onSpace, true)
-  }, [active, bulkActive])
+  }, [bulkActive])
 
   const libraryTableSelectAllRef = useRef(null)
   useLayoutEffect(() => {
@@ -1059,8 +877,13 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
   }, [bulkSelectedFilenames, filtered.length])
 
   return (
-    <div ref={pageNavRootRef} className="h-full flex" onMouseUp={handleMousePageButton}>
-      <FilterPanel search={search} onSearchChange={setSearch} sections={sections} />
+    <div className="h-full flex">
+      <FilterPanel
+        search={search}
+        onSearchChange={setSearch}
+        smartSearch={{ authors: authorCounts, tags: tagCounts, labels }}
+        sections={sections}
+      />
 
       <div className="flex-1 flex flex-col min-w-0">
         {/* Toolbar */}
@@ -1204,7 +1027,6 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
               updateCheckResults={updateCheckResults}
               updateCheckLoading={updateCheckLoading}
               updateCheckLastChecked={updateCheckLastChecked}
-              updateDetailsLoading={updateDetailsLoading}
               missingDeps={missingDeps}
               missingDepsLoading={missingDepsLoading}
               hubDetailsLoading={hubDetailsLoading}
@@ -1218,6 +1040,26 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
                   ? `${updateCheckLoading ? '…' : '?'} packages`
                   : `${filtered.length} packages`}
             </span>
+            {activeFilterCount > 0 && (
+              <span className="shrink-0 flex items-center gap-1.5 whitespace-nowrap text-[11px] text-text-tertiary">
+                <span aria-hidden="true">·</span>
+                <span>
+                  {activeFilterCount} {activeFilterCount === 1 ? 'filter' : 'filters'}
+                </span>
+                <span>
+                  (
+                  <button
+                    type="button"
+                    onClick={() => resetFilters()}
+                    title="Reset all filters to their defaults"
+                    className="text-text-tertiary hover:text-text-secondary transition-colors cursor-pointer"
+                  >
+                    Reset
+                  </button>
+                  )
+                </span>
+              </span>
+            )}
             <div className="flex-1 min-w-0" />
             {statusFilter !== 'missing' && (
               <div className="flex shrink-0 flex-nowrap items-center gap-2">
@@ -1281,16 +1123,12 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
             fixedHeight={compactCards ? 0 : 84}
             className="flex-1"
             scrollResetKey={scrollResetKey}
-            restoreIndex={restoreIdx}
-            restoreKey={restoreScrollKey}
+            selectedIndex={selectedIdx}
             onLayout={setGridLayout}
-            onFirstVisibleIndexChange={handleFirstVisibleIndexChange}
             onEmptyAreaPointerDown={bulkActive ? () => clearBulkSelection() : undefined}
-            showBackToTop
             renderItem={(pkg) => {
               const updateInfo = updateCheckResults?.[pkg.filename]
-              const dimUpdateUnavailable =
-                statusFilter === 'updates' && isUpdateUnavailable(updateInfo, updateDetailsLoading)
+              const dimUpdateUnavailable = statusFilter === 'updates' && isUpdateUnavailable(updateInfo)
               return (
                 <LibraryPackageContextMenu key={pkg.filename} pkg={pkg} updateInfo={updateInfo} onNavigate={onNavigate}>
                   <LibraryCard
@@ -1300,7 +1138,6 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
                     bulkMode={bulkActive}
                     bulkSelected={selectedBulkSet.has(pkg.filename)}
                     onFilterAuthor={handleFilterAuthor}
-                    onToggleHidden={handlePackageHiddenToggle}
                     mode={compactCards ? 'minimal' : 'medium'}
                     hideType={selectedTypes.length === 1}
                     dimmed={dimUpdateUnavailable}
@@ -1311,7 +1148,7 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
           />
         ) : (
           <div className="flex-1 flex flex-col overflow-hidden p-4">
-            <div className="border border-border rounded-lg overflow-hidden flex flex-col min-h-0">
+            <div className="border border-border rounded-lg overflow-hidden flex flex-col flex-1 min-h-0">
               <div className="bg-elevated text-[10px] uppercase tracking-wider text-text-tertiary flex border-b border-border shrink-0">
                 {bulkActive && (
                   <div className="w-8 shrink-0 flex items-center justify-center border-r border-border/50 py-2">
@@ -1341,14 +1178,9 @@ export default function LibraryView({ onNavigate, navContext, active = true }) {
                 rowHeight={37}
                 className="flex-1"
                 scrollResetKey={scrollResetKey}
-                restoreIndex={restoreIdx}
-                restoreKey={restoreScrollKey}
-                onFirstVisibleIndexChange={handleFirstVisibleIndexChange}
-                showBackToTop
                 renderRow={(pkg) => {
                   const updateInfo = updateCheckResults?.[pkg.filename]
-                  const dimUpdateUnavailable =
-                    statusFilter === 'updates' && isUpdateUnavailable(updateInfo, updateDetailsLoading)
+                  const dimUpdateUnavailable = statusFilter === 'updates' && isUpdateUnavailable(updateInfo)
                   return (
                     <LibraryPackageContextMenu
                       key={pkg.filename}
@@ -1439,7 +1271,6 @@ function ToolbarActions({
   updateCheckResults,
   updateCheckLoading,
   updateCheckLastChecked,
-  updateDetailsLoading,
   missingDeps,
   missingDepsLoading,
   hubDetailsLoading,
@@ -1481,7 +1312,7 @@ function ToolbarActions({
     let pausedFlag = false
     for (const update of Object.values(updateCheckResults)) {
       if (update.localNewerFilename) continue
-      if (isUpdateUnavailable(update, updateDetailsLoading)) continue
+      if (isUpdateUnavailable(update)) continue
       if (!update.hubResourceId && !update.packageName) continue
       try {
         const r = await store.install(update.hubResourceId, null, true, update.packageName, !!update.isDepUpdate)
@@ -1580,9 +1411,7 @@ function ToolbarActions({
   if (statusFilter === 'updates') {
     const downloadableCount =
       updateCheckResults != null
-        ? Object.values(updateCheckResults).filter(
-            (u) => !u.localNewerFilename && !isUpdateUnavailable(u, updateDetailsLoading),
-          ).length
+        ? Object.values(updateCheckResults).filter((u) => !u.localNewerFilename && !isUpdateUnavailable(u)).length
         : null
     return (
       <>
@@ -1630,7 +1459,7 @@ function MissingDepsTable({ data, loading, hubDetailsLoading, scrollResetKey, on
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden p-4">
-      <div className="border border-border rounded-lg overflow-hidden flex flex-col min-h-0">
+      <div className="border border-border rounded-lg overflow-hidden flex flex-col flex-1 min-h-0">
         <div className="bg-elevated text-[10px] uppercase tracking-wider text-text-tertiary flex border-b border-border shrink-0">
           <div className="flex-3 py-2 px-3 font-medium">Package</div>
           <div className="w-32 shrink-0 py-2 px-3 font-medium">Version</div>
@@ -1644,7 +1473,6 @@ function MissingDepsTable({ data, loading, hubDetailsLoading, scrollResetKey, on
           rowHeight={37}
           className="flex-1"
           scrollResetKey={scrollResetKey}
-          showBackToTop
           renderRow={(item) => (
             <MissingDepRow
               key={item.ref}
@@ -1891,7 +1719,7 @@ function LibraryPackageTypeBadgeMenu({ pkg, kindLabel, kindIsCore }) {
 function UpdateActions({ pkg, updateInfo }) {
   const [promoting, setPromoting] = useState(false)
   const updateState = useLibraryUpdateState(pkg, updateInfo)
-  const updateDetailsLoading = useLibraryStore((s) => s.updateDetailsLoading)
+  const checking = isUpdateChecking(updateInfo)
 
   const handlePromote = async () => {
     if (promoting) return
@@ -1942,7 +1770,7 @@ function UpdateActions({ pkg, updateInfo }) {
     )
   }
 
-  if (isUpdateUnavailable(updateInfo, updateDetailsLoading)) {
+  if (isUpdateUnavailable(updateInfo)) {
     return (
       <div className="rounded border border-border bg-elevated/40 px-2.5 py-2">
         <div className="flex items-center gap-1.5 text-[11px] font-medium text-text-secondary">
@@ -1962,10 +1790,14 @@ function UpdateActions({ pkg, updateInfo }) {
       variant="gradient"
       size="sm"
       onClick={() => useDownloadStore.getState().installUpdate(pkg, updateInfo)}
-      disabled={busy || (!updateInfo.hubResourceId && !updateInfo.packageName)}
+      disabled={busy || checking || (!updateInfo.hubResourceId && !updateInfo.packageName)}
       className="w-full text-[11px]"
     >
-      {updateState.state === 'pending' ? (
+      {checking ? (
+        <>
+          <Loader2 size={11} className="animate-spin" /> Checking v{updateInfo.hubVersion}…
+        </>
+      ) : updateState.state === 'pending' ? (
         <>
           <Loader2 size={11} className="animate-spin" /> Queuing…
         </>
@@ -2009,6 +1841,17 @@ function LibraryDetailPanel({ pkg, onNavigate, onFilterAuthor, updateInfo }) {
     if (!grouped[c.category]) grouped[c.category] = []
     grouped[c.category].push(c)
   })
+  // Flat, display-ordered gallery so arrow keys step through every content
+  // thumbnail in the section (across categories) once the lightbox is open.
+  const contentGallery = useMemo(() => {
+    const g = {}
+    ;(pkg.contents || []).forEach((c) => {
+      if (!g[c.category]) g[c.category] = []
+      g[c.category].push(c)
+    })
+    const types = Object.keys(g).sort(compareContentTypes)
+    return buildContentGallery(types.flatMap((t) => g[t]))
+  }, [pkg.contents])
 
   const hasDependents = pkg.dependents?.length > 0
   const suppressDisablePackageWarning = useLibraryStore((s) => s.suppressDisablePackageWarning)
@@ -2054,15 +1897,12 @@ function LibraryDetailPanel({ pkg, onNavigate, onFilterAuthor, updateInfo }) {
       toast(`Failed to toggle package: ${err.message}`)
     }
   }
-  const handleToggleHidden = async () => {
-    if (pkg.hidden && !pkg.hiddenDirect) {
-      toast(`Package is hidden by BrowserAssist ${pkg.hiddenReason === 'creator' ? 'creator' : 'tag'} rule`)
-      return
-    }
+  const handleEnableInactiveDeps = async () => {
     try {
-      await useLibraryStore.getState().setPackageHidden(pkg.filename, !pkg.hiddenDirect)
+      const res = await window.api.packages.enableDeps(pkg.filename)
+      if (res?.count > 0) toast(`Enabled ${res.count} dependenc${res.count === 1 ? 'y' : 'ies'}`, 'success')
     } catch (err) {
-      toast(`Failed to toggle hidden: ${err.message}`)
+      toast(`Failed to enable dependencies: ${err.message}`)
     }
   }
   const handlePromote = async () => {
@@ -2123,17 +1963,15 @@ function LibraryDetailPanel({ pkg, onNavigate, onFilterAuthor, updateInfo }) {
                 <span className="text-[11px] text-text-secondary">
                   by <AuthorLink author={pkg.creator} onFilterAuthor={onFilterAuthor} />
                 </span>
-                {pkg.promotionalLink && (
-                  <a
+                {isPromotionalLink(pkg.promotionalLink) && (
+                  <button
+                    type="button"
                     title={pkg.promotionalLink}
-                    onClick={(e) => {
-                      e.preventDefault()
-                      void window.api.shell.openExternal(pkg.promotionalLink)
-                    }}
-                    className="flex items-center gap-1 text-[10px] text-accent-blue hover:brightness-125 transition-[filter] cursor-pointer ml-1"
+                    onClick={() => void openExternalLink(pkg.promotionalLink)}
+                    className="flex items-center gap-1 text-[10px] text-accent-blue hover:brightness-125 transition-[filter] cursor-pointer ml-1 shrink-0"
                   >
                     <Heart size={9} /> Support
-                  </a>
+                  </button>
                 )}
               </div>
               <div className="flex items-center gap-1 mt-1 flex-wrap">
@@ -2221,16 +2059,6 @@ function LibraryDetailPanel({ pkg, onNavigate, onFilterAuthor, updateInfo }) {
                 <Compass size={12} /> View on Hub
               </Button>
             )}
-            <Button variant="outline" onClick={handleToggleHidden} className="w-full text-[11px]">
-              {pkg.hiddenDirect ? <Eye size={12} /> : <EyeOff size={12} />}
-              {pkg.hidden && !pkg.hiddenDirect
-                ? pkg.hiddenReason === 'creator'
-                  ? 'Hidden by creator'
-                  : 'Hidden by tag'
-                : pkg.hiddenDirect
-                  ? 'Unhide'
-                  : 'Hide'}
-            </Button>
             {pkg.isDirect ? (
               <div>
                 <div className="flex gap-1.5">
@@ -2386,7 +2214,9 @@ function LibraryDetailPanel({ pkg, onNavigate, onFilterAuthor, updateInfo }) {
               items={pkg.deps}
               depCount={pkg.depCount}
               missingDeps={pkg.missingDeps}
+              inactiveDeps={isPackageActive(pkg.storageState) ? pkg.inactiveDeps : 0}
               onInstallMissing={() => useDownloadStore.getState().installMissing(pkg.filename)}
+              onEnableInactive={handleEnableInactiveDeps}
               onSelectPackage={handleSelectPackage}
             />
           </div>
@@ -2439,6 +2269,7 @@ function LibraryDetailPanel({ pkg, onNavigate, onFilterAuthor, updateInfo }) {
                     key={type}
                     items={items}
                     label={type}
+                    gallery={contentGallery}
                     suppressHiddenRowStyle={galleryVisibilityFilter === 'hidden'}
                   />
                 ))}
@@ -2461,7 +2292,11 @@ function depBadnessRank(dep, byPackageRef) {
   if (d && d.status !== 'completed' && d.status !== 'cancelled') {
     dl = d.status === 'active' ? 'active' : d.status
   }
-  if (dep.resolution === 'exact' || dep.resolution === 'latest') return 0
+  // Missing (95) bubbles first; disabled/offloaded (85) second among problem deps.
+  if (dep.resolution === 'exact' || dep.resolution === 'latest') {
+    if (dep.storageState === 'disabled' || dep.storageState === 'offloaded') return 85
+    return 0
+  }
   if (dep.resolution === 'fallback') return 72
   if (dl === 'active') return 45
   if (dl === 'queued') return 58
@@ -2517,7 +2352,43 @@ function flattenDepRows(items, depth = 0) {
   return out
 }
 
-function DepList({ items, depCount, missingDeps, onInstallMissing, onSelectPackage }) {
+/**
+ * Well-header issue chip: a calm amber status that reveals an inline fix-all link
+ * on hover (via an interactive hover-card), so stray hovers never reflow the header.
+ */
+function DepIssueAction({ Icon, label, description, actionLabel, onAction }) {
+  return (
+    <HoverCard openDelay={300} closeDelay={100}>
+      <HoverCardTrigger asChild>
+        <span className="flex shrink-0 cursor-pointer items-center gap-1 whitespace-nowrap text-[10px] leading-none text-warning transition-[filter] hover:brightness-125">
+          <Icon size={10} className="shrink-0" /> {label}
+        </span>
+      </HoverCardTrigger>
+      <HoverCardContent align="end" className="max-w-[220px]">
+        <p className="text-[11px] leading-snug text-text-secondary">
+          {description}{' '}
+          <button
+            type="button"
+            onClick={onAction}
+            className="cursor-pointer font-medium text-accent-blue transition-[filter] hover:brightness-125"
+          >
+            {actionLabel}
+          </button>
+        </p>
+      </HoverCardContent>
+    </HoverCard>
+  )
+}
+
+function DepList({
+  items,
+  depCount,
+  missingDeps,
+  inactiveDeps = 0,
+  onInstallMissing,
+  onEnableInactive,
+  onSelectPackage,
+}) {
   const [expanded, setExpanded] = useState(false)
   const [query, setQuery] = useState('')
   const byPackageRef = useDownloadStore((s) => s.byPackageRef)
@@ -2584,23 +2455,30 @@ function DepList({ items, depCount, missingDeps, onInstallMissing, onSelectPacka
               <span className="shrink-0 whitespace-nowrap text-[11px] font-medium text-text-primary">
                 Dependencies <span className="text-text-tertiary font-normal">({depCount})</span>
               </span>
-              {missingDeps > 0 && (
-                <span className="flex shrink-0 items-center gap-1 whitespace-nowrap text-[10px] text-warning">
-                  <AlertTriangle size={10} className="shrink-0" /> {missingDeps} missing
-                </span>
-              )}
             </div>
           )}
         </div>
+        {/* Each issue reads as a calm, static amber status. Hovering it opens an interactive
+            hover-card holding an inline fix-all link — so accidental mouse-overs cause no
+            motion in the header, and the action is one deliberate move away. */}
         <div className="flex shrink-0 items-center gap-2">
+          {!showSearch && inactiveDeps > 0 && onEnableInactive && (
+            <DepIssueAction
+              Icon={Power}
+              label={`${inactiveDeps} disabled`}
+              description={`${inactiveDeps} dependenc${inactiveDeps === 1 ? 'y is' : 'ies are'} disabled or offloaded.`}
+              actionLabel="Enable all"
+              onAction={onEnableInactive}
+            />
+          )}
           {!showSearch && missingDeps > 0 && (
-            <button
-              type="button"
-              onClick={onInstallMissing}
-              className="shrink-0 cursor-pointer text-[10px] text-accent-blue transition-[filter] hover:brightness-125"
-            >
-              Install missing
-            </button>
+            <DepIssueAction
+              Icon={AlertTriangle}
+              label={`${missingDeps} missing`}
+              description={`${missingDeps} dependenc${missingDeps === 1 ? 'y is' : 'ies are'} missing.`}
+              actionLabel="Install all"
+              onAction={onInstallMissing}
+            />
           )}
           {expanded && collapsible && (
             <button

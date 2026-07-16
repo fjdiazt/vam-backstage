@@ -8,9 +8,13 @@ VaM Backstage solves this by:
 
 - **Differentiating direct installs from dependencies.** On first scan, a graph-based leaf-detection algorithm classifies packages. Users can promote/demote packages manually afterward.
 - **Auto-hiding dependency content in VaM's content browser.** The app manages `.hide`/`.fav` sidecar files that VaM reads natively, making dependency content invisible in VaM without modifying any package files.
-- **Providing a full package browser with Hub integration.** Users can search, browse, and install packages from the VaM Hub, with dependency resolution and concurrent downloads.
-- **Content inspector.** A flat gallery of all content items across all packages with visibility/favorite controls.
+- **Providing a full package browser with Hub integration.** Users can search, browse, and install packages from the VaM Hub, with dependency resolution and concurrent downloads. A local wishlist preserves Hub snapshots for paid or removed packages.
+- **Content inspector.** A flat gallery of all content items across all packages with visibility/favorite controls, custom labels, and extracted-preset provenance.
 - **Package removal with dependency cascade.** Uninstalling a package identifies orphan dependencies and optionally removes them.
+- **Custom labels.** User-defined colored tags on packages and individual content items, with Library/Content filters and inheritance on version upgrades.
+- **Preset extraction.** Write appearance/outfit presets from scenes (and convert legacy looks) into loose VaM files under `Custom/Atom/Person/.../extracted/`.
+- **Disable and offload.** Packages can be disabled in place (VaM-native: an empty `.var.disabled` marker beside the real `.var`) or offloaded to registered aux library directories on the same filesystem; disable behavior is configurable.
+- **Remote client/server mode.** One machine can host the library backend over LAN WebSocket while other instances connect as thin clients (`--connect=`).
 
 The application is built with Electron 39, React 19, SQLite (better-sqlite3), Zustand for state management, and Tailwind CSS v4 with shadcn/ui-style components (via the `shadcn` CLI and `radix-ui` primitives). It is JavaScript-only (no TypeScript). The UI is dark-only.
 
@@ -32,12 +36,12 @@ The application is built with Electron 39, React 19, SQLite (better-sqlite3), Zu
 
 ### Steady-State Usage
 
-- **Hub**: Browse VaM Hub packages with full-text search, type/pricing/author/tag/license filters, and sort options. Click a card to see a detail panel (left) with an embedded webview showing the actual Hub page (right). Install triggers download of the package plus all missing dependencies.
-- **Library**: Browse installed packages as a gallery (compact/detailed cards) or table. Select a package to see a detail panel with content list, dependency tree, dependents, and actions (uninstall/promote/demote/disable/force-remove). Missing dependencies section shows broken packages with install actions.
-- **Content**: Browse all content items flat across packages as a gallery or table. Select an item to see the owning package, toggle hidden/favorite. Cross-navigate to Library or Hub.
+- **Hub**: Browse VaM Hub packages with full-text search, type/pricing/author/tag/license filters, and sort options — or switch to **Wishlist** mode for a client-filtered gallery of locally saved Hub snapshots. Click a card to see a detail panel (left) with an embedded webview showing the actual Hub page (right). Install triggers download of the package plus all missing dependencies. Pin/unpin wishlist entries; when logged into the Hub, toggle favorite/bookmark/rate/like from the detail panel.
+- **Library**: Browse installed packages as a gallery (compact/detailed cards) or table. Filter by label, storage state (enabled/disabled/offloaded), and update availability. Select a package to see a detail panel with content list, dependency tree, dependents, label chips, and actions (uninstall/promote/demote/disable/offload/force-remove, Link to Hub…). Context menu: apply labels, extract appearance/outfit presets from scenes, convert legacy looks. Missing dependencies section shows broken packages with install actions. Cards show a "no preset" checkmark once appearance presets have been extracted.
+- **Content**: Browse all content items flat across packages as a gallery or table. Filter by label and package storage state. Select an item to see the owning package, toggle hidden/favorite, apply labels. Extracted presets show provenance ("Extracted from …") and re-extract actions. Cross-navigate to Library or Hub.
 - **Downloads**: Slide-in panel (between ribbon and content area) showing active/queued/completed/failed downloads with live progress, speed, and ETA. Pause/resume all, cancel, retry.
-- **Settings**: VaM directory configuration, library rescanning, integrity verification, auto-hide toggle, thumbnail blur (privacy), developer options.
-- **Status bar**: Always-visible bottom strip with package count, dependency count, content items, total size, active download progress, scan progress, and app version.
+- **Settings**: VaM directory configuration, aux offload library directories, disable behavior (suffix vs move-to-offload-dir), library rescanning, integrity verification, auto-hide toggles, thumbnail blur (privacy), remote server/client mode, update channel, developer options.
+- **Status bar**: Always-visible bottom strip with package count, dependency count, content items, total size, active download progress, scan progress, remote-server indicator (when serving), and app version.
 
 ### Cross-Navigation
 
@@ -60,23 +64,28 @@ The application is built with Electron 39, React 19, SQLite (better-sqlite3), Zu
 │  ├── FirstRun (first-run wizard)                          │
 │  ├── StatusBar                                            │
 │  └── Zustand Stores (hub, library, content, downloads,    │
-│       installed, status)                                  │
+│       installed, labels, wishlist, view, status, remote)  │
 │                                                           │
 │  ──── contextBridge (src/preload/index.js) ────           │
+│       local IPC or remote WebSocket transport             │
 ├───────────────────────────────────────────────────────────┤
 │                       Main Process                        │
 │                                                           │
 │  index.js ── startup orchestration                        │
 │  ├── db.js ── SQLite persistence layer                    │
 │  ├── store.js ── in-memory indexes & computed state       │
+│  ├── storage-state.js ── disable/offload rename chokepoint│
+│  ├── library-dirs.js ── main + aux library dir registry   │
 │  ├── scanner/ ── .var reading, classification, graph      │
-│  ├── hub/ ── Hub API client + CDN index                   │
+│  ├── scenes/ ── preset extraction from scenes/looks       │
+│  ├── hub/ ── Hub API client + CDN index + interactions    │
 │  ├── downloads/ ── concurrent download engine             │
+│  ├── remote/ ── LAN WebSocket server + IPC registry       │
 │  ├── vam-prefs.js ── .hide/.fav sidecar management        │
 │  ├── watcher.js ── FS monitoring (@parcel/watcher)        │
 │  ├── thumb-resolver.js ── Hub thumbnail fetching          │
 │  ├── avatar-cache.js ── Hub author avatar caching         │
-│  ├── updater.js ── electron-updater wiring (§21)          │
+│  ├── updater.js + mac-update.js ── auto-update (§23)      │
 │  └── ipc/ ── handler modules per domain                   │
 └───────────────────────────────────────────────────────────┘
 ```
@@ -87,14 +96,16 @@ On startup, the main process reads SQLite and the filesystem, then builds in-mem
 
 **Read paths — in-memory vs SQLite:**
 
-| Handler domain                  | Source of truth at read time                         |
-| ------------------------------- | ---------------------------------------------------- |
-| `packages:*` list/detail/stats  | in-memory (via `buildFromDb()`)                      |
-| `contents:*` list/counts        | in-memory                                            |
-| `settings:get` / `settings:set` | SQLite                                               |
-| `downloads:list`                | SQLite (persisted queue rows)                        |
-| `thumbnails:get`                | SQLite (paths + prefs helpers)                       |
-| `hub:*`                         | Hub API + `hub_resources` / `hub_users` cache tables |
+| Handler domain                   | Source of truth at read time                          |
+| -------------------------------- | ----------------------------------------------------- |
+| `packages:*` list/detail/stats   | in-memory (via `buildFromDb()`)                       |
+| `contents:*` list/counts         | in-memory                                             |
+| `settings:get` / `settings:set`  | SQLite                                                |
+| `downloads:list`                 | SQLite (persisted queue rows)                         |
+| `thumbnails:get`                 | SQLite (paths + prefs helpers)                        |
+| `hub:*`                          | Hub API + `hub_resources` / `hub_users` cache tables  |
+| `labels:list`                    | in-memory label list (refreshed on label mutations)   |
+| `wishlist:list` / `wishlist:ids` | SQLite `hub_wishlist` (+ install annotations at read) |
 
 ### IPC Contract
 
@@ -122,9 +133,9 @@ App.jsx
 │   └── Section: Failed (retry/remove individual, retry all)
 ├── Main Content Area (flex-1)
 │   ├── HubView
-│   │   ├── FilterPanel (resizable left)
-│   │   ├── Toolbar (count + card size toggle)
-│   │   ├── HubCard gallery (infinite scroll, default 220px cards, minimal/medium modes)
+│   │   ├── FilterPanel (resizable left; includes labels-autocomplete)
+│   │   ├── Toolbar (count + card size toggle + Hub/Wishlist mode)
+│   │   ├── HubCard gallery (infinite scroll in hub mode; wishlist loads all at once)
 │   │   └── HubDetail (replaces gallery on card click)
 │   │       ├── BackBar (breadcrumb)
 │   │       ├── PackageInfoPanel (320px left, scrollable)
@@ -136,7 +147,7 @@ App.jsx
 │   │           ├── BrowserToolbar (back/forward/reload + URL bar)
 │   │           └── TabBar (Overview/Reviews/History/Discussion)
 │   ├── LibraryView
-│   │   ├── FilterPanel (resizable left)
+│   │   ├── FilterPanel (resizable left; includes labels-autocomplete)
 │   │   ├── Toolbar (count + Install All Missing + view toggle)
 │   │   ├── VirtualGrid / Table (LibraryCard or LibraryTableRow × N)
 │   │   └── LibraryDetailPanel (resizable right, 260–500px)
@@ -147,7 +158,7 @@ App.jsx
 │   │       ├── Dependents (expandable list)
 │   │       └── ContentCategory groups (collapsible, Eye/Star toggles per item)
 │   ├── ContentView
-│   │   ├── FilterPanel (resizable left)
+│   │   ├── FilterPanel (resizable left; includes labels-autocomplete)
 │   │   ├── Toolbar (count + view toggle + thumbnail size slider)
 │   │   ├── VirtualGrid / Table (ContentCard × N, variable size)
 │   │   └── ContentDetailPanel (resizable right, 220–450px)
@@ -240,7 +251,7 @@ All gradients are computed client-side with no server dependency and serve as th
 
 - **Typography**: Geist Variable font (system sans-serif fallback); `user-select: none` by default for an app-chrome feel.
 - **Scrollbars**: custom 6px — transparent track, `border-bright` thumb, `text-tertiary` on hover, 3px border-radius.
-- **Privacy mode**: when enabled, `html[data-blur-thumbs]` triggers a strong CSS blur filter on all `.thumb` elements.
+- **Privacy mode**: when enabled, `html[data-blur-thumbs]` triggers a strong CSS blur filter on all `.thumb` elements. Preference lives in renderer localStorage (`useRemoteUiStore`) so it stays per-machine (including remote clients) rather than in the host SQLite settings.
 
 ---
 
@@ -301,7 +312,7 @@ Cross-package deduplication also occurs: when multiple versions of the same pack
 
 ## 7. Database Schema
 
-SQLite with WAL journaling, managed by `better-sqlite3` in the main process. Current schema version: **21**. New databases are created at the latest version in one step (`createSchema` in `db.js`); existing DBs walk forward through incremental steps in `migrate()` (v17 → v18 → v19 → v20 → v21). Pre-release builds at versions 1–15 cannot be upgraded — delete `backstage.db` under the app userData directory if you hit that error. The `__local__` sentinel package row that owns loose Saves/Custom content (see §7.x and §11) is seeded by `ensureLocalPackage()` on every open — no schema change, just an idempotent data fixup that works on both new installs and existing DBs.
+SQLite with WAL journaling, managed by `better-sqlite3` in the main process. Current schema version: **25**. New databases are created at the latest version in one step (`createSchema` in `db.js`); existing DBs walk forward through incremental steps in `migrate()` (v17 → … → v25). Pre-release builds at versions **< 16** cannot be upgraded — delete `backstage.db` under the app userData directory if you hit that error. The `__local__` sentinel package row that owns loose Saves/Custom content (see §7 and §11) is seeded by `ensureLocalPackage()` on every open — no schema change, just an idempotent data fixup that works on both new installs and existing DBs.
 
 ### `packages` — Package Scan Cache
 
@@ -322,6 +333,7 @@ CREATE TABLE packages (
   is_direct        INTEGER NOT NULL DEFAULT 0,  -- 1=user installed, 0=dependency
   storage_state    TEXT NOT NULL DEFAULT 'enabled',  -- 'enabled' | 'disabled' | 'offloaded'
   library_dir_id   INTEGER REFERENCES library_dirs(id) ON DELETE RESTRICT,  -- NULL = main AddonPackages
+  subpath          TEXT NOT NULL DEFAULT '',  -- POSIX relative dir within the library dir ('' = root)
   hub_resource_id  TEXT,              -- VaM Hub resource ID (learned from Hub API)
   hub_user_id      TEXT,              -- Hub user ID for author avatar
   hub_display_name TEXT,              -- Hub display title (often differs from meta title)
@@ -332,22 +344,36 @@ CREATE TABLE packages (
   type_override    TEXT,              -- user-set type override (null=auto-detected)
   is_corrupted     INTEGER NOT NULL DEFAULT 0,  -- 1=failed integrity check
   dep_refs         TEXT NOT NULL DEFAULT '[]',  -- JSON array of raw dep ref strings
+  hub_detail_applied_at INTEGER,      -- mirrors hub_resources.updated_at; dirty-check for scanHubDetails
+  hub_name_checked_at   INTEGER,      -- negative cache for name-based Hub lookup (paid/off-Hub packages)
+  missing_since    INTEGER,           -- soft-delete tombstone: unixepoch when .var left disk; NULL = present
   first_seen_at    INTEGER NOT NULL DEFAULT (unixepoch()),
   scanned_at       INTEGER
 );
 CREATE INDEX idx_packages_package_name ON packages(package_name);
 CREATE INDEX idx_packages_creator ON packages(creator);
+CREATE INDEX idx_packages_missing_since ON packages(missing_since);
 ```
+
+`missing_since` implements **soft-delete tombstones**. When a `.var` disappears from disk, neither the watcher's unlink path nor the full-scan reconciler `DELETE`s the row (which would cascade through `contents` and the label junction tables, destroying the user's identity-keyed settings). Instead they stamp `missing_since` (`markPackageMissing` / `markPackagesMissing`), which hides the row from every enumerating getter. The single filtering chokepoint is `getAllPackages()` (`… WHERE missing_since IS NULL`), which feeds `buildFromDb`/`buildGraphOnly` and therefore the in-memory `packageIndex` and everything downstream; `getAllContents` joins through it, and the remaining direct enumerators (hub scan work-lists, counts, `getAllDbFilenamesWithDir`, thumbnail work-list, donor lookup) carry the same clause. Getters that select a single row by primary key stay unfiltered — the caller already knows the identity it wants.
+
+The payoff is **transparent restoration**: if the file reappears anywhere under a library root — a package the user moved to an unregistered folder and moved back, a restored backup, or a remounted removable drive — the row (and its hub link, labels, type override, content visibility) is still there. Any reappearance clears the stamp: `setStorageState` (relocation walk / cache-hit reconcile) and `upsertPackage` (fresh scan) both set `missing_since = NULL`. This also fixes the BrowserAssist disable/offload glitch, where BA renames the `.var` to a scratch name and back within moments — the watcher sees unlink-then-add across two debounce batches, tombstoning on the unlink and clearing it byte-for-byte on the re-add via `scanSingleVar`'s cache-hit branch, so the package never loses its identity.
+
+Tombstones are otherwise permanent (settings tied to identity should not expire on a timer). They cost little — the DB is tiny relative to the `.var` archive it describes — but a dev-settings "Forget deleted data" button (`forgetDeletedData`, gated like "Nuke database") is the single cleanup escape hatch for anyone who wants the space back. It (1) hard-deletes every tombstone (cascading their preserved `contents`/labels) and (2) prunes **orphaned content labels**: `label_contents` rows key on `packages(filename)` rather than `contents.id`, so replacing a still-present package in place with a version that drops some items leaves the labels of those removed internal paths dangling (a rescan deletes+reinserts `contents`, which does not cascade to `label_contents`). Those orphans are likewise retained by default — consistent with the identity-keyed-memory model, so re-adding the item restores its label — and reclaimed only by this button.
 
 `storage_state` replaces the legacy `is_enabled` boolean (v21). It encodes three physical placements:
 
-| state       | location                                              | on-disk name (canonical) |
-| ----------- | ----------------------------------------------------- | ------------------------ |
-| `enabled`   | main `AddonPackages` (`library_dir_id IS NULL`)       | `Foo.1.var`              |
-| `disabled`  | main `AddonPackages` (`library_dir_id IS NULL`)       | `Foo.1.var.disabled`     |
-| `offloaded` | a registered aux library directory (`library_dir_id`) | `Foo.1.var`              |
+| state                      | location                                              | content bytes live in                                |
+| -------------------------- | ----------------------------------------------------- | ---------------------------------------------------- |
+| `enabled`                  | main `AddonPackages` (`library_dir_id IS NULL`)       | bare `Foo.1.var`                                     |
+| `disabled` (marker)        | main `AddonPackages` (`library_dir_id IS NULL`)       | bare `Foo.1.var` + empty `Foo.1.var.disabled` marker |
+| `disabled` (legacy suffix) | main `AddonPackages` (`library_dir_id IS NULL`)       | `Foo.1.var.disabled` (no bare sibling)               |
+| `disabled` (Qvaro rename)  | main `AddonPackages` (`library_dir_id IS NULL`)       | `Foo.1.DISABLED` (no bare sibling)                   |
+| `offloaded`                | a registered aux library directory (`library_dir_id`) | bare `Foo.1.var`                                     |
 
-For dependency-graph purposes, `disabled` and `offloaded` behave identically (the package is unavailable to VaM at runtime). On-disk names are fully derived from `storage_state`: `disabled` carries the `.var.disabled` suffix; `enabled` and `offloaded` are suffix-less. All app-initiated transitions go through a single `applyStorageState` chokepoint that does `fs.rename`, DB update, in-memory patch, and watcher suppression atomically. Aux dirs must live on the same filesystem as main `AddonPackages` (validated by a probe-rename when the dir is registered), so a plain rename is always sufficient.
+For dependency-graph purposes, `disabled` and `offloaded` behave identically (the package is unavailable to VaM at runtime). Three on-disk encodings express "disabled" in main: VaM's native **marker** style keeps the real `Foo.1.var` in place beside an empty `Foo.1.var.disabled` sentinel (the marker's presence is the disable signal); the **legacy suffix** style — used by older versions of this app and some external tools — renames the content to `Foo.1.var.disabled` with no bare sibling; and the **Qvaro** style (from the Qvaro tool) renames the content to `Foo.1.DISABLED` — the whole `.var` extension replaced by `.DISABLED` (uppercase, matched case-insensitively) — again with no bare sibling. We support _reading_ all three; the legacy-suffix and Qvaro cases are identical to the classifier ("content in the disabled sibling, no bare `.var`") and differ only in the sibling's spelling. We deliberately do **not** store which encoding a row uses: the DB keeps only the canonical bare `filename`, `storage_state`, and `subpath`. Where the content bytes physically live is re-derived from disk on demand by `resolveContentPath` (`src/main/library-dirs.js`), which probes the bare + disabled-sibling sizes via `classifyMainVar` (`src/main/disable-layout.js`) for disabled rows and short-circuits to the nominal bare path for everything else; `classifyMainVarOnDisk` tries the `.var.disabled` spelling first and falls back to the `.DISABLED` rename. Reads that need the bytes are rare, one-off, and already touch the disk, so a couple of extra `stat`s cost nothing while keeping the disk the single source of truth — no cached column to go stale. App-initiated disables always produce the marker style. All app-initiated transitions go through a single `applyStorageState` chokepoint that normalizes content to the bare name, reconciles the marker, updates the DB (`storage_state`, `library_dir_id`), patches memory, and suppresses the resulting watcher events atomically. Aux dirs must live on the same filesystem as main `AddonPackages` (validated by a probe-rename when the dir is registered), so a plain rename is always sufficient. Aux dirs are always suffix-less (offloaded == active); a stray `.var.disabled` there is normalized to bare `.var` on scan/add.
+
+A `.var` is valid anywhere under a library root, not only at the top level — VaM loads packages from any subfolder of `AddonPackages`. The `subpath` column records that relative folder (POSIX-style, `''` at the root); `pkgVarPath(pkg)` joins `library dir + subpath + filename` to the nominal bare path (writers/deleters and the companion-thumbnail lookup use this), while `resolveContentPath(pkg)` layers the on-demand disk probe on top for readers that open the archive of a possibly suffix-disabled package. `applyStorageState` preserves `subpath` across all transitions: an enabled/disabled flip renames in place inside the subfolder, and an offload mirrors the same relative subpath under the aux dir (creating it as needed), so an offload→enable round-trip is lossless. The scanner records `subpath` at discovery and reconciles it on a stat-cache hit (a same-bytes move into/out of a subfolder updates the column without re-reading the archive). The companion thumbnail (`Foo.1.jpg` next to `Foo.1.var`) is found via `dirname(pkgVarPath)`, so it tracks the package into subfolders for free.
 
 ### `library_dirs` — Offload Library Directories
 
@@ -361,7 +387,7 @@ CREATE TABLE library_dirs (
 );
 ```
 
-The scanner walks every registered library dir; the watcher monitors all of them; a package moved between dirs by an external tool is reconciled as a move (single update of `storage_state` + `library_dir_id`) rather than uninstall + reinstall. Removing an aux dir is allowed only when no packages still point at it (`ON DELETE RESTRICT`).
+The scanner walks every registered library dir recursively; the watcher monitors all of them; a package moved between dirs (or into a different subfolder) by an external tool is reconciled as a move (single update of `storage_state` + `library_dir_id` + `subpath`) rather than uninstall + reinstall — so labels and other FK-bound settings survive. Removing an aux dir with no packages is a plain delete (`ON DELETE RESTRICT` guards the FK); force-removing one that still holds packages (`removeLibraryDirTombstoningPackages`) does not delete those rows — it tombstones them (see `missing_since`) and detaches `library_dir_id` so the RESTRICT lifts, leaving the on-disk `.var`s in place. Re-adding the folder and rescanning resurrects each row with its labels/overrides intact, so a force-remove is recoverable, not destructive.
 
 ### `contents` — Content Item Scan Cache
 
@@ -371,19 +397,62 @@ Content items discovered inside `.var` files. Avoids re-reading ZIPs on restart.
 CREATE TABLE contents (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   package_filename  TEXT NOT NULL REFERENCES packages(filename) ON DELETE CASCADE,
-  internal_path     TEXT NOT NULL,     -- path within the .var ZIP
+  internal_path     TEXT NOT NULL,     -- path within the .var ZIP (or loose path for __local__)
   display_name      TEXT NOT NULL,     -- human-readable name from path
   type              TEXT NOT NULL,     -- exact type (scene, look, clothingItem, etc.)
   thumbnail_path    TEXT,              -- sibling .jpg path inside the .var ZIP (nullable)
+  person_atom_ids   TEXT,              -- JSON array of Person atom ids (scene sources; v17)
+  file_mtime        REAL NOT NULL DEFAULT 0,  -- loose-content dirty-check gate (v18)
+  size_bytes        INTEGER NOT NULL DEFAULT 0,
   UNIQUE(package_filename, internal_path)
 );
 CREATE INDEX idx_contents_package ON contents(package_filename);
 CREATE INDEX idx_contents_type ON contents(type);
 ```
 
+### `labels` — User-Defined Tags (v20)
+
+```sql
+CREATE TABLE labels (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  color      INTEGER,   -- NULL = "None" (muted); -1 = "Auto" (hash-derived); 0..N = palette index
+  created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE TABLE label_packages (
+  label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+  package_filename TEXT NOT NULL REFERENCES packages(filename) ON DELETE CASCADE,
+  PRIMARY KEY (label_id, package_filename)
+);
+
+CREATE TABLE label_contents (
+  label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+  package_filename TEXT NOT NULL REFERENCES packages(filename) ON DELETE CASCADE,
+  internal_path TEXT NOT NULL,
+  PRIMARY KEY (label_id, package_filename, internal_path)
+);
+```
+
+Package labels are stored on `label_packages`; content can have its own labels on `label_contents`. Junction keys use `(package_filename, internal_path)` rather than `contents.id` because content rows can be replaced during rescans. Labels on a newly installed package version are inherited from the previous version of the same group (`scanner/inherit.js`). Abandoned labels (zero applications) are garbage-collected at startup.
+
+### `hub_wishlist` — Local Hub Wishlist (v25)
+
+Unlike `hub_resources` (disposable API cache), this table is the feature's durable copy of detail-shaped Hub JSON — paid or removed packages may never get a local `.var` filename.
+
+```sql
+CREATE TABLE hub_wishlist (
+  resource_id    TEXT PRIMARY KEY CHECK (numeric hub id),
+  snapshot_json  TEXT NOT NULL,   -- raw Hub fields only; `_`-prefixed annotations stripped at write
+  created_at     INTEGER NOT NULL DEFAULT (unixepoch()),
+  snapshot_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+  unavailable_at INTEGER          -- set when Hub definitively reports the resource gone
+);
+```
+
 ### `downloads` — Persistent Download Queue
 
-Survives crash/restart. Live progress (speed, %) is in-memory only. On startup, `status='active'` and `status='queued'` rows are marked `'failed'` with `error='Interrupted'` (temp files are cleaned up first); the user can retry them manually.
+Survives crash/restart. Live progress (speed, %) is in-memory only. Global pause is persisted in `settings.downloads_paused`. On startup: if downloads were paused, active rows are reset to `queued` and partial `.tmp` files are kept so the queue can resume; otherwise unfinished `active`/`queued` rows are marked `'failed'` with `error='Interrupted'` (temp files cleaned up first) for manual retry.
 
 ```sql
 CREATE TABLE downloads (
@@ -451,9 +520,10 @@ CREATE TABLE settings (
 - `auto_hide_foreign_hair` / `auto_hide_foreign_poses` / `auto_hide_foreign_clothing` — `'1'` to auto-manage `.hide` files for content of that category bundled inside packages whose own effective type is _not_ that category (e.g. hide a stray hair shipped inside a clothing pack). Looks/Scenes intentionally have no equivalent — they're commonly bundled as demos. All four auto-hide settings flow through one declarative rule table (`AUTO_HIDE_RULES` in `src/main/scanner/index.js`); each rule contributes a `matches(pkgCtx, content)` predicate. **Targeted-sweep + deference invariant**: a remove sweep for rule X unhides only items rule X claims that are currently hidden AND that no other active rule still claims; an apply sweep for rule X hides only items in rule X's claim that aren't already hidden. Rules can stack freely — overlapping claims (e.g. a hair in a dep clothing pack with both `auto_hide_deps` and `auto_hide_foreign_hair` on) stay hidden until the _last_ rule claiming them is turned off and swept.
 - `hub_debug_requests` — `'1'` to log all Hub API requests
 - `hub_filters_json` — cached Hub filter metadata (types, tags, sort options)
-- `blur_thumbnails` — `'1'` when thumbnail blur (privacy) is enabled
-- `update_channel` — `'stable'` | `'dev'`; selects updater feed (see §21)
-- `disable_behavior` — `'suffix'` (rename to `.var.disabled` in main; default) or `'move-to:<auxDirId>'` (move to the named aux library directory). Removing the referenced aux dir resets this to `'suffix'`.
+- `update_channel` — `'stable'` | `'dev'`; selects updater feed (see §23)
+- `disable_behavior` — `'suffix'` (VaM-native: drop an empty `.var.disabled` marker beside the bare `.var` in main; default) or `'move-to:<auxDirId>'` (move to the named aux library directory). Removing the referenced aux dir resets this to `'suffix'`.
+- `remote_mode_enabled` — `'1'` when the Settings remote section is enabled (server UI + optional auto-start).
+- `remote_serve_on_launch` — `'1'` to call `remote:start` automatically on startup when remote mode is enabled.
 
 ### Local content sentinel (`__local__`)
 
@@ -465,6 +535,20 @@ Loose `.hide` / `.fav` sidecars live next to the source file (e.g. `Saves/scene/
 
 Schema is forward-only. New installs go through `createSchema` directly at the latest version; existing DBs walk forward through incremental steps in `migrate()`. Any new column or table must be reflected in both `createSchema` and a new migration step — leaving them out of one will diverge new installs from upgraded ones.
 
+| Version | Summary                                                          |
+| ------- | ---------------------------------------------------------------- |
+| v17     | `contents.person_atom_ids`                                       |
+| v18     | `contents.file_mtime` / `size_bytes` (loose-content dirty-check) |
+| v19     | `packages.hub_detail_applied_at`                                 |
+| v20     | Labels tables                                                    |
+| v21     | `library_dirs`, `storage_state`, drop `is_enabled`               |
+| v22     | `packages.hub_name_checked_at`                                   |
+| v23     | Hub-id numeric CHECK + scrub bogus `'null'` ids                  |
+| v24     | `packages.subpath`                                               |
+| v25     | `hub_wishlist`                                                   |
+| v26     | `library_dirs.browser_assist`                                    |
+| v27     | `packages.missing_since` (soft-delete tombstones)                |
+
 ---
 
 ## 8. In-Memory Structures
@@ -473,25 +557,29 @@ All library business logic — filtering, sorting, dependency resolution, conten
 
 ### Core Indexes
 
-| Structure                | Type                                           | Description                                                |
-| ------------------------ | ---------------------------------------------- | ---------------------------------------------------------- |
-| `packageIndex`           | `Map<filename, PackageObj>`                    | All packages keyed by filename                             |
-| `groupIndex`             | `Map<packageName, filename[]>`                 | Package group → all version filenames                      |
-| `forwardDeps`            | `Map<filename, [{ref, resolved, resolution}]>` | Resolved dependency edges per package                      |
-| `reverseDeps`            | `Map<filename, Set<filename>>`                 | Reverse edges: who depends on this package                 |
-| `contentItems`           | `Array<ContentItem>`                           | All gallery-visible content items                          |
-| `contentItemsDeduped`    | `Array<ContentItem>`                           | Cross-version deduplicated content                         |
-| `contentByPackage`       | `Map<filename, ContentItem[]>`                 | Content grouped by owning package                          |
-| `prefsMap`               | `Map<"filename/path", {hidden, favorite}>`     | Visibility/favorite state from sidecar files               |
-| `morphCountByPackage`    | `Map<filename, number>`                        | Morph count per package                                    |
-| `aggregateMorphCountMap` | `Map<filename, number>`                        | Morph count including transitive dependencies              |
-| `removableSizeMap`       | `Map<filename, number>`                        | Bytes freed if package is uninstalled                      |
-| `orphanSet`              | `Set<filename>`                                | Direct packages with no reverse deps (considering cascade) |
-| `directOrphanSet`        | `Set<filename>`                                | Direct packages with strictly zero reverse deps            |
-| `tagCounts`              | `{tag: count}`                                 | Hub tag occurrence counts across packages                  |
-| `authorCounts`           | `{creator: count}`                             | Author occurrence counts                                   |
-| `creatorsNeedingUserId`  | `Map<normalized, filenames[]>`                 | Authors missing Hub user IDs                               |
-| `stats`                  | `StatsObj`                                     | Aggregate counts and sizes                                 |
+| Structure                      | Type                                           | Description                                                |
+| ------------------------------ | ---------------------------------------------- | ---------------------------------------------------------- |
+| `packageIndex`                 | `Map<filename, PackageObj>`                    | All packages keyed by filename                             |
+| `groupIndex`                   | `Map<packageName, filename[]>`                 | Package group → all version filenames                      |
+| `forwardDeps`                  | `Map<filename, [{ref, resolved, resolution}]>` | Resolved dependency edges per package                      |
+| `reverseDeps`                  | `Map<filename, Set<filename>>`                 | Reverse edges: who depends on this package                 |
+| `contentItems`                 | `Array<ContentItem>`                           | All gallery-visible content items                          |
+| `contentItemsDeduped`          | `Array<ContentItem>`                           | Cross-version deduplicated content                         |
+| `contentByPackage`             | `Map<filename, ContentItem[]>`                 | Content grouped by owning package                          |
+| `prefsMap`                     | `Map<"filename/path", {hidden, favorite}>`     | Visibility/favorite state from sidecar files               |
+| `morphCountByPackage`          | `Map<filename, number>`                        | Morph count per package                                    |
+| `aggregateMorphCountMap`       | `Map<filename, number>`                        | Morph count including transitive dependencies              |
+| `removableSizeMap`             | `Map<filename, number>`                        | Bytes freed if package is uninstalled                      |
+| `orphanSet`                    | `Set<filename>`                                | Direct packages with no reverse deps (considering cascade) |
+| `directOrphanSet`              | `Set<filename>`                                | Direct packages with strictly zero reverse deps            |
+| `tagCounts`                    | `{tag: count}`                                 | Hub tag occurrence counts across packages                  |
+| `authorCounts`                 | `{creator: count}`                             | Author occurrence counts                                   |
+| `creatorsNeedingUserId`        | `Map<normalized, filenames[]>`                 | Authors missing Hub user IDs                               |
+| `labelsByPackage`              | `Map<filename, number[]>`                      | Label ids applied directly to each package                 |
+| `labelsByContent`              | `Map<"pkg\0path", number[]>`                   | Label ids applied directly to each content item            |
+| `extractedAppearanceBasenames` | `Set<basename>`                                | Basenames of loose appearance presets on disk              |
+| `extractedByPackage`           | `Map<filename, ContentItem[]>`                 | Extracted presets owned by each package (any version)      |
+| `stats`                        | `StatsObj`                                     | Aggregate counts and sizes                                 |
 
 ### Stats Object
 
@@ -522,6 +610,7 @@ All library business logic — filtering, sorting, dependency resolution, conten
 6. Compute morph counts (own + transitive)
 7. Compute orphan sets
 8. Aggregate `stats`, `tagCounts`, `authorCounts`
+9. Refresh label junction maps (`refreshLabels`) and extracted-preset ownership indexes
 
 The `skipGraph` fast path is used directly by callers that know the graph is unchanged (e.g. enable/disable toggles, type overrides).
 
@@ -828,10 +917,10 @@ If a `.tmp` file exists from a previous attempt, the manager tries a `Range: byt
 
 ### Management Operations
 
-- **Pause/Resume all**: Stops all active transfers, preserves progress state. Resume re-queues them.
+- **Pause/Resume all**: Stops all active transfers, preserves progress state and persists pause across restarts (`settings.downloads_paused`). Resume re-queues them.
 - **Cancel**: Aborts the HTTP transfer, deletes the temp file, marks `status='cancelled'`.
 - **Retry**: Resets a failed download to `'queued'`.
-- **Clear completed/failed**: Removes entries from the database.
+- **Clear completed/failed**: Removes entries from the database (Downloads panel exposes Clear for both sections).
 
 ---
 
@@ -857,6 +946,14 @@ The Hub API is a single POST endpoint (`https://hub.virtamate.com/citizenx/api.p
 
 When search results return from the Hub, the client enriches each resource with local install status (`_installed`, `_isDirect`, `_localFilename`). It also backfills `hub_display_name` and `hub_user_id` into the packages database as a side effect of browsing.
 
+### Hub account interactions
+
+`hub/interactions.js` manages Hub session cookies and authenticated actions (favorite, bookmark, rate, like). `hub:isLoggedIn` probes cookie presence; `hub:resourceUserState` reads per-resource state. Toggle handlers return `{ ok, reason? }` and emit `hub:auth-changed` when the session is invalid. These channels stay **local-only** in remote client mode (not proxied over WebSocket) because the session lives in the local Electron partition.
+
+### Wishlist maintenance
+
+Background Hub fetches (`getResourceDetail`, `scanHubDetails`, name lookup) piggyback wishlist snapshot refresh via `upsertHubResourceDetail` / `markWishlistItemUnavailable` in `db.js`. When a row changes, the hub client emits bare `wishlist:updated` so an already-loaded wishlist refreshes. User pin/unpin via `wishlist:add` / `wishlist:remove` calls `notifyPeers('wishlist:updated', { membership: true })` so other connected clients refresh pins/count without echoing the event back to the actor (who already updated optimistically and reloads after the RPC). The membership marker preserves the old standalone behavior: background Hub traffic does not re-fetch wishlist IDs when the full list has never been loaded. Adding also fire-and-forgets `prefetchHubResThumbnail` so icons survive later Hub removal.
+
 ---
 
 ## 14. File System Watcher
@@ -865,7 +962,7 @@ When search results return from the Hub, the client enriches each resource with 
 
 The watcher (`src/main/watcher.js`) runs three sets of `@parcel/watcher` subscriptions, one per concern:
 
-1. **packageWatcher** — one subscription per registered library directory (main `AddonPackages/` plus any registered aux/offload dirs). Watches for `.var` and (in main only) `.var.disabled` files. Restarts whenever the `library_dirs` registry changes. Cross-dir moves are reconciled as a single `setStorageState` UPDATE so package rows and their label FKs are preserved.
+1. **packageWatcher** — one subscription per registered library directory (main `AddonPackages/` plus any registered aux/offload dirs), each recursive so `.var` files in subfolders are seen. Watches for `.var` and (in main only) `.var.disabled` files. Restarts whenever the `library_dirs` registry changes. On an unlink, the canonical is located by a single recursive walk across the library dirs (`locateVars`) before any delete, so a file moved to another dir or subfolder is reconciled as a single `setStorageState` UPDATE (state + `library_dir_id` + `subpath`), preserving package rows and their label FKs; only a truly-gone file is deleted.
 2. **localWatcher** — one subscription per loose-content root (`Saves/`, `Custom/`) for content changes (debounced `runLocalScan`) and sibling `.hide`/`.fav` sidecars.
 3. **prefsWatcher** — single subscription on `AddonPackagesFilePrefs/` for `.hide`/`.fav` sidecar changes.
 
@@ -883,6 +980,7 @@ Events are debounced for 500ms and processed as a batch:
 - Removed files: Delete from database (CASCADE removes content rows)
 - After all changes: `buildFromDb()` to rebuild in-memory structures
 - Apply auto-hide rules to freshly-scanned packages via `computeAutoHidePathsForNewPackage` + `hidePackageContent` — same flow as `postDownloadIntegrate`, ensures externally-dropped `.var`s honor the foreign-hair / poses / clothing rules. Watcher-installed files are treated as `is_direct=1`, so the `deps` rule doesn't fire here.
+- **No cascade on external changes.** Enabling a package on disk (dropping its `.var`, or a peer app removing a `.var.disabled` marker) never cascade-enables its disabled/offloaded deps, and disabling never cascade-disables dependents. A watcher event is an unattended external change: silently flipping _other_ packages would race a peer app's own queued dep changes, enable content the user may not want, and be a surprising side effect. Unsatisfied deps simply show as "broken" in the graph. Cascade only happens on app/user-initiated transitions (`ipc/packages.js` toggle-enabled, `postDownloadIntegrate`). Freshly-scanned enabled packages are still Hub-enriched (metadata only, no state change).
 - Emit `packages:updated`, `contents:updated`
 
 **Prefs events** (sidecar add/remove):
@@ -915,9 +1013,9 @@ This replaces the previous TTL-based `suppressPath`/`suppressPrefsStem` mechanis
 
 **Main process**:
 
-- On-demand extraction from `.var` ZIPs via IPC
-- Hub CDN download with local disk cache in `{userData}/thumb-cache/{filename}.jpg`
-- Background batch resolution for packages without thumbnails
+- On-demand extraction from `.var` ZIPs via IPC, disk-cached in `{userData}/thumb-cache/`
+- Two cache-file schemes: `hub-icon-{rid}.jpg` (Hub CDN icon, keyed by resource id, shared by installed packages and wishlist cards) and `{filename}__{hash}.jpg` (thumb extracted from a `.var`, keyed by file + internal path; a package's own thumb reuses its representative content entry)
+- Background batch resolution (`thumb-resolver.js`) downloads Hub icons for packages without one; a one-time `thumb-cache-migrate.js` pass upgrades the pre-unification `{filename}.jpg` layout
 
 **Renderer**:
 
@@ -938,16 +1036,19 @@ All renderer state is managed by **Zustand** stores (no Redux, no Context provid
 
 ### Store Overview
 
-| Store                             | Purpose                            | Key State                                                                                     |
-| --------------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------------- |
-| `useHubStore`                     | Hub search, filters, detail        | `resources[]`, filter state, `detailData`, `cardMode`, `filterOptions`                        |
-| `useLibraryStore`                 | Local packages, filters, detail    | `packages[]`, filter state, `selectedDetail`, `viewMode`, `missingDeps`, `updateCheckResults` |
-| `useContentStore`                 | Content items, filters, detail     | `contents[]`, filter state, `selectedItem`, `selectedPackage`, `viewMode`                     |
-| `useDownloadStore`                | Download queue and live progress   | `items[]`, `liveProgress{}`, `paused`, lookup maps by resource ID and package ref             |
-| `useInstalledStore`               | Lightweight install status cache   | `byHubResourceId` map for Hub UI cross-referencing                                            |
-| `useStatusStore`                  | Status bar stats and scan progress | `stats{}`, `scan{}`                                                                           |
-| `useToastStore`                   | Notification toasts                | `toasts[]`, `add()`, `dismiss()`                                                              |
-| `useContentCategoryExpandedStore` | Content category collapse state    | Expanded/collapsed state for content type groups                                              |
+| Store               | Purpose                            | Key State                                                                                                         |
+| ------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `useLibraryStore`   | Local packages, filters, detail    | `packages[]`, filter state, `selectedDetail`, `viewMode`, `selectedLabelIds`, `missingDeps`, `updateCheckResults` |
+| `useContentStore`   | Content items, filters, detail     | `contents[]`, filter state, `selectedItem`, `selectedPackage`, `selectedLabelIds`, `viewMode`, `expandedByType`   |
+| `useHubStore`       | Hub search, filters, detail        | `resources[]`, filter state, `detailData`, `cardMode`, `galleryMode` (`hub` \| `wishlist`), `filterOptions`       |
+| `useDownloadStore`  | Download queue and live progress   | `items[]`, `liveProgress{}`, `paused`, lookup maps by resource ID and package ref                                 |
+| `useInstalledStore` | Lightweight install status cache   | `byHubResourceId` map for Hub UI cross-referencing                                                                |
+| `useLabelsStore`    | Label definitions + counts         | `labels[]`, `byId`, `fetchLabels()` on `labels:updated`                                                           |
+| `useWishlistStore`  | Local Hub wishlist                 | `items[]`, `ids` Set, `load()` / `toggle()` backed by SQLite snapshots                                            |
+| `useViewStore`      | Active ribbon view (persisted)     | `view`: `'hub'` \| `'library'` \| `'content'` — Settings/Downloads never restored as the launch view              |
+| `useRemoteUiStore`  | Local-only UI state (persisted)    | `warningDismissed` (client-mode security banner); `blurThumbnails` (privacy blur) — both localStorage, not SQLite |
+| `useStatusStore`    | Status bar stats and scan progress | `stats{}`, `scan{}`                                                                                               |
+| `useToastStore`     | Notification toasts                | `toasts[]`, `add()`, `dismiss()`                                                                                  |
 
 ### Shared Patterns
 
@@ -989,21 +1090,24 @@ sequenceDiagram
 
 The events split into two categories:
 
-- **Invalidation events** (`packages:updated`, `contents:updated`, `downloads:updated`): Carry no payload. Signal "something changed" so the renderer re-fetches full datasets via `ipcMain.handle`. This avoids data consistency issues where event payloads might be stale relative to the main-process state at the time the renderer processes them.
+- **Invalidation events** (`packages:updated`, `contents:updated`, `labels:updated`, `wishlist:updated`, `downloads:updated`): Usually carry no payload and signal "something changed" so the renderer re-fetches authoritative state via `ipcMain.handle`. Peer pin/unpin adds `{ membership: true }` to `wishlist:updated` only to select the cheap ID refresh when the full wishlist is not loaded.
 - **Streaming events** (`download:progress`, `scan:progress`): Carry data payloads directly. Used for high-frequency updates where a full re-fetch would be too expensive. The renderer writes these directly into Zustand state with no IPC round-trip.
 
 ### Event Reactions by View
 
-Each event triggers a specific set of re-fetches per subscriber. HubStore does not subscribe to global events — it relies on cross-store sync (below).
+Each event triggers a specific set of re-fetches per subscriber. Hub search/filter state lives in `useHubStore`, but `HubView` also listens for `packages:updated` (install-badge + wishlist reconciliation) and `wishlist:updated` (peer pin/unpin and background snapshot refreshes).
 
-| Event               | LibraryView                                                                                                                                             | ContentView                                            | StatusBar                                                                                | DownloadStore                   |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------- | ------------------------------- |
-| `packages:updated`  | `fetchPackages`, `fetchBackendCounts`, `checkForUpdates`, `refreshDetail`, tag/author counts; missing-dep fetch or invalidate depending on filter state | `fetchContents`, `refreshSelection`, tag/author counts | `fetchStats`                                                                             | —                               |
-| `contents:updated`  | `refreshDetail`                                                                                                                                         | `fetchContents`, `refreshSelection`                    | `fetchStats`                                                                             | —                               |
-| `downloads:updated` | —                                                                                                                                                       | —                                                      | —                                                                                        | `fetchItems` (rebuilds indexes) |
-| `download:progress` | —                                                                                                                                                       | —                                                      | —                                                                                        | updates `liveProgress` in place |
-| `download:failed`   | —                                                                                                                                                       | —                                                      | —                                                                                        | toast notification              |
-| `scan:progress`     | —                                                                                                                                                       | —                                                      | updates `scan` state; shows bar after 1s delay; on finalize, clears and re-fetches stats | —                               |
+| Event                     | LibraryView                                                                                                                                             | ContentView                                            | HubView / Wishlist                                                         | StatusBar                                                                                | DownloadStore                     |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ | -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------- |
+| `packages:updated`        | `fetchPackages`, `fetchBackendCounts`, `checkForUpdates`, `refreshDetail`, tag/author counts; missing-dep fetch or invalidate depending on filter state | `fetchContents`, `refreshSelection`, tag/author counts | re-sync install badges on visible cards; reload wishlist if loaded         | `fetchStats`                                                                             | —                                 |
+| `contents:updated`        | `refreshDetail`                                                                                                                                         | `fetchContents`, `refreshSelection`                    | —                                                                          | `fetchStats`                                                                             | —                                 |
+| `labels:updated`          | `useLabelsStore.fetchLabels`; prune stale `selectedLabelIds` (App.jsx)                                                                                  | same                                                   | —                                                                          | —                                                                                        | —                                 |
+| `wishlist:updated`        | —                                                                                                                                                       | —                                                      | `load()` if loaded; otherwise `loadIds()` only for peer membership changes | —                                                                                        | —                                 |
+| `downloads:updated`       | —                                                                                                                                                       | —                                                      | —                                                                          | —                                                                                        | `fetchItems` (rebuilds indexes)   |
+| `downloads:pause-changed` | —                                                                                                                                                       | —                                                      | —                                                                          | —                                                                                        | set peer pause state from payload |
+| `download:progress`       | —                                                                                                                                                       | —                                                      | —                                                                          | —                                                                                        | updates `liveProgress` in place   |
+| `download:failed`         | —                                                                                                                                                       | —                                                      | —                                                                          | —                                                                                        | toast notification                |
+| `scan:progress`           | —                                                                                                                                                       | —                                                      | —                                                                          | updates `scan` state; shows bar after 1s delay; on finalize, clears and re-fetches stats | —                                 |
 
 Notes on LibraryView's `packages:updated` handling:
 
@@ -1013,6 +1117,7 @@ Notes on LibraryView's `packages:updated` handling:
 Notes on DownloadStore:
 
 - `download:progress` is a pure in-memory update driven by the event payload — no IPC round-trip.
+- `downloads:pause-changed` is emitted with `notifyPeers` only for pause/resume/cancel-all. The actor remains optimistic; peers set the boolean directly. Ordinary standalone `downloads:updated` handling remains unchanged and performs no extra pause query or pruning.
 
 ### Cross-Store Synchronization
 
@@ -1136,22 +1241,20 @@ User clicks "Uninstall" on package A (which has dependents)
 User clicks "Disable" on package A
   │
   Main process:
-  ├─ Compute cascadeDisable(A) → {B, C}  (deps to cascade-disable)
-  ├─ rename A.var → A.var.disabled
-  ├─ rename B.var → B.var.disabled        (cascade)
-  ├─ rename C.var → C.var.disabled        (cascade)
-  ├─ DB: setStorageState for A, B, C  (via applyStorageState chokepoint)
-  ├─ In-mem: patchStorageState([A, B, C], 'disabled')  ── fast in-place patch on packageIndex
+  ├─ Compute cascadeDisable(A) → {B, C}
+  ├─ For each target: nextStorageStateForIntent(current, 'disable', disableTarget)
+  │     disableTarget ← parseDisableBehavior(settings.disable_behavior)
+  │       'suffix'  → storage_state='disabled' in main (empty .var.disabled marker beside bare .var)
+  │       'move-to:<id>' → storage_state='offloaded' in aux dir (bare .var)
+  ├─ applyStorageState for A, B, C  (single chokepoint: fs.rename + DB + watcher suppression)
+  ├─ In-mem: patchStorageState([A, B, C], …)
   ├─ notify('packages:updated')
-  └─ Return {ok, storageState: 'disabled', cascadeCount: 2}
+  └─ Return {ok, storageState, cascadeCount}
   │
-  Renderer:
-  ├─ App-level listener calls useLibraryStore.fetchPackages()
-  ├─ fetchPackages rebuilds packageByFilename + triggers useContentStore.relink()
-  ├─ relink rebuilds the contents array with refreshed c.package references
-  └─ ContentView re-renders disabled-badge dim, "disabled" facet count, etc. (no contents:list IPC)
-  Toast: "Disabled A and 2 dependencies"
+  Renderer: fetchPackages → relink content package refs → toast with cascade count
 ```
+
+Re-enable inverts the matrix (`intent: 'enable'`) — an offloaded package returns to main `enabled`; a suffix-disabled package drops the `.disabled` suffix.
 
 ### Data Staleness and Consistency
 
@@ -1239,14 +1342,15 @@ The Library gallery uses a default `itemWidth` of 220px (user-adjustable, persis
 
 A generic, resizable filter sidebar used by all three main views. Supports these section types:
 
-| Section Type        | Behavior                                                                |
-| ------------------- | ----------------------------------------------------------------------- |
-| `list`              | Single-select buttons with optional icons and color indicators          |
-| `tags`              | Multi-select with color dot badges and toggle checkboxes                |
-| `text`              | Simple text input with clear button                                     |
-| `text-autocomplete` | Text input with dropdown suggestions (substring match, sorted by count) |
-| `tags-autocomplete` | Multi-select tags with dropdown suggestions                             |
-| `select`            | Dropdown select                                                         |
+| Section Type          | Behavior                                                                |
+| --------------------- | ----------------------------------------------------------------------- |
+| `list`                | Single-select buttons with optional icons and color indicators          |
+| `tags`                | Multi-select with color dot badges and toggle checkboxes                |
+| `text`                | Simple text input with clear button                                     |
+| `text-autocomplete`   | Text input with dropdown suggestions (substring match, sorted by count) |
+| `tags-autocomplete`   | Multi-select tags with dropdown suggestions                             |
+| `labels-autocomplete` | Multi-select labels with colored chips + inline manage/rename menu      |
+| `select`              | Dropdown select                                                         |
 
 Features: resizable width (persisted to localStorage), global search bar at top, collapsible lists (>6 items with "Show more" toggle).
 
@@ -1262,6 +1366,7 @@ A single `PackageCard.jsx` file exports multiple card components:
 - **`LibraryCard`**: Local package card (thumbnail, metadata, status badges)
 - **`LibraryTableRow`**: Table row variant of library card
 - **`ContentCard`**: Square content item card (type badge, custom tag, hover-reveal controls)
+- **`LabelDots` / `LabelChip`**: Colored label indicators on cards; package labels inherit visually to content
 - **`DepRow`**: Dependency tree row with nested indentation and status tags
 - **`AuthorAvatar`**: Hub avatar or colored-initial fallback
 - **`AuthorLink`**: Clickable author name dispatching filter actions
@@ -1274,11 +1379,19 @@ Renders Creative Commons license abbreviations with a colored badge. License can
 
 Expandable/collapsible content type groups with batch hide/favorite toggle actions on the category header.
 
+### ScrollToTopButton
+
+Floating control mounted by `VirtualGrid` when the scroll container is far from the top.
+
+### StorageStateChip
+
+Badge showing `enabled` / `disabled` / `offloaded` on package detail panels.
+
 ---
 
 ## 19. IPC Channel Reference
 
-Handlers live under `src/main/ipc/` split per domain (`packages.js`, `contents.js`, `hub.js`, `downloads.js`, `scanner.js`, `settings.js`, `thumbnails.js`, `avatars.js`, `shell.js`, `dev.js`, `app.js`) plus the `updater:*` handlers in `src/main/updater.js`. The preload script (`src/preload/index.js`) exposes them verbatim on `window.api`.
+Handlers live under `src/main/ipc/` split per domain (`packages.js`, `contents.js`, `hub.js`, `downloads.js`, `scanner.js`, `settings.js`, `thumbnails.js`, `avatars.js`, `shell.js`, `dev.js`, `labels.js`, `wishlist.js`, `library-dirs.js`, `extract.js`, `remote.js`, plus app handlers in `index.js`) and `updater:*` handlers in `src/main/updater.js`. The preload script (`src/preload/index.js`) exposes them on `window.api`; in client mode (`--connect=`) the same surface is tunneled over WebSocket via `remote-transport.js`.
 
 ### Naming conventions
 
@@ -1292,31 +1405,33 @@ Handlers live under `src/main/ipc/` split per domain (`packages.js`, `contents.j
 
 #### Packages (`src/main/ipc/packages.js`)
 
-| Channel                        | Purpose                                                                      |
-| ------------------------------ | ---------------------------------------------------------------------------- |
-| `packages:list`                | All packages (filtering done client-side)                                    |
-| `packages:detail`              | Single package with deps, dependents, contents                               |
-| `packages:stats`               | Aggregate stats (see §8)                                                     |
-| `packages:status-counts`       | Direct/dependency/broken/orphan counts                                       |
-| `packages:type-counts`         | Counts grouped by package type                                               |
-| `packages:tag-counts`          | Hub tag occurrence counts                                                    |
-| `packages:author-counts`       | Author occurrence counts                                                     |
-| `packages:install`             | Install by Hub resource (with optional dep auto-queue)                       |
-| `packages:install-missing`     | Install a single missing dep of one package                                  |
-| `packages:install-all-missing` | Install every missing ref across the library                                 |
-| `packages:install-deps-batch`  | Install a renderer-supplied list of missing refs                             |
-| `packages:install-dep`         | Install a single dep by Hub file record                                      |
-| `packages:promote`             | Promote dep → direct (single filename or array)                              |
-| `packages:uninstall`           | Single filename or array; demotes instead of deleting when dependents remain |
-| `packages:toggle-enabled`      | Disable/enable on disk (cascade-aware)                                       |
-| `packages:force-remove`        | Delete a package regardless of dependents                                    |
-| `packages:remove-orphans`      | Bulk-remove every package in `orphanSet`                                     |
-| `packages:set-type-override`   | Override the auto-detected type                                              |
-| `packages:missing-deps`        | Aggregated missing-dep data for Library's "missing" filter                   |
-| `packages:enrich-from-hub`     | Backfill Hub metadata for a batch of package stems                           |
-| `packages:file-list`           | Full internal ZIP file list for a `.var`                                     |
-| `packages:check-updates`       | Run the CDN update check                                                     |
-| `packages:redownload`          | Re-fetch a `.var` from the Hub to replace a corrupted copy                   |
+| Channel                        | Purpose                                                                                          |
+| ------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `packages:list`                | All packages (filtering done client-side)                                                        |
+| `packages:detail`              | Single package with deps, dependents, contents                                                   |
+| `packages:stats`               | Aggregate stats (see §8)                                                                         |
+| `packages:status-counts`       | Direct/dependency/broken/orphan counts                                                           |
+| `packages:type-counts`         | Counts grouped by package type                                                                   |
+| `packages:tag-counts`          | Hub tag occurrence counts                                                                        |
+| `packages:author-counts`       | Author occurrence counts                                                                         |
+| `packages:install`             | Install by Hub resource (with optional dep auto-queue)                                           |
+| `packages:install-missing`     | Install a single missing dep of one package                                                      |
+| `packages:install-all-missing` | Install every missing ref across the library                                                     |
+| `packages:install-deps-batch`  | Install a renderer-supplied list of missing refs                                                 |
+| `packages:install-dep`         | Install a single dep by Hub file record                                                          |
+| `packages:promote`             | Promote dep → direct (single filename or array)                                                  |
+| `packages:uninstall`           | Single filename or array; demotes instead of deleting when dependents remain                     |
+| `packages:toggle-enabled`      | Toggle disable/enable/offload via `applyStorageState` (cascade-aware; honors `disable_behavior`) |
+| `packages:set-enabled`         | Set enabled/disabled for an explicit filename list                                               |
+| `packages:force-remove`        | Delete a package regardless of dependents                                                        |
+| `packages:remove-orphans`      | Bulk-remove every package in `orphanSet`                                                         |
+| `packages:set-type-override`   | Override the auto-detected type                                                                  |
+| `packages:setHubResource`      | Manually link a local package to a Hub resource id                                               |
+| `packages:missing-deps`        | Aggregated missing-dep data for Library's "missing" filter                                       |
+| `packages:enrich-from-hub`     | Backfill Hub metadata for a batch of package stems                                               |
+| `packages:file-list`           | Full internal ZIP file list for a `.var`                                                         |
+| `packages:check-updates`       | Run the CDN update check                                                                         |
+| `packages:redownload`          | Re-fetch a `.var` from the Hub to replace a corrupted copy                                       |
 
 `packages:install-missing`, `packages:install-all-missing`, and `packages:install-deps-batch` are three distinct entry points; all three are backed by the Hub client's `findPackages`.
 
@@ -1343,6 +1458,12 @@ Handlers live under `src/main/ipc/` split per domain (`packages.js`, `contents.j
 | `hub:check-availability` | Hub availability for a batch of dep refs                                   |
 | `hub:scan-packages`      | Trigger the packages.json CDN scan                                         |
 | `hub:invalidateCaches`   | Clear in-memory Hub LRU caches                                             |
+| `hub:isLoggedIn`         | Whether Hub session cookies are present (local-only; not proxied remotely) |
+| `hub:resourceUserState`  | Favorite/bookmark/rate/like state for a resource                           |
+| `hub:toggleFavorite`     | Toggle Hub favorite (auth-guarded)                                         |
+| `hub:toggleBookmark`     | Toggle Hub bookmark (auth-guarded)                                         |
+| `hub:toggleRate`         | Toggle Hub rating (auth-guarded)                                           |
+| `hub:toggleLike`         | Toggle Hub like (auth-guarded)                                             |
 
 #### Downloads (`src/main/ipc/downloads.js`)
 
@@ -1373,6 +1494,58 @@ Handlers live under `src/main/ipc/` split per domain (`packages.js`, `contents.j
 | `wizard:enrich-hub`          | Trigger Hub metadata enrichment (drives `hub-scan:progress`)                                                                                                                       |
 | `startup:consume-unreadable` | One-shot drain of unreadable-`.var` files collected during the startup scan; further instances arrive via `scan:unreadable` events                                                 |
 
+#### Labels (`src/main/ipc/labels.js`)
+
+| Channel                 | Purpose                                          |
+| ----------------------- | ------------------------------------------------ |
+| `labels:list`           | All label definitions with application counts    |
+| `labels:create`         | Find-or-create by name (idempotent)              |
+| `labels:rename`         | Rename a label                                   |
+| `labels:recolor`        | Set palette index, Auto (`-1`), or None (`null`) |
+| `labels:delete`         | Delete label and cascade junction rows           |
+| `labels:apply-packages` | Apply/remove label across N packages             |
+| `labels:apply-contents` | Apply/remove label across N content items        |
+
+#### Wishlist (`src/main/ipc/wishlist.js`)
+
+| Channel           | Purpose                                                                    |
+| ----------------- | -------------------------------------------------------------------------- |
+| `wishlist:list`   | All wishlist snapshots, annotated with install state                       |
+| `wishlist:ids`    | Resource-id set for pin badges                                             |
+| `wishlist:add`    | Persist snapshot (+ prefetch thumbnail); `notifyPeers('wishlist:updated')` |
+| `wishlist:remove` | Remove entry; `notifyPeers('wishlist:updated')`                            |
+
+#### Library directories (`src/main/ipc/library-dirs.js`)
+
+| Channel               | Purpose                                                   |
+| --------------------- | --------------------------------------------------------- |
+| `library-dirs:list`   | Main path + registered aux dirs with package stats        |
+| `library-dirs:browse` | Native folder picker for a new aux dir                    |
+| `library-dirs:add`    | Register aux dir (same-FS probe), rescan, restart watcher |
+| `library-dirs:remove` | Remove empty aux dir; reset `disable_behavior` if needed  |
+
+#### Preset extraction (`src/main/ipc/extract.js`)
+
+| Channel                    | Purpose                                                                                        |
+| -------------------------- | ---------------------------------------------------------------------------------------------- |
+| `extract:probe-scene`      | Which appearance/outfit presets are missing for one scene row                                  |
+| `extract:probe-package`    | Package-level scene probe for context menus                                                    |
+| `extract:resolve-source`   | Reverse lookup: extracted preset → source scene + atom                                         |
+| `extract:run`              | Write one or batch of presets (`appearance` \| `outfit`, `create` \| `overwrite` \| `refresh`) |
+| `extract:run-for-packages` | Bulk extract across selected package filenames                                                 |
+
+#### Remote control (`src/main/ipc/remote.js`)
+
+| Channel                        | Purpose                                                |
+| ------------------------------ | ------------------------------------------------------ |
+| `remote:status`                | `{ running, port, clients }`                           |
+| `remote:local-ips`             | Enumerated LAN IPv4 addresses (+ primary egress guess) |
+| `remote:start` / `remote:stop` | Hot-toggle the WebSocket server                        |
+| `remote:relaunch-connect`      | Relaunch as client with `--connect=<url>`              |
+| `remote:relaunch-disconnect`   | Relaunch as local instance; clear autoconnect file     |
+| `remote:get-autoconnect`       | Read persisted client autoconnect URL                  |
+| `remote:set-autoconnect`       | Arm/disarm client autoconnect (file-backed; no DB)     |
+
 #### Settings / App / Shell
 
 | Channel                    | Purpose                        |
@@ -1398,7 +1571,7 @@ Handlers live under `src/main/ipc/` split per domain (`packages.js`, `contents.j
 | `updater:check`      | Force an update check                                |
 | `updater:install`    | Quit-and-install a downloaded update                 |
 | `updater:getChannel` | Current update channel (`stable` / `dev`)            |
-| `updater:setChannel` | Switch channel and kick off a background check (§21) |
+| `updater:setChannel` | Switch channel and kick off a background check (§23) |
 
 #### Dev (`src/main/ipc/dev.js`)
 
@@ -1415,22 +1588,29 @@ When developer options are unlocked, **F12** (and Ctrl+Shift+I / Cmd+Alt+I) togg
 
 ### Event channels (Main → Renderer)
 
-| Channel                     | Payload                                                            | Frequency                                   |
-| --------------------------- | ------------------------------------------------------------------ | ------------------------------------------- |
-| `packages:updated`          | —                                                                  | On package changes                          |
-| `contents:updated`          | —                                                                  | On content changes                          |
-| `downloads:updated`         | —                                                                  | On download queue changes                   |
-| `thumbnails:updated`        | `{ keys }` (invalidated thumbnail cache keys, e.g. `pkg:filename`) | After background thumb resolution (batched) |
-| `avatars:updated`           | —                                                                  | After avatar cache update                   |
-| `download:progress`         | `{id, progress, speed, bytesLoaded, fileSize}`                     | Every 250ms per active download             |
-| `download:failed`           | `{id, error}`                                                      | On download failure                         |
-| `scan:progress`             | `{phase, step, total, message}`                                    | During local library scan                   |
-| `scan:unreadable`           | `{filename}` per event                                             | Unreadable `.var` detected post-startup     |
-| `hub-scan:progress`         | `{current, total, found, phase, ...}`                              | During first-run / Hub enrichment           |
-| `auto-hide:progress`        | `{current, total, filename?, items, ...}`                          | During batch `.hide` application            |
-| `integrity:progress`        | `{checked, total}`                                                 | During integrity check                      |
-| `updater:update-available`  | `{version, ...}`                                                   | When an update is available                 |
-| `updater:update-downloaded` | `{version, ...}`                                                   | When an update is ready to install          |
+| Channel                     | Payload                                                            | Frequency                                                             |
+| --------------------------- | ------------------------------------------------------------------ | --------------------------------------------------------------------- |
+| `packages:updated`          | —                                                                  | On package changes                                                    |
+| `contents:updated`          | —                                                                  | On content changes                                                    |
+| `labels:updated`            | —                                                                  | On label metadata or application counts                               |
+| `wishlist:updated`          | optional `{ membership: true }`                                    | Peer pin/unpin (`notifyPeers`) + bare snapshot/unavailability changes |
+| `downloads:updated`         | —                                                                  | On download queue changes                                             |
+| `downloads:pause-changed`   | boolean                                                            | Peer-only pause/resume/cancel-all state                               |
+| `thumbnails:updated`        | `{ keys }` (invalidated thumbnail cache keys, e.g. `pkg:filename`) | After background thumb resolution (batched)                           |
+| `avatars:updated`           | —                                                                  | After avatar cache update                                             |
+| `download:progress`         | `{id, progress, speed, bytesLoaded, fileSize}`                     | Every 250ms per active download                                       |
+| `download:failed`           | `{id, error}`                                                      | On download failure                                                   |
+| `scan:progress`             | `{phase, step, total, message}`                                    | During local library scan                                             |
+| `scan:unreadable`           | `{filename}` per event                                             | Unreadable `.var` detected post-startup                               |
+| `hub-scan:progress`         | `{current, total, found, phase, ...}`                              | During first-run / Hub enrichment                                     |
+| `hub:auth-changed`          | `{ loggedIn }`                                                     | Hub session gained/lost (local only; not broadcast)                   |
+| `updater:update-*` / error  | version / message                                                  | Host updater status (local only; not broadcast)                       |
+| `remote:server-status`      | `{ running, port, clients }`                                       | Local server start/stop or client connect/disconnect                  |
+| `auto-hide:progress`        | `{current, total, filename?, items, ...}`                          | During batch `.hide` application                                      |
+| `integrity:progress`        | `{checked, total}`                                                 | During integrity check                                                |
+| `updater:update-available`  | `{version, ...}`                                                   | When an update is available                                           |
+| `updater:update-downloaded` | `{version, ...}`                                                   | When an update is ready to install                                    |
+| `updater:error`             | `{message}`                                                        | Updater failure (check/download/mac staging)                          |
 
 ---
 
@@ -1450,7 +1630,9 @@ When developer options are unlocked, **F12** (and Ctrl+Shift+I / Cmd+Alt+I) togg
 | Database       | better-sqlite3             | 12.8.0        |
 | File watching  | @parcel/watcher            | 2.5.6         |
 | ZIP reading    | yauzl                      | 3.3.0         |
+| WebSocket      | ws                         | 8.21.0        |
 | Language       | JavaScript (no TypeScript) | —             |
+| Node (engines) | Node.js                    | ≥ 24          |
 
 ### Path Aliases
 
@@ -1461,33 +1643,66 @@ When developer options are unlocked, **F12** (and Ctrl+Shift+I / Cmd+Alt+I) togg
 
 ```
 src/
-├── main/           (~36 files — Electron backend; count drifts with features)
-│   ├── db.js, store.js, index.js
-│   ├── scanner/    (var-reader, classifier, graph, ingest, integrity)
-│   ├── hub/        (client, packages-json, scanner)
+├── main/           (~76 files — Electron backend)
+│   ├── db.js, store.js, storage-state.js, index.js
+│   ├── scanner/    (var-reader, classifier, graph, ingest, inherit, integrity, local)
+│   ├── scenes/     (extract.js, extractor.js, extract-targets.js, scene-source.js)
+│   ├── hub/        (client, packages-json, scanner, interactions)
 │   ├── downloads/  (manager)
-│   ├── ipc/        (per-domain handlers)
-│   └── vam-prefs.js, watcher.js, notify.js, thumb-resolver.js, thumbnails.js,
-│       avatar-cache.js, updater.js, browser-assist.js, p-limit.js
+│   ├── remote/     (server.js, registry.js, autostart.js, cli.js)
+│   ├── ipc/        (per-domain handlers incl. labels, wishlist, extract, remote, library-dirs)
+│   └── vam-prefs.js, watcher.js, notify.js, library-dirs.js, thumb-resolver.js,
+│       thumbnails.js, avatar-cache.js, updater.js, mac-update.js, browser-assist.js, p-limit.js
 ├── preload/
-│   └── index.js    (contextBridge → window.api)
-├── renderer/       (~55 files under src/ — React frontend)
+│   ├── index.js           (contextBridge → window.api)
+│   └── remote-transport.js (WebSocket client transport when --connect= is set)
+├── renderer/
 │   └── src/
 │       ├── App.jsx
 │       ├── views/      (Hub, Library, Content, Settings)
-│       ├── components/ (PackageCard, FilterPanel, DownloadsPanel, FirstRun, StatusBar, VirtualGrid, etc.)
-│       ├── stores/     (Zustand stores per domain)
-│       ├── hooks/      (useThumbnail, useAvatar, useHubInstallState, etc.)
-│       ├── lib/        (utils, licenses)
+│       ├── components/ (PackageCard, FilterPanel, labels/*, DownloadsPanel, FirstRun, …)
+│       ├── stores/     (Zustand stores + persistViewState helpers)
+│       ├── hooks/      (useThumbnail, useAvatar, useHubInstallState, …)
+│       ├── lib/        (utils, licenses, labels, semver, changelog)
 │       └── assets/     (main.css)
-└── shared/ (shared modules between main and renderer; includes tests)
-    ├── content-types.js, hub-http.js, licenses.js, paths.js, search-text.js
-    └── licenses.test.js
+└── shared/ (modules + tests shared between main and renderer)
+    ├── content-types.js, disable-behavior.js, hub-http.js, licenses.js, paths.js,
+    │   search-text.js, net-codec.js, remote-config.js, local-package.js, version.js
+    └── *.test.js
 ```
 
 ---
 
-## 21. Release Channels
+## 21. Preset Extraction
+
+Scenes and legacy looks share VaM's `{ atoms: [{ type: "Person", storables }] }` JSON shape. `scenes/extract.js` reads that JSON (from inside a `.var` or loose on disk), filters storable entries, and writes `.vap` (+ optional `.jpg`) presets under:
+
+```
+{vamDir}/Custom/Atom/Person/Appearance/extracted/Preset_<creator> - <name>.vap
+{vamDir}/Custom/Atom/Person/Clothing/extracted/Preset_<creator> - <name>.vap   (outfit)
+```
+
+**Probe path**: At scan time, scene-source rows store `person_atom_ids` (v17). During `buildFromDb()`, `extractedAppearanceBasenames` collects basenames of loose `look` rows under `Appearance/extracted/`; package cards compare scene rows against that set for the "no preset" / checkmark UI.
+
+**Write path**: Context menus in `LibraryPackageContextMenu` and `ContentItemContextMenu` call `extract:run` (single/batch) or `extract:run-for-packages` (bulk selection). Modes: `create` (skip existing), `overwrite`, `refresh`. After any write, `refreshAfterExtract()` runs `runLocalScan` + `buildFromDb()` + `packages:updated` so library cards flip immediately (the watcher emits `contents:updated` after its debounce).
+
+**Extracted preset lifecycle**: Loose presets are `__local__` content rows attributed to an owning package via `extractedFrom` / `extractedByPackage`. They appear in Content with an "Extracted" tag and inherit the owner's storage state. Disable/delete of extracted `.vap` files uses `scenes/extracted-lifecycle.js` rename/unlink plans (`.disabled` suffix + sidecar carry).
+
+---
+
+## 22. Remote Client/Server Mode
+
+One Electron instance can host the full main-process backend on the LAN while others connect as thin clients.
+
+**Server** (`remote/server.js`): A `ws` listener on `0.0.0.0` (default port `42069`, see `shared/remote-config.js`). `remote/registry.js` captures every `ipcMain.handle` registration into a lookup map; incoming `{ channel, args }` frames invoke the same handlers locally unless denied by `remote/channel-policy.js` (`shell:*`, `remote:*`, `updater:*`, `dev:*`, native browse/detect, Hub session toggles, database-path disclosure). `notify()` events are rebroadcast to all connected clients except machine-local channels (`hub:auth-changed`, `updater:*`). `notifyPeers()` skips the invoking renderer or WebSocket when the actor is already current. No authentication — trusted-LAN assumption. Version mismatch is rejected unless the peer runs in dev/unlocked-developer mode.
+
+**Client** (`preload/remote-transport.js`): When launched with `--connect=<ws://host:port>`, all `window.api.*` invokes become WebSocket RPC; event subscriptions receive rebroadcast payloads. `remote:*`, `shell:openExternal`, updater, and Hub session channels still use local IPC (or stubs); the server denylist is the backstop against raw peers bypassing that routing.
+
+**Settings UX**: Enable remote mode, optional serve-on-launch, pick port, copy `ws://<ip>:<port>`. Connecting/disconnecting relaunches the app with/without `--connect=` (hot-switching transport mid-session is intentionally not supported). Client autoconnect URL is stored in a standalone file (`remote/autostart.js`) because a pure client head may have no DB yet.
+
+---
+
+## 23. Release Channels
 
 Two GitHub Actions workflows publish to separate channels. The in-app setting `update_channel` (`stable` | `dev`, default `stable`) picks which feed `electron-updater` uses via [`src/main/updater.js`](../src/main/updater.js).
 
@@ -1511,3 +1726,14 @@ Dev builds use `X.Y.(Z+1)-dev.<run_number>` so they sort strictly ahead of the c
 ### Channel switching at runtime
 
 `updater:setChannel` persists the new value, reconfigures `setFeedURL`, and kicks off a background `checkForUpdates()` without awaiting it — the IPC returns immediately and no app restart is needed.
+
+### macOS: custom install path (no Apple certificate)
+
+Mac builds are ad-hoc signed (`identity: '-'`), and Squirrel.Mac — the native updater electron-updater delegates to on mac — validates the downloaded bundle against the running app's designated requirement, which an ad-hoc signature can never satisfy (ShipIt aborts with "code failed to satisfy specified code requirement(s)"). So on darwin electron-updater is used only for **check + download** (the zip is still sha512-verified against `latest-mac.yml`), and the install step is a custom bundle swap in [`src/main/mac-update.js`](../src/main/mac-update.js):
+
+1. `autoInstallOnAppQuit` is forced off on mac — that flag is what hands the zip to Squirrel right after download (`MacUpdater.updateDownloaded`).
+2. On `update-downloaded`, the zip is **staged**: extracted with `ditto -xk` (preserves framework symlinks), quarantine stripped defensively (`xattr -dr` — Node downloads don't set it anyway), and `updater:update-downloaded` is only broadcast once staging succeeds.
+3. `updater:install` (or a normal quit, via a `will-quit` hook for `autoInstallOnAppQuit` parity) swaps the staged `.app` over the installed bundle with two `/bin/mv` renames — safe while running, macOS keeps the process's inodes alive — then relaunches. A failed second rename rolls the old bundle back.
+4. Guard rails: refuses when not running from an `.app` or when Gatekeeper-translocated (`/AppTranslocation/` path), returning an actionable error instead of failing silently.
+
+This mirrors what ShipIt itself (and Sparkle/Tauri/Velopack) does mechanically, minus the signature check we cannot satisfy — integrity still rests on GitHub HTTPS + the checksum, same trust model as the unsigned Windows/Linux channels. Updater failures anywhere (download, staging, install) are surfaced to the renderer via `updater:error` and shown as a toast; `updater:install` returns `{ ok, error? }`. The **first** install remains manual (browser-downloaded DMG is quarantined; release notes carry the one-time `xattr -dr com.apple.quarantine` instruction) — only subsequent updates are automatic.

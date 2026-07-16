@@ -1,9 +1,10 @@
-import { createWriteStream } from 'fs'
-import { stat as fsStat, rename, unlink, mkdir } from 'fs/promises'
+import { createWriteStream, constants as fsConstants } from 'fs'
+import { stat as fsStat, rename, unlink, mkdir, copyFile } from 'fs/promises'
 import { join, dirname } from 'path'
-import { HUB_HTTP_USER_AGENT } from '@shared/hub-http.js'
-import { net, session } from 'electron'
+import { randomUUID } from 'crypto'
+import { net } from 'electron'
 import { verifyZipFile } from '../var-stability.js'
+import { parseVarFilename, canonicalVarFilename } from '../scanner/var-reader.js'
 import {
   insertDownload,
   getDownload,
@@ -31,6 +32,7 @@ import { notify } from '../notify.js'
 import { scanAndUpsert } from '../scanner/ingest.js'
 import { computeAutoHidePathsForNewPackage } from '../scanner/index.js'
 import { inheritFromOlderVersion } from '../scanner/inherit.js'
+import { refreshExtractedPresetsForUpdates } from '../scenes/extract-refresh.js'
 import { computeCascadeEnable, parseDepRef, isFlexibleRef } from '../scanner/graph.js'
 import {
   buildFromDb,
@@ -41,9 +43,11 @@ import {
   getPackageIndex,
   getTransitiveMissingRefs,
   findLocalByFilename,
+  resolveHubDownloadUrl,
+  packageHasNoLookPresetTag,
 } from '../store.js'
 import { readAllPrefs, hidePackageContent } from '../vam-prefs.js'
-import { recordOwnedPath } from '../watcher.js'
+import { recordOwnedPath, withBulkWindow } from '../watcher.js'
 import { resolvePackageThumbnails } from '../thumb-resolver.js'
 import { applyStorageState, computeInstallTarget, parseDisableBehavior } from '../storage-state.js'
 import { getMainLibraryDirPath } from '../library-dirs.js'
@@ -52,7 +56,6 @@ const MAX_CONCURRENT = 5
 const PROGRESS_INTERVAL_MS = 250
 const MAX_AUTO_RETRIES = 5
 const RETRY_BASE_DELAY_MS = 2000 // 2s, 4s, 8s, 16s, 32s
-const DOWNLOADS_PAUSED_SETTING = 'downloads_paused'
 
 /** True for errors that are likely transient network failures (Wi-Fi switch, brief outage). */
 function isTransientNetworkError(err) {
@@ -77,24 +80,30 @@ let retryTimers = new Map() // id → pending setTimeout handle
 let paused = false
 let pendingDepLookups = new Set() // dep refs currently in-flight via findPackages
 
-export async function initDownloadManager() {
-  paused = getSetting(DOWNLOADS_PAUSED_SETTING) === '1'
-  if (paused) {
-    resetActiveDownloads()
-    clearCompleted()
-    return
-  }
+const PAUSED_SETTING = 'downloads_paused'
 
-  // Clean up temp files from any interrupted downloads before marking them failed
-  const rows = getAllDownloads()
-  for (const r of rows) {
-    if (r.temp_path && (r.status === 'active' || r.status === 'queued')) {
-      try {
-        await unlink(r.temp_path)
-      } catch {}
+function persistPaused(value) {
+  setSetting(PAUSED_SETTING, value ? '1' : null)
+}
+
+export async function initDownloadManager() {
+  const wasPaused = getSetting(PAUSED_SETTING) === '1'
+  if (wasPaused) {
+    // User left downloads paused — keep the queue and partial .tmp files
+    paused = true
+    resetActiveDownloads()
+  } else {
+    // Crash / unclean exit — discard partials and mark unfinished as failed
+    const rows = getAllDownloads()
+    for (const r of rows) {
+      if (r.temp_path && (r.status === 'active' || r.status === 'queued')) {
+        try {
+          await unlink(r.temp_path)
+        } catch {}
+      }
     }
+    failUnfinishedDownloads()
   }
-  failUnfinishedDownloads()
   clearCompleted()
 }
 
@@ -147,38 +156,6 @@ export function concreteDepFilename(file) {
   const ver = file?.latest_version
   if (!name || !/^\d+$/.test(String(ver))) return null
   return name + '.' + ver + '.var'
-}
-
-export function openDownloadStream(url, { headers = {}, signal } = {}) {
-  return new Promise((resolve, reject) => {
-    const request = net.request({ url, redirect: 'follow' })
-    for (const [name, value] of Object.entries(headers)) {
-      if (value !== undefined && value !== null && value !== '') request.setHeader(name, value)
-    }
-    const abort = () => {
-      const err = new Error('The operation was aborted')
-      err.name = 'AbortError'
-      request.abort()
-      reject(err)
-    }
-    if (signal?.aborted) return abort()
-    signal?.addEventListener('abort', abort, { once: true })
-    request.on('response', (body) => {
-      signal?.removeEventListener('abort', abort)
-      const status = body.statusCode || 0
-      resolve({
-        body,
-        status,
-        statusText: body.statusMessage || '',
-        ok: status >= 200 && status < 300,
-      })
-    })
-    request.on('error', (err) => {
-      signal?.removeEventListener('abort', abort)
-      reject(err)
-    })
-    request.end()
-  })
 }
 
 // --- Public API (called by IPC handlers) ---
@@ -503,6 +480,163 @@ export async function enqueueInstallRef(hubFileData) {
   return { ok: true }
 }
 
+/** Resolve + validate the import target, returning the addon dir and canonical .var name. */
+function resolveImportTarget(filename) {
+  if (!getSetting('vam_dir')) throw new Error('VaM directory not configured')
+  const addonDir = getMainLibraryDirPath()
+  if (!addonDir) throw new Error('Main library directory not configured')
+
+  const canonical = canonicalVarFilename(String(filename || '').trim())
+  if (!/\.var$/i.test(canonical) || !parseVarFilename(canonical)) {
+    throw new Error(`Not a valid .var filename: ${filename}`)
+  }
+  return { addonDir, canonical }
+}
+
+/** Coerce a Buffer/Uint8Array/array-like into a Buffer over its own byte window. */
+function toBuffer(bytes) {
+  return Buffer.isBuffer(bytes)
+    ? bytes
+    : bytes instanceof Uint8Array
+      ? Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+      : Buffer.from(bytes)
+}
+
+/**
+ * Verify a fully-written temp .var, atomically rename it into place, and run the
+ * same post-add integration the download path uses (scan + upsert, inherit,
+ * auto-hide, graph rebuild, cascade-enable, notify). Imported as a direct
+ * install with no Hub linkage and without auto-queuing deps — missing deps
+ * surface in the normal Library UI. Unlinks the temp file on verify failure.
+ */
+async function finalizeImportedVar(canonical, tempPath, finalPath) {
+  try {
+    await verifyZipFile(tempPath)
+  } catch (err) {
+    try {
+      await unlink(tempPath)
+    } catch {}
+    throw new Error(`Not a valid .var package: ${err.message}`)
+  }
+
+  await withBulkWindow(async () => {
+    recordOwnedPath(finalPath)
+    await rename(tempPath, finalPath)
+  })
+
+  await postDownloadIntegrate(canonical, finalPath, true, null, false)
+
+  return { ok: true, filename: canonical }
+}
+
+/**
+ * Import a dragged-in .var that the main process can read directly by path —
+ * the local (non-remote) fast path. Copies the source into place instead of
+ * streaming its bytes through the renderer/IPC: no read into renderer memory,
+ * no structured-clone copy per chunk. `COPYFILE_FICLONE` makes this a
+ * copy-on-write reflink on filesystems that support it (e.g. APFS/Btrfs), so a
+ * same-volume import is near-instant; elsewhere it falls back to a plain copy.
+ * The source file is left untouched. Verify + atomic rename + integrate are
+ * shared with the streamed path via `finalizeImportedVar`.
+ */
+export async function importLocalFromPath({ filename, sourcePath }) {
+  const { addonDir, canonical } = resolveImportTarget(filename)
+  if (findLocalByFilename(canonical)) return { already: true, filename: canonical }
+
+  const finalPath = join(addonDir, canonical)
+  const tempPath = finalPath + '.import.tmp'
+  await mkdir(dirname(finalPath), { recursive: true })
+
+  try {
+    await copyFile(sourcePath, tempPath, fsConstants.COPYFILE_FICLONE)
+  } catch (err) {
+    try {
+      await unlink(tempPath)
+    } catch {}
+    throw err
+  }
+
+  return finalizeImportedVar(canonical, tempPath, finalPath)
+}
+
+/**
+ * Import a dragged-in .var, streamed in bounded chunks: begin → chunk* → finish
+ * (or abort). Chunking is required for the remote (client→server) bridge, whose
+ * wire codec base64-encodes each buffer into a single JS string — a whole 500MB
+ * .var would blow past Node's max string length (and the WS `maxPayload`). The
+ * server writes chunks straight to a temp file, so the full payload never has
+ * to exist in memory or as one string; the same path runs locally too.
+ */
+const activeVarUploads = new Map() // uploadId -> { canonical, tempPath, finalPath, stream, bytesWritten, error }
+
+export async function beginImportLocalVar({ filename }) {
+  const { addonDir, canonical } = resolveImportTarget(filename)
+  // Short-circuit before opening any file so an already-installed package costs
+  // a single round-trip and the client can skip uploading the bytes entirely.
+  if (findLocalByFilename(canonical)) return { already: true, filename: canonical }
+
+  const finalPath = join(addonDir, canonical)
+  const tempPath = finalPath + '.import.tmp'
+  await mkdir(dirname(finalPath), { recursive: true })
+
+  const stream = createWriteStream(tempPath)
+  const session = { canonical, tempPath, finalPath, stream, bytesWritten: 0, error: null }
+  stream.on('error', (err) => (session.error = err))
+
+  const uploadId = randomUUID()
+  activeVarUploads.set(uploadId, session)
+  return { uploadId, filename: canonical }
+}
+
+export async function appendImportLocalVar({ uploadId, chunk }) {
+  const session = activeVarUploads.get(uploadId)
+  if (!session) throw new Error('Unknown or expired import session')
+  if (session.error) throw session.error
+
+  const buf = toBuffer(chunk)
+  if (!session.stream.write(buf)) {
+    await new Promise((resolve, reject) => {
+      session.stream.once('drain', resolve)
+      session.stream.once('error', reject)
+    })
+  }
+  session.bytesWritten += buf.byteLength
+  return { ok: true, bytesWritten: session.bytesWritten }
+}
+
+export async function finishImportLocalVar({ uploadId }) {
+  const session = activeVarUploads.get(uploadId)
+  if (!session) throw new Error('Unknown or expired import session')
+  activeVarUploads.delete(uploadId)
+
+  await new Promise((resolve, reject) => {
+    session.stream.on('error', reject)
+    session.stream.end(resolve)
+  })
+  if (session.error) throw session.error
+
+  if (session.bytesWritten === 0) {
+    try {
+      await unlink(session.tempPath)
+    } catch {}
+    throw new Error('Empty file')
+  }
+  return finalizeImportedVar(session.canonical, session.tempPath, session.finalPath)
+}
+
+export async function abortImportLocalVar({ uploadId }) {
+  const session = activeVarUploads.get(uploadId)
+  if (!session) return { ok: true }
+  activeVarUploads.delete(uploadId)
+  try {
+    session.stream.destroy()
+  } catch {}
+  try {
+    await unlink(session.tempPath)
+  } catch {}
+  return { ok: true }
+}
+
 /** @returns {Promise<string[]>} Dep refs that could not be queued (not on Hub or no download URL). */
 async function enqueueMissingDeps(detail, parentRef, autoQueueDeps = true) {
   if (!detail.dependencies) return []
@@ -596,13 +730,7 @@ async function enqueueMissingDeps(detail, parentRef, autoQueueDeps = true) {
 }
 
 function resolveDownloadUrl(hubFile) {
-  if (hubFile.downloadUrl && hubFile.downloadUrl !== 'null' && !hubFile.downloadUrl.endsWith('?file=')) {
-    return hubFile.downloadUrl
-  }
-  if (hubFile.urlHosted && hubFile.urlHosted !== 'null') {
-    return hubFile.urlHosted
-  }
-  return null
+  return resolveHubDownloadUrl(hubFile)
 }
 
 export function getDownloadList() {
@@ -667,7 +795,7 @@ export function isPaused() {
 
 export function pauseAll() {
   paused = true
-  setSetting(DOWNLOADS_PAUSED_SETTING, '1')
+  persistPaused(true)
   const ids = [...activeTransfers.keys()]
   for (const id of ids) {
     const transfer = activeTransfers.get(id)
@@ -682,7 +810,7 @@ export function pauseAll() {
 
 export function resumeAll() {
   paused = false
-  setSetting(DOWNLOADS_PAUSED_SETTING, '0')
+  persistPaused(false)
   resetActiveDownloads()
   emitUpdated()
   processQueue()
@@ -701,7 +829,7 @@ export async function cancelAll() {
   }
   cancelAllDownloads()
   paused = false
-  setSetting(DOWNLOADS_PAUSED_SETTING, '0')
+  persistPaused(false)
   pausedProgress.clear()
   for (const timer of retryTimers.values()) clearTimeout(timer)
   retryTimers.clear()
@@ -814,17 +942,13 @@ async function startDownload(entry) {
     } catch {}
     transferState.bytesLoaded = existingBytes
 
-    // Get cookies from the hub session for consent
-    const hubSession = session.fromPartition('persist:hub')
-    const cookies = await hubSession.cookies.get({ url: 'https://hub.virtamate.com' })
-    const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join('; ')
-
-    const headers = { 'User-Agent': HUB_HTTP_USER_AGENT, Cookie: cookieHeader }
+    const headers = { Cookie: 'vamhubconsent=yes' }
     if (existingBytes > 0) headers['Range'] = `bytes=${existingBytes}-`
 
-    const res = await openDownloadStream(download_url, {
+    const res = await net.fetch(download_url, {
       signal: controller.signal,
       headers,
+      redirect: 'follow',
     })
 
     if (existingBytes > 0 && res.status === 200) {
@@ -846,7 +970,10 @@ async function startDownload(entry) {
     const fileStream = createWriteStream(tempPath, existingBytes > 0 ? { flags: 'a' } : undefined)
     const fileError = new Promise((_, reject) => fileStream.on('error', reject))
 
-    for await (const value of res.body) {
+    const reader = res.body.getReader()
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
       if (!fileStream.write(value)) {
         await new Promise((r) => fileStream.once('drain', r))
       }
@@ -1120,9 +1247,24 @@ async function postDownloadIntegrate(filename, fullPath, isDirect, hubResourceId
     // Single full aggregate rebuild (reuses graph from buildGraphOnly above)
     buildFromDb({ skipGraph: true })
 
+    // Top-level Hub installs of Looks packs that have no appearance/skin preset
+    // items (same condition as the library "no preset" badge).
+    if (isDirect && packageHasNoLookPresetTag(filename)) {
+      const pkg = getPackageIndex().get(filename)
+      const label = pkg?.hub_display_name || pkg?.title || pkg?.package_name || filename
+      notify('install:look-no-preset', { filename, label })
+    }
+
     notify('packages:updated')
     notify('contents:updated')
     resolvePackageThumbnails()
+
+    // Auto-refresh extracted presets when this install is a strictly-newer
+    // version of a package the user had extracted from (after the rebuild so
+    // readScene resolves the new .var).
+    if (inherited?.donor && vamDir) {
+      await refreshExtractedPresetsForUpdates([{ filename, donorFilename: inherited.donor, contentItems }], vamDir)
+    }
   } catch (err) {
     console.warn(`Post-download integration failed for ${filename}:`, err.message)
   }
