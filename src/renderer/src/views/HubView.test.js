@@ -75,4 +75,9 @@ describe('HubView infinite page tracking', () => {
     expect(hubView).toContain('captureScrollAnchor')
     expect(hubView).toContain('requestAnimationFrame(() =>')
   })
+
+  it('replaces paged results when detail Next crosses an API page boundary', () => {
+    expect(hubView).toContain("if (browseMode === 'paged') goToPage(targetPage)")
+    expect(hubView).toContain("if (wishlistMode || browseMode !== 'infinite'")
+  })
 })

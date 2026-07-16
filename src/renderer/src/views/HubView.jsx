@@ -541,7 +541,7 @@ export default function HubView({ onNavigate }) {
   const pendingNextFromRef = useRef(null)
   const handleDetailNext = useCallback(() => {
     detailPrefetchRef.current = true
-    const { galleryMode, resources, detailResource, detailData, page, totalPages } = useHubStore.getState()
+    const { galleryMode, browseMode, resources, detailResource, detailData, page, totalPages } = useHubStore.getState()
     const cur = detailResource ? String(detailData?.resource_id ?? detailResource.resource_id ?? '') : ''
     if (galleryMode === 'wishlist') {
       const list = wishlistViewRef.current
@@ -554,27 +554,32 @@ export default function HubView({ onNavigate }) {
     if (idx < resources.length - 1) {
       openDetail(resources[idx + 1])
     } else if (page < totalPages) {
-      pendingNextFromRef.current = cur
-      fetchNextPage()
+      const targetPage = page + 1
+      pendingNextFromRef.current = { fromId: cur, targetPage, replace: browseMode === 'paged' }
+      if (browseMode === 'paged') goToPage(targetPage)
+      else fetchNextPage()
     }
-  }, [openDetail, fetchNextPage])
+  }, [openDetail, fetchNextPage, goToPage])
 
   useEffect(() => {
-    const fromId = pendingNextFromRef.current
-    if (!fromId) return
-    const idx = resources.findIndex((r) => String(r.resource_id) === fromId)
+    const pending = pendingNextFromRef.current
+    if (!pending) return
+    const idx = resources.findIndex((r) => String(r.resource_id) === pending.fromId)
     if (idx >= 0 && idx < resources.length - 1) {
       pendingNextFromRef.current = null
       openDetail(resources[idx + 1])
+    } else if (pending.replace && page === pending.targetPage && resources.length > 0) {
+      pendingNextFromRef.current = null
+      openDetail(resources[0])
     }
-  }, [resources, openDetail])
+  }, [resources, page, openDetail])
 
   // Proactively load the next search page when the shown item nears the end of the
   // loaded list, so Next is rarely a dead wait.
   useEffect(() => {
-    if (wishlistMode || detailIdx < 0 || loading) return
+    if (wishlistMode || browseMode !== 'infinite' || detailIdx < 0 || loading) return
     if (detailIdx >= resources.length - 2 && page < totalPages) fetchNextPage()
-  }, [wishlistMode, detailIdx, resources.length, page, totalPages, loading, fetchNextPage])
+  }, [wishlistMode, browseMode, detailIdx, resources.length, page, totalPages, loading, fetchNextPage])
 
   // Once stepping through, warm the next item's detail into the main-process LRU
   // cache so the upcoming Next resolves without a network round-trip. The previous
