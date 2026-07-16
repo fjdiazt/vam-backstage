@@ -110,6 +110,7 @@ export const useLibraryStore = create(
        *  so content rows can attach a `c.package` reference for read-time joins. */
       packageByFilename: new Map(),
       selectedDetail: null,
+      scrollAnchorFilename: null,
       /** Multi-select: package filenames */
       bulkSelectedFilenames: [],
       bulkAnchorFilename: null,
@@ -363,6 +364,11 @@ export const useLibraryStore = create(
       },
 
       clearSelection: () => set({ selectedDetail: null }),
+      setScrollAnchorFilename: (scrollAnchorFilename) =>
+        set((state) => {
+          const next = scrollAnchorFilename || null
+          return state.scrollAnchorFilename === next ? state : { scrollAnchorFilename: next }
+        }),
 
       toggleBulkSelect: (filename) =>
         set((s) => {
@@ -447,6 +453,7 @@ export const useLibraryStore = create(
       viewMode: oneOf(['grid', 'table']),
       cardWidth: asCardWidth,
       compactCards: asBool,
+      scrollAnchorFilename: asString,
     }),
   ),
 )

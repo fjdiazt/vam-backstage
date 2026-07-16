@@ -102,6 +102,7 @@ import { packageNeedsDisableConfirmation } from '@/lib/package-disable-confirm'
 import { useViewStore } from '@/stores/useViewStore'
 import { useMousePageNavigation } from '@/hooks/useMousePageNavigation'
 import { scrollMousePage, shouldIgnoreMousePageTarget } from '@/lib/mouse-page-nav'
+import { resolveLibraryRestoreIndex } from '@/lib/view-scroll-anchor'
 
 const SORT_OPTIONS = ['Recently installed', 'Type', 'Name', 'Size', 'Content', 'Deps', 'Morphs']
 export const LAZY_LABEL_LOADING = false
@@ -208,6 +209,7 @@ export default function LibraryView({ onNavigate, navContext }) {
   const {
     packages,
     selectedDetail,
+    scrollAnchorFilename,
     search,
     authorSearch,
     excludedAuthors,
@@ -253,6 +255,7 @@ export default function LibraryView({ onNavigate, navContext }) {
     refreshUpdateCheck,
     selectPackage,
     clearSelection,
+    setScrollAnchorFilename,
     bulkSelectedFilenames,
     toggleBulkSelect,
     rangeBulkSelect,
@@ -560,9 +563,9 @@ export default function LibraryView({ onNavigate, navContext }) {
         onChange: setVisibilityFilter,
         listCollapsible: false,
         items: [
+          { value: 'all', label: 'All', count: visibilityCounts.all },
           { value: 'visible', label: 'Visible', count: visibilityCounts.visible },
           { value: 'hidden', label: 'Hidden', count: visibilityCounts.hidden },
-          { value: 'all', label: 'All', count: visibilityCounts.all },
         ],
       },
       {
@@ -723,6 +726,17 @@ export default function LibraryView({ onNavigate, navContext }) {
   const lastSelectedIdxRef = useRef(0)
   const prevScrollResetKeyRef = useRef(scrollResetKey)
   const selectedIdx = selectedDetail ? filtered.findIndex((p) => p.filename === selectedDetail.filename) : -1
+  const restoreIdx = resolveLibraryRestoreIndex(filtered, scrollAnchorFilename, selectedDetail?.filename)
+  const restoreKeyRef = useRef(scrollAnchorFilename ? `anchor:${scrollAnchorFilename}` : '')
+  const restoreKey = restoreKeyRef.current
+  const handleFirstVisibleIndexChange = useCallback(
+    (index) => {
+      if (!libraryActive) return
+      const pkg = filtered[index]
+      if (pkg) setScrollAnchorFilename(pkg.filename)
+    },
+    [filtered, libraryActive, setScrollAnchorFilename],
+  )
   if (selectedIdx >= 0) lastSelectedIdxRef.current = selectedIdx
 
   const runSelectPackage = useCallback(
@@ -1252,6 +1266,9 @@ export default function LibraryView({ onNavigate, navContext }) {
             fixedHeight={compactCards ? 0 : 84}
             className="flex-1"
             scrollResetKey={scrollResetKey}
+            restoreIndex={restoreIdx}
+            restoreKey={restoreKey}
+            onFirstVisibleIndexChange={handleFirstVisibleIndexChange}
             selectedIndex={selectedIdx}
             onLayout={setGridLayout}
             onEmptyAreaPointerDown={bulkActive ? () => clearBulkSelection() : undefined}
@@ -1308,6 +1325,9 @@ export default function LibraryView({ onNavigate, navContext }) {
                 rowHeight={37}
                 className="flex-1"
                 scrollResetKey={scrollResetKey}
+                restoreIndex={restoreIdx}
+                restoreKey={restoreKey}
+                onFirstVisibleIndexChange={handleFirstVisibleIndexChange}
                 renderRow={(pkg) => {
                   const updateInfo = updateCheckResults?.[pkg.filename]
                   const dimUpdateUnavailable = statusFilter === 'updates' && isUpdateUnavailable(updateInfo)

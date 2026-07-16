@@ -36,6 +36,9 @@ export const asPolarityList = (v) => {
 /** Validator: keep strings, drop anything else. */
 export const asString = (v) => (typeof v === 'string' ? v : undefined)
 
+/** Validator: keep string/number identifiers. */
+export const asId = (v) => (typeof v === 'string' || typeof v === 'number' ? v : undefined)
+
 /** Validator: keep booleans, drop anything else. */
 export const asBool = (v) => (typeof v === 'boolean' ? v : undefined)
 

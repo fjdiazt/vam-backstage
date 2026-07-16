@@ -3,7 +3,16 @@ import { persist } from 'zustand/middleware'
 import { toast } from '@/components/Toast'
 import { typeFilterSlice } from './typeFilterSlice'
 import { useLibraryStore } from './useLibraryStore'
-import { persistViewState, oneOf, asArray, asPolarityList, asString, asCardWidth, asObject } from './persistViewState'
+import {
+  persistViewState,
+  oneOf,
+  asArray,
+  asPolarityList,
+  asString,
+  asId,
+  asCardWidth,
+  asObject,
+} from './persistViewState'
 
 /**
  * Attach `c.package` references onto a fresh content array. Content rows arrive
@@ -49,6 +58,8 @@ export const useContentStore = create(
       contents: [],
       selectedItem: null,
       selectedPackage: null, // package detail for the selected item's owning package
+      scrollAnchorItemId: null,
+      scrollAnchorPackageFilename: null,
       /** Multi-select: content item ids (same type as item.id) */
       bulkSelectedIds: [],
       bulkAnchorId: null,
@@ -67,6 +78,8 @@ export const useContentStore = create(
           ...FILTER_DEFAULTS,
           selectedItem: null,
           selectedPackage: null,
+          scrollAnchorItemId: null,
+          scrollAnchorPackageFilename: null,
           bulkSelectedIds: [],
           bulkAnchorId: null,
           ...overrides,
@@ -196,6 +209,14 @@ export const useContentStore = create(
       },
 
       clearSelection: () => set({ selectedItem: null, selectedPackage: null }),
+      setScrollAnchorItem: (item) =>
+        set((state) => {
+          const nextId = item?.id ?? null
+          const nextPackageFilename = item?.packageFilename ?? null
+          return state.scrollAnchorItemId === nextId && state.scrollAnchorPackageFilename === nextPackageFilename
+            ? state
+            : { scrollAnchorItemId: nextId, scrollAnchorPackageFilename: nextPackageFilename }
+        }),
 
       toggleBulkSelect: (id) =>
         set((s) => {
@@ -311,6 +332,8 @@ export const useContentStore = create(
       viewMode: oneOf(['grid', 'table']),
       cardWidth: asCardWidth,
       expandedByType: asObject,
+      scrollAnchorItemId: asId,
+      scrollAnchorPackageFilename: asString,
     }),
   ),
 )

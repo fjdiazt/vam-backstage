@@ -65,6 +65,7 @@ import { StorageStateChip } from '@/components/StorageStateChip'
 import { useViewStore } from '@/stores/useViewStore'
 import { useMousePageNavigation } from '@/hooks/useMousePageNavigation'
 import { scrollMousePage, shouldIgnoreMousePageTarget } from '@/lib/mouse-page-nav'
+import { resolveContentRestoreIndex } from '@/lib/view-scroll-anchor'
 
 const SORT_OPTIONS = ['Recently installed', 'Name A-Z', 'Package', 'Type']
 export const LAZY_LABEL_LOADING = false
@@ -209,6 +210,8 @@ export default function ContentView({ onNavigate, navContext }) {
     contents,
     selectedItem,
     selectedPackage,
+    scrollAnchorItemId,
+    scrollAnchorPackageFilename,
     search,
     authorSearch,
     excludedAuthors,
@@ -242,6 +245,7 @@ export default function ContentView({ onNavigate, navContext }) {
     setCardWidth,
     selectItem,
     clearSelection,
+    setScrollAnchorItem,
     bulkSelectedIds,
     toggleBulkSelect,
     rangeBulkSelect,
@@ -787,6 +791,25 @@ export default function ContentView({ onNavigate, navContext }) {
   const lastSelectedIdxRef = useRef(0)
   const prevScrollResetKeyRef = useRef(scrollResetKey)
   const selectedIdx = selectedItem ? filtered.findIndex((c) => c.id === selectedItem.id) : -1
+  const restoreIdx = resolveContentRestoreIndex(
+    filtered,
+    scrollAnchorItemId,
+    scrollAnchorPackageFilename,
+    selectedItem?.id,
+    selectedItem?.packageFilename,
+  )
+  const restoreKeyRef = useRef(
+    scrollAnchorItemId != null ? `anchor:${scrollAnchorItemId}:${scrollAnchorPackageFilename ?? ''}` : '',
+  )
+  const restoreKey = restoreKeyRef.current
+  const handleFirstVisibleIndexChange = useCallback(
+    (index) => {
+      if (!contentActive) return
+      const item = filtered[index]
+      if (item) setScrollAnchorItem(item)
+    },
+    [contentActive, filtered, setScrollAnchorItem],
+  )
   if (selectedIdx >= 0) lastSelectedIdxRef.current = selectedIdx
 
   const runSelectItem = useCallback(
@@ -1262,6 +1285,9 @@ export default function ContentView({ onNavigate, navContext }) {
             itemHeight={cardWidth}
             className="flex-1"
             scrollResetKey={scrollResetKey}
+            restoreIndex={restoreIdx}
+            restoreKey={restoreKey}
+            onFirstVisibleIndexChange={handleFirstVisibleIndexChange}
             selectedIndex={selectedIdx}
             onLayout={setGridLayout}
             onEmptyAreaPointerDown={bulkActive ? () => clearBulkSelection() : undefined}
@@ -1318,6 +1344,9 @@ export default function ContentView({ onNavigate, navContext }) {
                 rowHeight={37}
                 className="flex-1"
                 scrollResetKey={scrollResetKey}
+                restoreIndex={restoreIdx}
+                restoreKey={restoreKey}
+                onFirstVisibleIndexChange={handleFirstVisibleIndexChange}
                 renderRow={(item) => (
                   <ContentItemContextMenu
                     key={item.id}

@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'fs'
+import { resolve } from 'path'
 import { labelsForContentItems, LAZY_LABEL_LOADING } from './ContentView'
+
+const source = readFileSync(resolve(import.meta.dirname, 'ContentView.jsx'), 'utf8')
 
 describe('ContentView label facets', () => {
   it('keeps label loading eager while facet-filtering options in memory', () => {
@@ -28,5 +32,10 @@ describe('ContentView label facets', () => {
     const items = [{ category: 'Scenes', ownLabelIds: [1, 2], labelSourceCategories: { 1: 'Looks', 2: 'Scenes' } }]
 
     expect(labelsForContentItems(labels, items, [], ['Looks']).map((l) => l.name)).toEqual(['looks:vg'])
+  })
+
+  it('keeps the startup scroll restore token stable while scrolling', () => {
+    expect(source).toContain('const restoreKeyRef = useRef(')
+    expect(source).toContain('const restoreKey = restoreKeyRef.current')
   })
 })

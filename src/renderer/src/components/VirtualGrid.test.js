@@ -15,4 +15,10 @@ describe('virtual scroll back-to-top wiring', () => {
     expect(source).toContain('const scrollRef = providedScrollRef || ownScrollRef')
     expect(source).toContain('onWheel={onWheel}')
   })
+
+  it('restores persisted first-visible anchors in grid and table modes', () => {
+    expect(source.match(/restoreIndex = null/g)).toHaveLength(2)
+    expect(source.match(/onFirstVisibleIndexChange/g).length).toBeGreaterThanOrEqual(4)
+    expect(source.match(/consumedRestoreKeyRef/g).length).toBeGreaterThanOrEqual(4)
+  })
 })
