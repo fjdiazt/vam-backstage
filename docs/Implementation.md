@@ -14,7 +14,7 @@ VaM Backstage solves this by:
 - **Custom labels.** User-defined colored tags on packages and individual content items, with Library/Content filters and inheritance on version upgrades.
 - **Preset extraction.** Write appearance/outfit presets from scenes (and convert legacy looks) into loose VaM files under `Custom/Atom/Person/.../extracted/`.
 - **Disable and offload.** Packages can be disabled in place (VaM-native: an empty `.var.disabled` marker beside the real `.var`) or offloaded to registered aux library directories on the same filesystem; disable behavior is configurable.
-- **Remote client/server mode.** One machine can host the library backend over LAN WebSocket while other instances connect as thin clients (`--connect=`).
+- **Remote client/server and browser mode.** One machine can host the library backend over a same-port HTTP/WebSocket listener; Electron thin clients (`--connect=`) and desktop browsers share the same renderer/API contract.
 
 The application is built with Electron 39, React 19, SQLite (better-sqlite3), Zustand for state management, and Tailwind CSS v4 with shadcn/ui-style components (via the `shadcn` CLI and `radix-ui` primitives). It is JavaScript-only (no TypeScript). The UI is dark-only.
 
@@ -66,8 +66,8 @@ The application is built with Electron 39, React 19, SQLite (better-sqlite3), Zu
 │  └── Zustand Stores (hub, library, content, downloads,    │
 │       installed, labels, wishlist, view, status, remote)  │
 │                                                           │
-│  ──── contextBridge (src/preload/index.js) ────           │
-│       local IPC or remote WebSocket transport             │
+│  ──── shared API facade (`src/shared/api.js`) ────        │
+│       Electron IPC or browser/Electron WebSocket RPC      │
 ├───────────────────────────────────────────────────────────┤
 │                       Main Process                        │
 │                                                           │
@@ -80,7 +80,7 @@ The application is built with Electron 39, React 19, SQLite (better-sqlite3), Zu
 │  ├── scenes/ ── preset extraction from scenes/looks       │
 │  ├── hub/ ── Hub API client + CDN index + interactions    │
 │  ├── downloads/ ── concurrent download engine             │
-│  ├── remote/ ── LAN WebSocket server + IPC registry       │
+│  ├── remote/ ── LAN HTTP/WS server + IPC registry         │
 │  ├── vam-prefs.js ── .hide/.fav sidecar management        │
 │  ├── watcher.js ── FS monitoring (@parcel/watcher)        │
 │  ├── thumb-resolver.js ── Hub thumbnail fetching          │
@@ -112,7 +112,9 @@ On startup, the main process reads SQLite and the filesystem, then builds in-mem
 Communication between the two processes uses two patterns (arrows are elided from the diagram above):
 
 - **Request-response**: renderer calls `ipcRenderer.invoke` (exposed as `window.api.*` by the preload script) and awaits a result from `ipcMain.handle` in main.
-- **Events**: main pushes notifications via `webContents.send`, the renderer subscribes with `ipcRenderer.on`. Used for download progress, invalidation signals, and scan progress.
+- **Events**: main pushes notifications via `webContents.send` and the LAN server rebroadcasts allowed events over WebSocket. Electron and browser adapters expose the same subscription methods.
+
+The browser bootstrap installs `window.api` from the shared API factory before React mounts. `window.api.runtime.capabilities` gates native-only UI while keeping one renderer bundle.
 
 ---
 
@@ -1690,15 +1692,19 @@ Scenes and legacy looks share VaM's `{ atoms: [{ type: "Person", storables }] }`
 
 ---
 
-## 22. Remote Client/Server Mode
+## 22. Remote Client/Server and Browser Mode
 
-One Electron instance can host the full main-process backend on the LAN while others connect as thin clients.
+One Electron instance can host the full main-process backend on the LAN. Other Electron instances can connect as thin clients, and desktop browsers can load the same renderer over HTTP.
 
-**Server** (`remote/server.js`): A `ws` listener on `0.0.0.0` (default port `42069`, see `shared/remote-config.js`). `remote/registry.js` captures every `ipcMain.handle` registration into a lookup map; incoming `{ channel, args }` frames invoke the same handlers locally unless denied by `remote/channel-policy.js` (`shell:*`, `remote:*`, `updater:*`, `dev:*`, native browse/detect, Hub session toggles, database-path disclosure). `notify()` events are rebroadcast to all connected clients except machine-local channels (`hub:auth-changed`, `updater:*`). `notifyPeers()` skips the invoking renderer or WebSocket when the actor is already current. No authentication — trusted-LAN assumption. Version mismatch is rejected unless the peer runs in dev/unlocked-developer mode.
+**Server** (`remote/server.js`, `remote/http-server.js`): one Node HTTP listener binds `0.0.0.0` (default port `42069`, see `shared/remote-config.js`). It serves the production `out/renderer` files, provides SPA fallback, and accepts `ws` upgrades on the same port. `remote/registry.js` captures every `ipcMain.handle` registration into a lookup map; incoming `{ channel, args }` frames invoke the same handlers locally unless denied by `remote/channel-policy.js` (`shell:*`, `remote:*`, `updater:*`, `dev:*`, native browse/detect, Hub session toggles, database-path disclosure). `notify()` events are rebroadcast to all connected clients except machine-local channels (`hub:auth-changed`, `updater:*`). `notifyPeers()` skips the invoking renderer or WebSocket when the actor is already current.
 
-**Client** (`preload/remote-transport.js`): When launched with `--connect=<ws://host:port>`, all `window.api.*` invokes become WebSocket RPC; event subscriptions receive rebroadcast payloads. `remote:*`, `shell:openExternal`, updater, and Hub session channels still use local IPC (or stubs); the server denylist is the backstop against raw peers bypassing that routing.
+**Shared client contract** (`shared/api.js`, `shared/remote-transport.js`): Electron preload and browser bootstrap both construct the same `window.api` facade. Electron uses IPC locally or WebSocket RPC under `--connect=`. A browser uses a same-origin WebSocket URL. Runtime capabilities tell React whether embedded Hub, Hub account actions, native dialogs, Explorer reveal, updater, server controls, and developer tools exist.
 
-**Settings UX**: Enable remote mode, optional serve-on-launch, pick port, copy `ws://<ip>:<port>`. Connecting/disconnecting relaunches the app with/without `--connect=` (hot-switching transport mid-session is intentionally not supported). Client autoconnect URL is stored in a standalone file (`remote/autostart.js`) because a pure client head may have no DB yet.
+**Browser behavior** (`renderer/src/browser-api.js`): browser mode reuses the production renderer. Host-backed library, content, label, scan, download, wishlist, and Hub search/install channels use WebSocket RPC. `.var` import uses the existing chunked upload path. Hub pages open in a normal tab. Native-only operations are stubbed safely and their controls are hidden.
+
+**Settings UX**: Enable client-server mode, optionally serve on launch, choose the port, then open `http://<host-ip>:42069`. Connecting/disconnecting an Electron client relaunches the app with/without `--connect=` because hot-switching transport mid-session is intentionally unsupported. The client autoconnect URL is stored in `remote/autostart.js` because a pure client head may have no DB yet.
+
+**Trust model**: there is no authentication, TLS, or access control. Every device that can reach the port can view and mutate the library. Bind/use it only on a trusted intranet. Version mismatch is rejected unless the peer runs in dev/unlocked-developer mode.
 
 ---
 

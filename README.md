@@ -24,6 +24,14 @@ Explore and organize your collection in a fast desktop interface, with powerful 
 
 **Manage your library from another computer.** Run Backstage on the machine that stores your VaM library, then connect over your local network to browse, download, and manage packages from another computer.
 
+## Intranet browser access
+
+Enable **Client-server mode** in Settings and start the server. Open `http://<host-ip>:42069` in a desktop browser on the same trusted network. The desktop app may stay open as the host, or the packaged executable may run headlessly with `--serve`.
+
+Browser clients support library and content management, scans, downloads, labels, Hub search and installation, and `.var` upload. Hub pages open in a normal browser tab. Native folder selection, Explorer reveal, updates, server controls, developer tools, and Hub account actions remain in Electron.
+
+Remote Access has no authentication. Every device that can reach the port can modify the library. Use it only on a trusted intranet.
+
 ## Development
 
 Requires Node.js >= 24.
