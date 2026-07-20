@@ -49,6 +49,7 @@ import {
 } from '@/components/ui/alert-dialog'
 
 export default function SettingsView() {
+  const capabilities = window.api.runtime.capabilities
   const [vamDir, setVamDir] = useState('')
   const blurThumbnails = useRemoteUiStore((s) => s.blurThumbnails)
   const setBlurThumbnails = useRemoteUiStore((s) => s.setBlurThumbnails)
@@ -118,7 +119,6 @@ export default function SettingsView() {
   useEffect(() => {
     window.api.settings.get('vam_dir').then((v) => setVamDir(v || ''))
     window.api.settings.get('hub_debug_requests').then((v) => setHubDebugRequests(v === '1'))
-    window.api.settings.get('developer_options_unlocked').then((v) => setDeveloperUnlocked(v === '1'))
     window.api.settings.get('disable_behavior').then((v) => setDisableBehavior(v || 'suffix'))
     window.api.settings.get('offload_suggestions_dismissed').then((v) =>
       setDismissedOffload(
@@ -130,28 +130,35 @@ export default function SettingsView() {
         ),
       ),
     )
-    window.api.settings.get('remote_serve_port').then((v) => setServerPort(v || String(DEFAULT_REMOTE_PORT)))
-    window.api.settings.get('remote_serve_on_launch').then((v) => setServeOnLaunch(v === '1'))
-    window.api.settings.get('remote_mode_enabled').then((v) => setRemoteEnabled(v === '1'))
-    window.api.settings.get('remote_connect_url').then((v) => setConnectUrl(v || ''))
-    window.api.remote
-      .getAutoconnect()
-      .then((r) => setAutoConnectArmed(!!r?.url))
-      .catch(() => {})
-    window.api.dev.isDev().then(setIsDev)
-    window.api.dev
-      .countDeletedData()
-      .then((r) =>
-        setDeletedData(
-          r?.ok ? { packages: r.packages, contentLabels: r.contentLabels } : { packages: 0, contentLabels: 0 },
-        ),
-      )
-      .catch(() => {})
+    if (capabilities.serverControl) {
+      window.api.settings.get('remote_serve_port').then((v) => setServerPort(v || String(DEFAULT_REMOTE_PORT)))
+      window.api.settings.get('remote_serve_on_launch').then((v) => setServeOnLaunch(v === '1'))
+      window.api.settings.get('remote_mode_enabled').then((v) => setRemoteEnabled(v === '1'))
+      window.api.settings.get('remote_connect_url').then((v) => setConnectUrl(v || ''))
+      window.api.remote
+        .getAutoconnect()
+        .then((r) => setAutoConnectArmed(!!r?.url))
+        .catch(() => {})
+    }
+    if (capabilities.developerTools) {
+      window.api.settings.get('developer_options_unlocked').then((v) => setDeveloperUnlocked(v === '1'))
+      window.api.dev.isDev().then(setIsDev)
+      window.api.dev
+        .countDeletedData()
+        .then((r) =>
+          setDeletedData(
+            r?.ok ? { packages: r.packages, contentLabels: r.contentLabels } : { packages: 0, contentLabels: 0 },
+          ),
+        )
+        .catch(() => {})
+    }
     window.api.app.getVersion().then(setAppVersion)
-    window.api.updater.getChannel().then((c) => setUpdateChannel(c === 'dev' ? 'dev' : 'stable'))
+    if (capabilities.updater) {
+      window.api.updater.getChannel().then((c) => setUpdateChannel(c === 'dev' ? 'dev' : 'stable'))
+    }
     useHubHiddenStore.getState().hydrate()
     refreshLibDirs()
-  }, [refreshLibDirs])
+  }, [capabilities.developerTools, capabilities.serverControl, capabilities.updater, refreshLibDirs])
 
   const handleAddAuxDir = useCallback(async () => {
     if (libDirsLoading) return
@@ -253,7 +260,7 @@ export default function SettingsView() {
 
   useEffect(() => {
     let cancelled = false
-    if (!vamDir) {
+    if (!capabilities.developerTools || !vamDir) {
       setBaDirPresent(false)
     } else {
       window.api.dev.browserAssistDirExists().then((r) => {
@@ -263,9 +270,10 @@ export default function SettingsView() {
     return () => {
       cancelled = true
     }
-  }, [vamDir])
+  }, [capabilities.developerTools, vamDir])
 
   useEffect(() => {
+    if (!capabilities.hubAccountActions) return undefined
     let cancelled = false
     window.api.hub.isLoggedIn().then((v) => {
       if (!cancelled) setHubLoggedIn(!!v)
@@ -275,7 +283,7 @@ export default function SettingsView() {
       cancelled = true
       off?.()
     }
-  }, [])
+  }, [capabilities.hubAccountActions])
 
   const handleBrowseDir = useCallback(async () => {
     const result = await window.api.wizard.browseVamDir(vamDir || undefined)
@@ -492,13 +500,13 @@ export default function SettingsView() {
     if (dbPath) window.api.shell.showItemInFolder(dbPath)
   }, [])
 
-  const showDevSection = isDev || developerUnlocked
+  const showDevSection = capabilities.developerTools && (isDev || developerUnlocked)
   // The section can't be hidden while a client/host connection is live — the
   // toggle then reflects that forced-on state and can't be switched off.
   const remoteSectionForced = isRemoteClient || !!remoteStatus?.running
 
   const handleAboutVersionTap = useCallback(() => {
-    if (isDev || developerUnlocked) return
+    if (!capabilities.developerTools || isDev || developerUnlocked) return
     const r = devUnlockRef.current
     if (r.resetTimer != null) clearTimeout(r.resetTimer)
     r.count += 1
@@ -514,7 +522,7 @@ export default function SettingsView() {
       setDeveloperUnlocked(true)
       toast('Developer options enabled', 'success', 3000)
     })
-  }, [isDev, developerUnlocked])
+  }, [capabilities.developerTools, isDev, developerUnlocked])
 
   const handleDisableDeveloperOptions = useCallback(async () => {
     await window.api.settings.set('developer_options_unlocked', '0')
@@ -523,7 +531,7 @@ export default function SettingsView() {
   }, [])
 
   useEffect(() => {
-    if (isRemoteClient) return
+    if (!capabilities.serverControl || isRemoteClient) return
     window.api.remote
       .status()
       .then((s) => {
@@ -537,7 +545,7 @@ export default function SettingsView() {
       .catch(() => {})
     // Live updates when clients connect/disconnect (pushed from the server).
     return window.api.on('remote:server-status', (s) => setRemoteStatus(s))
-  }, [isRemoteClient])
+  }, [capabilities.serverControl, isRemoteClient])
 
   const refreshRemoteStatus = useCallback(async () => {
     try {
@@ -651,9 +659,11 @@ export default function SettingsView() {
               >
                 {vamDir || <span className="italic text-text-tertiary font-sans">Not configured</span>}
               </TruncateWithTooltip>
-              <Button variant="outline" size="lg" onClick={handleBrowseDir} className="shrink-0 h-10 px-3.5">
-                <FolderOpen size={14} /> Browse
-              </Button>
+              {capabilities.nativeDialogs && (
+                <Button variant="outline" size="lg" onClick={handleBrowseDir} className="shrink-0 h-10 px-3.5">
+                  <FolderOpen size={14} /> Browse
+                </Button>
+              )}
             </div>
           </div>
 
@@ -665,16 +675,18 @@ export default function SettingsView() {
                   Folders for packages you want to keep around but not load in VaM.
                 </div>
               </div>
-              <Button
-                variant="outline"
-                size="lg"
-                onClick={handleAddAuxDir}
-                disabled={libDirsLoading}
-                className="shrink-0"
-              >
-                {libDirsLoading ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
-                Add Folder
-              </Button>
+              {capabilities.nativeDialogs && (
+                <Button
+                  variant="outline"
+                  size="lg"
+                  onClick={handleAddAuxDir}
+                  disabled={libDirsLoading}
+                  className="shrink-0"
+                >
+                  {libDirsLoading ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
+                  Add Folder
+                </Button>
+              )}
             </div>
             {libDirs.aux.length > 0 && (
               <ul className="rounded-lg border border-border divide-y divide-border bg-surface/50">
@@ -807,9 +819,11 @@ export default function SettingsView() {
                 {hubScanning ? <Loader2 size={14} className="animate-spin" /> : <Compass size={14} />}
                 {hubScanning ? 'Scanning Hub…' : 'Scan Hub Details'}
               </Button>
-              <Button variant="outline" size="lg" onClick={handleOpenApplicationFolder} className="text-xs">
-                <FolderOpen size={14} /> Show in folder
-              </Button>
+              {capabilities.revealInFolder && (
+                <Button variant="outline" size="lg" onClick={handleOpenApplicationFolder} className="text-xs">
+                  <FolderOpen size={14} /> Show in folder
+                </Button>
+              )}
             </div>
             {hubScanning && hubScanProgress && (
               <div className="text-[11px] text-text-tertiary">
@@ -953,23 +967,25 @@ export default function SettingsView() {
               </div>
               <Switch checked={suppressDisablePackageWarning} onCheckedChange={setSuppressDisablePackageWarning} />
             </label>
-            <label
-              className="flex items-center gap-3 cursor-pointer"
-              title={remoteSectionForced ? "Can't be hidden while a client/host connection is active." : undefined}
-            >
-              <div className="flex-1 min-w-0">
-                <div className="text-xs text-text-primary font-medium">Client-server mode</div>
-                <div className="text-[11px] text-text-tertiary mt-0.5">
-                  Show the network options for using one library from several devices. Leave off if you only run this
-                  app on a single PC.
+            {capabilities.serverControl && (
+              <label
+                className="flex items-center gap-3 cursor-pointer"
+                title={remoteSectionForced ? "Can't be hidden while a client/host connection is active." : undefined}
+              >
+                <div className="flex-1 min-w-0">
+                  <div className="text-xs text-text-primary font-medium">Client-server mode</div>
+                  <div className="text-[11px] text-text-tertiary mt-0.5">
+                    Show the network options for using one library from several devices. Leave off if you only run this
+                    app on a single PC.
+                  </div>
                 </div>
-              </div>
-              <Switch
-                checked={remoteEnabled || remoteSectionForced}
-                disabled={remoteSectionForced}
-                onCheckedChange={handleToggleRemoteEnabled}
-              />
-            </label>
+                <Switch
+                  checked={remoteEnabled || remoteSectionForced}
+                  disabled={remoteSectionForced}
+                  onCheckedChange={handleToggleRemoteEnabled}
+                />
+              </label>
+            )}
           </div>
         </Section>
 
@@ -1137,7 +1153,7 @@ export default function SettingsView() {
           </Section>
         )}
 
-        {(remoteEnabled || remoteSectionForced) && (
+        {capabilities.serverControl && (remoteEnabled || remoteSectionForced) && (
           <Section
             title="Client-server mode"
             icon={Network}

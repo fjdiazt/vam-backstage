@@ -44,6 +44,7 @@ const NAV_ITEMS = [
   { id: 'graph', icon: Network, label: 'Graph' },
 ]
 export default function App() {
+  const capabilities = window.api.runtime.capabilities
   const view = useViewStore((s) => s.view)
   const setView = useViewStore((s) => s.setView)
   const blurThumbnails = useRemoteUiStore((s) => s.blurThumbnails)
@@ -221,7 +222,12 @@ export default function App() {
     <TooltipProvider>
       <div className="flex h-full bg-base">
         <RemoteGate />
-        {showWizard && <FirstRun onDone={() => setShowWizard(false)} />}
+        {showWizard &&
+          (capabilities.nativeDialogs ? (
+            <FirstRun onDone={() => setShowWizard(false)} />
+          ) : (
+            <HostSetupRequired onReload={() => window.location.reload()} />
+          ))}
         <nav className="w-[56px] bg-surface flex flex-col items-center border-r border-border shrink-0">
           <div className="w-full flex flex-col items-center shrink-0 mb-1.5" title="VaM Backstage">
             <div className="w-full flex items-center justify-center h-[52px]">
@@ -325,6 +331,7 @@ export default function App() {
 const SLOW_CONNECT_MS = 6000
 
 function RemoteGate() {
+  const capabilities = window.api.runtime.capabilities
   const [status, setStatus] = useState(null)
   const [slowConnect, setSlowConnect] = useState(false)
   useEffect(() => {
@@ -343,7 +350,7 @@ function RemoteGate() {
   if (!window.api.remote?.isRemote) return null
   if (connected) return null
   const isError = !!status?.error
-  const showEscape = isError || slowConnect
+  const showEscape = capabilities.serverControl && (isError || slowConnect)
   return (
     <AlertDialog open>
       <AlertDialogContent onEscapeKeyDown={(e) => e.preventDefault()}>
@@ -357,7 +364,9 @@ function RemoteGate() {
           </AlertDialogDescription>
           {!isError && slowConnect && (
             <p className="col-start-2 text-[12px] text-text-tertiary">
-              This is taking longer than usual — the server may be offline. You can start locally instead.
+              {capabilities.serverControl
+                ? 'This is taking longer than usual — the server may be offline. You can start locally instead.'
+                : 'This is taking longer than usual — the server may be offline.'}
             </p>
           )}
         </AlertDialogHeader>
@@ -373,6 +382,23 @@ function RemoteGate() {
   )
 }
 
+function HostSetupRequired({ onReload }) {
+  return (
+    <AlertDialog open>
+      <AlertDialogContent onEscapeKeyDown={(event) => event.preventDefault()}>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Complete setup on the host desktop</AlertDialogTitle>
+          <AlertDialogDescription>
+            VaM Backstage needs its VaM directory configured before browser access can start.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogAction onClick={onReload}>Reload</AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
+}
 function NavButton({ item, active, onClick, badge, badgePaused, errorBadge }) {
   const Icon = item.icon
   return (

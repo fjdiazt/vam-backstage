@@ -259,6 +259,7 @@ export default function HubDetail({
   position,
   backLabel,
 }) {
+  const capabilities = window.api.runtime.capabilities
   const { detailData, detailLoading } = useHubStore()
   const detail = detailData
   // Hub stays mounted across tabs (<Activity>), so gate the Chromium guest on Hub
@@ -298,7 +299,9 @@ export default function HubDetail({
     toggleBookmark,
     toggleRate,
     toggleLike,
-  } = useHubInteractions(resourceId, { enabled: HUB_INTERACTIONS_ENABLED })
+  } = useHubInteractions(resourceId, {
+    enabled: HUB_INTERACTIONS_ENABLED && capabilities.hubAccountActions,
+  })
 
   const tabUrls = useMemo(
     () => ({
@@ -895,36 +898,53 @@ export default function HubDetail({
                   {formatNumber(parseInt(pkg.download_count || '0', 10))}
                 </span>
               </span>
-              <RatingStat
-                ratingAvg={pkg.rating_avg}
-                ratingWeighted={pkg.rating_weighted}
-                ratingCount={parseInt(pkg.rating_count || '0', 10)}
-                loggedIn={hubLoggedIn}
-                rated={rated}
-                ratedDown={ratedDown}
-                busy={interactionsLoading}
-                onRate={toggleRate}
-              />
-              <LikeStat
-                count={Math.max(0, (serverReactionScore ?? parseInt(pkg.reaction_score || '0', 10)) + likeDelta)}
-                loggedIn={hubLoggedIn}
-                liked={liked}
-                busy={interactionsLoading}
-                onLike={toggleLike}
-              />
-              <FavoriteStat
-                loggedIn={hubLoggedIn}
-                favorited={favorited}
-                favoriteCount={favoriteCount}
-                busy={interactionsLoading}
-                onFavorite={toggleFavorite}
-              />
-              <BookmarkStat
-                loggedIn={hubLoggedIn}
-                bookmarked={bookmarked}
-                busy={interactionsLoading}
-                onBookmark={toggleBookmark}
-              />
+              {capabilities.hubAccountActions ? (
+                <>
+                  <RatingStat
+                    ratingAvg={pkg.rating_avg}
+                    ratingWeighted={pkg.rating_weighted}
+                    ratingCount={parseInt(pkg.rating_count || '0', 10)}
+                    loggedIn={hubLoggedIn}
+                    rated={rated}
+                    ratedDown={ratedDown}
+                    busy={interactionsLoading}
+                    onRate={toggleRate}
+                  />
+                  <LikeStat
+                    count={Math.max(0, (serverReactionScore ?? parseInt(pkg.reaction_score || '0', 10)) + likeDelta)}
+                    loggedIn={hubLoggedIn}
+                    liked={liked}
+                    busy={interactionsLoading}
+                    onLike={toggleLike}
+                  />
+                  <FavoriteStat
+                    loggedIn={hubLoggedIn}
+                    favorited={favorited}
+                    favoriteCount={favoriteCount}
+                    busy={interactionsLoading}
+                    onFavorite={toggleFavorite}
+                  />
+                  <BookmarkStat
+                    loggedIn={hubLoggedIn}
+                    bookmarked={bookmarked}
+                    busy={interactionsLoading}
+                    onBookmark={toggleBookmark}
+                  />
+                </>
+              ) : (
+                <>
+                  <span className="flex items-center gap-1.5 text-text-tertiary" title="Average Hub rating">
+                    <Star size={13} />
+                    <span className="text-text-primary font-medium">{formatStarRating(pkg.rating_avg) || '—'}</span>
+                  </span>
+                  <span className="flex items-center gap-1.5 text-text-tertiary" title="Hub likes">
+                    <ThumbsUp size={13} />
+                    <span className="text-text-primary font-medium">
+                      {formatNumber(parseInt(pkg.reaction_score || '0', 10))}
+                    </span>
+                  </span>
+                </>
+              )}
               <button
                 type="button"
                 onClick={() => toggleWishlist(pkg)}
@@ -1070,122 +1090,136 @@ export default function HubDetail({
           />
         </div>
 
-        {/* Right: Webview browser — pointer-events off on webview while resizing so the guest view does not steal the drag */}
-        <div className={`flex-1 flex flex-col min-w-0 bg-base ${hubPanelResizeDrag ? 'select-none' : ''}`}>
-          {/* Browser toolbar */}
-          <div className="h-10 flex items-center gap-1.5 px-3 border-b border-border bg-surface shrink-0">
-            <Button variant="ghost" size="icon-sm" onClick={goBack} disabled={!canGoBack}>
-              <ArrowLeft size={14} />
-            </Button>
-            <Button variant="ghost" size="icon-sm" onClick={goForward} disabled={!canGoForward}>
-              <ArrowRight size={14} />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              onClick={isLoading ? stop : reload}
-              title={isLoading ? 'Stop' : 'Reload'}
-            >
-              {isLoading ? <X size={14} /> : <RotateCw size={13} />}
-            </Button>
-            <div className="flex-1 min-w-0 h-7 bg-elevated border border-border rounded px-2.5 flex items-center gap-2 ml-1 focus-within:border-accent-blue/60 transition-colors">
-              <Globe size={12} className="text-text-tertiary shrink-0" />
-              <input
-                ref={addressInputRef}
-                type="text"
-                value={addressDraft}
-                spellCheck={false}
-                onChange={(e) => setAddressDraft(e.target.value)}
-                onFocus={() => setAddressFocused(true)}
-                onBlur={() => {
-                  setAddressFocused(false)
-                  setAddressDraft(displayUrl)
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault()
-                    navigateToAddress()
-                  } else if (e.key === 'Escape') {
-                    e.preventDefault()
-                    setAddressDraft(displayUrl)
-                    addressInputRef.current?.blur()
-                  }
-                }}
-                className="flex-1 min-w-0 bg-transparent outline-none text-[11px] text-text-secondary font-mono select-text cursor-text"
-              />
+        {capabilities.embeddedHub ? (
+          <>
+            {/* Right: Webview browser — pointer-events off on webview while resizing so the guest view does not steal the drag */}
+            <div className={`flex-1 flex flex-col min-w-0 bg-base ${hubPanelResizeDrag ? 'select-none' : ''}`}>
+              {/* Browser toolbar */}
+              <div className="h-10 flex items-center gap-1.5 px-3 border-b border-border bg-surface shrink-0">
+                <Button variant="ghost" size="icon-sm" onClick={goBack} disabled={!canGoBack}>
+                  <ArrowLeft size={14} />
+                </Button>
+                <Button variant="ghost" size="icon-sm" onClick={goForward} disabled={!canGoForward}>
+                  <ArrowRight size={14} />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  onClick={isLoading ? stop : reload}
+                  title={isLoading ? 'Stop' : 'Reload'}
+                >
+                  {isLoading ? <X size={14} /> : <RotateCw size={13} />}
+                </Button>
+                <div className="flex-1 min-w-0 h-7 bg-elevated border border-border rounded px-2.5 flex items-center gap-2 ml-1 focus-within:border-accent-blue/60 transition-colors">
+                  <Globe size={12} className="text-text-tertiary shrink-0" />
+                  <input
+                    ref={addressInputRef}
+                    type="text"
+                    value={addressDraft}
+                    spellCheck={false}
+                    onChange={(e) => setAddressDraft(e.target.value)}
+                    onFocus={() => setAddressFocused(true)}
+                    onBlur={() => {
+                      setAddressFocused(false)
+                      setAddressDraft(displayUrl)
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault()
+                        navigateToAddress()
+                      } else if (e.key === 'Escape') {
+                        e.preventDefault()
+                        setAddressDraft(displayUrl)
+                        addressInputRef.current?.blur()
+                      }
+                    }}
+                    className="flex-1 min-w-0 bg-transparent outline-none text-[11px] text-text-secondary font-mono select-text cursor-text"
+                  />
+                </div>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  title={urlCopied ? 'Copied!' : 'Copy URL'}
+                  className="shrink-0 relative"
+                  onClick={() => {
+                    navigator.clipboard.writeText(fullBrowserUrl).then(() => {
+                      setUrlCopied(true)
+                      setTimeout(() => setUrlCopied(false), 1500)
+                    })
+                  }}
+                >
+                  <Copy
+                    size={14}
+                    className={`transition-all duration-200 ${urlCopied ? 'opacity-0 scale-50' : 'opacity-100 scale-100'}`}
+                  />
+                  <Check
+                    size={14}
+                    className={`absolute transition-all duration-200 text-success ${urlCopied ? 'opacity-100 scale-100' : 'opacity-0 scale-50'}`}
+                  />
+                </Button>
+                {isDev && (
+                  <Button variant="ghost" size="icon-sm" title="Open webview DevTools" onClick={openWebviewDevTools}>
+                    <Bug size={14} />
+                  </Button>
+                )}
+                <Button variant="ghost" size="icon-sm" className="ml-1" asChild>
+                  <a
+                    href={fullBrowserUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    title="Open in browser"
+                    onClick={(e) => {
+                      e.preventDefault()
+                      void window.api.shell.openExternal(fullBrowserUrl)
+                    }}
+                  >
+                    <ExternalLink size={14} />
+                  </a>
+                </Button>
+              </div>
+
+              {/* Tab bar */}
+              <div className="flex items-center border-b border-border bg-surface shrink-0">
+                {tabs.map((tab) => (
+                  <button
+                    type="button"
+                    key={tab.key}
+                    onClick={() => selectTab(tab.key)}
+                    className={`px-4 py-2 text-xs border-b-2 transition-colors cursor-pointer ${browserTab === tab.key ? 'border-accent-blue text-text-primary' : 'border-transparent text-text-tertiary hover:text-text-secondary'}`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Webview — only mounted while Hub is the active view (see hubActive) */}
+              <div className="flex-1 min-h-0">
+                {hubActive && (
+                  <webview
+                    key={browserResourceId}
+                    ref={webviewRef}
+                    src={navUrl}
+                    preload={window.api.app.hubWebviewPreload}
+                    partition="persist:hub"
+                    allowpopups="true"
+                    className="w-full h-full"
+                    style={{ display: 'flex', pointerEvents: hubPanelResizeDrag ? 'none' : 'auto' }}
+                  />
+                )}
+              </div>
             </div>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              title={urlCopied ? 'Copied!' : 'Copy URL'}
-              className="shrink-0 relative"
-              onClick={() => {
-                navigator.clipboard.writeText(fullBrowserUrl).then(() => {
-                  setUrlCopied(true)
-                  setTimeout(() => setUrlCopied(false), 1500)
-                })
-              }}
-            >
-              <Copy
-                size={14}
-                className={`transition-all duration-200 ${urlCopied ? 'opacity-0 scale-50' : 'opacity-100 scale-100'}`}
-              />
-              <Check
-                size={14}
-                className={`absolute transition-all duration-200 text-success ${urlCopied ? 'opacity-100 scale-100' : 'opacity-0 scale-50'}`}
-              />
-            </Button>
-            {isDev && (
-              <Button variant="ghost" size="icon-sm" title="Open webview DevTools" onClick={openWebviewDevTools}>
-                <Bug size={14} />
+          </>
+        ) : (
+          <div className="flex-1 flex items-center justify-center bg-base p-8">
+            <div className="max-w-sm text-center space-y-4">
+              <Globe size={32} className="mx-auto text-text-tertiary" />
+              <div className="text-sm font-medium text-text-primary">Hub page opens in your browser</div>
+              <Button onClick={() => void window.api.shell.openExternal(fullBrowserUrl)}>
+                <ExternalLink size={14} /> Open Hub page
               </Button>
-            )}
-            <Button variant="ghost" size="icon-sm" className="ml-1" asChild>
-              <a
-                href={fullBrowserUrl}
-                target="_blank"
-                rel="noreferrer"
-                title="Open in browser"
-                onClick={(e) => {
-                  e.preventDefault()
-                  void window.api.shell.openExternal(fullBrowserUrl)
-                }}
-              >
-                <ExternalLink size={14} />
-              </a>
-            </Button>
+            </div>
           </div>
-
-          {/* Tab bar */}
-          <div className="flex items-center border-b border-border bg-surface shrink-0">
-            {tabs.map((tab) => (
-              <button
-                type="button"
-                key={tab.key}
-                onClick={() => selectTab(tab.key)}
-                className={`px-4 py-2 text-xs border-b-2 transition-colors cursor-pointer ${browserTab === tab.key ? 'border-accent-blue text-text-primary' : 'border-transparent text-text-tertiary hover:text-text-secondary'}`}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Webview — only mounted while Hub is the active view (see hubActive) */}
-          <div className="flex-1 min-h-0">
-            {hubActive && (
-              <webview
-                key={browserResourceId}
-                ref={webviewRef}
-                src={navUrl}
-                preload={window.api.app.hubWebviewPreload}
-                partition="persist:hub"
-                allowpopups="true"
-                className="w-full h-full"
-                style={{ display: 'flex', pointerEvents: hubPanelResizeDrag ? 'none' : 'auto' }}
-              />
-            )}
-          </div>
-        </div>
+        )}
       </div>
     </div>
   )

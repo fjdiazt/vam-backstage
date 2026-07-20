@@ -1432,6 +1432,7 @@ function ContentDetailPanel({
   onSelectRelated,
   suppressHiddenRowStyle = false,
 }) {
+  const capabilities = window.api.runtime.capabilities
   const [panelWidth, setPanelWidth] = usePersistedPanelWidth('panel_width_detail', {
     min: 260,
     max: 500,
@@ -1609,18 +1610,20 @@ function ContentDetailPanel({
                   </div>
                 </div>
               </div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={async () => {
-                  const vamDir = await window.api.settings.get('vam_dir')
-                  if (!vamDir) return
-                  window.api.shell.showItemInFolder([vamDir, item.internalPath])
-                }}
-                className="w-full text-[10px] text-accent-blue mt-3"
-              >
-                <FolderOpen size={12} /> Show in folder
-              </Button>
+              {capabilities.revealInFolder && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={async () => {
+                    const vamDir = await window.api.settings.get('vam_dir')
+                    if (!vamDir) return
+                    window.api.shell.showItemInFolder([vamDir, item.internalPath])
+                  }}
+                  className="w-full text-[10px] text-accent-blue mt-3"
+                >
+                  <FolderOpen size={12} /> Show in folder
+                </Button>
+              )}
             </>
           ) : pkg ? (
             <>

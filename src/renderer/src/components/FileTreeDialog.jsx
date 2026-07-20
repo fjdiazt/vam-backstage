@@ -139,6 +139,7 @@ function TreeFile({ file, depth }) {
 }
 
 export default function FileTreeDialog({ open, onOpenChange, filename }) {
+  const capabilities = window.api.runtime.capabilities
   const [fileList, setFileList] = useState(null)
   const [varPath, setVarPath] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -224,7 +225,7 @@ export default function FileTreeDialog({ open, onOpenChange, filename }) {
               {allExpanded ? <FoldVertical size={14} /> : <UnfoldVertical size={14} />}
             </Button>
           )}
-          {varPath && (
+          {capabilities.revealInFolder && varPath && (
             <Button
               variant="ghost"
               size="icon-sm"

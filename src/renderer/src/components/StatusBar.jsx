@@ -131,6 +131,7 @@ function RemoteStatusIndicator() {
 }
 
 export default function StatusBar() {
+  const capabilities = window.api.runtime.capabilities
   const { stats, scan, hubScan } = useStatusStore()
   const dlItems = useDownloadStore((s) => s.items)
   const liveProgress = useDownloadStore((s) => s.liveProgress)
@@ -148,12 +149,13 @@ export default function StatusBar() {
   const [versionCheckBusy, setVersionCheckBusy] = useState(false)
 
   useEffect(() => {
-    window.api.dev.isDev().then(setIsDev)
+    if (capabilities.updater) window.api.dev.isDev().then(setIsDev)
+    else setIsDev(false)
     window.api.app.getVersion().then(setAppVersion)
-  }, [])
+  }, [capabilities.updater])
 
   useEffect(() => {
-    if (isDev) return undefined
+    if (!capabilities.updater || isDev) return undefined
     const cleanup1 = window.api.onUpdateAvailable((data) => {
       setUpdateState({ phase: 'downloading', version: data.version })
     })
@@ -172,7 +174,7 @@ export default function StatusBar() {
       cleanup2()
       cleanup3()
     }
-  }, [isDev])
+  }, [capabilities.updater, isDev])
 
   const handleInstallClick = async () => {
     const r = await window.api.updater.install()
@@ -350,40 +352,46 @@ export default function StatusBar() {
         </div>
       )}
       <RemoteStatusIndicator />
-      <StatTooltip
-        lines={isDev ? 'VaM Backstage\nAutomatic updates run in the release build.' : 'Click to check for updates.'}
-      >
-        <div
-          className={`text-[10px] ml-2 flex items-center gap-2 shrink-0 min-w-0 cursor-pointer ${
-            !isDev && updateState ? 'text-accent-blue' : 'text-text-secondary/75'
-          }`}
+      {capabilities.updater ? (
+        <StatTooltip
+          lines={isDev ? 'VaM Backstage\nAutomatic updates run in the release build.' : 'Click to check for updates.'}
         >
-          {isDev || !updateState ? (
-            <VersionLabelButton busy={versionCheckBusy} onClick={handleVersionClick}>
-              VaM Backstage v{appVersion ? `${appVersion} Beta` : '—'}
-            </VersionLabelButton>
-          ) : updateState.phase === 'downloading' ? (
-            <VersionLabelButton busy={versionCheckBusy} onClick={handleVersionClick}>
-              Update v{updateState.version} downloading…
-            </VersionLabelButton>
-          ) : (
-            <>
-              <VersionLabelButton busy={versionCheckBusy} onClick={handleVersionClick} className="flex-1">
-                v{appVersion ? `${appVersion} Beta` : '—'} → v{updateState.version} — restart to update
+          <div
+            className={`text-[10px] ml-2 flex items-center gap-2 shrink-0 min-w-0 cursor-pointer ${
+              !isDev && updateState ? 'text-accent-blue' : 'text-text-secondary/75'
+            }`}
+          >
+            {isDev || !updateState ? (
+              <VersionLabelButton busy={versionCheckBusy} onClick={handleVersionClick}>
+                VaM Backstage v{appVersion ? `${appVersion} Beta` : '—'}
               </VersionLabelButton>
-              <Button
-                type="button"
-                variant="ghost"
-                size="xs"
-                className="text-accent-blue hover:text-accent-blue hover:bg-accent-blue/15 shrink-0 h-6 px-2"
-                onClick={handleInstallClick}
-              >
-                Restart
-              </Button>
-            </>
-          )}
+            ) : updateState.phase === 'downloading' ? (
+              <VersionLabelButton busy={versionCheckBusy} onClick={handleVersionClick}>
+                Update v{updateState.version} downloading…
+              </VersionLabelButton>
+            ) : (
+              <>
+                <VersionLabelButton busy={versionCheckBusy} onClick={handleVersionClick} className="flex-1">
+                  v{appVersion ? `${appVersion} Beta` : '—'} → v{updateState.version} — restart to update
+                </VersionLabelButton>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="xs"
+                  className="text-accent-blue hover:text-accent-blue hover:bg-accent-blue/15 shrink-0 h-6 px-2"
+                  onClick={handleInstallClick}
+                >
+                  Restart
+                </Button>
+              </>
+            )}
+          </div>
+        </StatTooltip>
+      ) : (
+        <div className="text-[10px] ml-2 text-text-secondary/75 shrink-0 select-text">
+          VaM Backstage v{appVersion ? `${appVersion} Beta` : '—'}
         </div>
-      </StatTooltip>
+      )}
     </div>
   )
 }
