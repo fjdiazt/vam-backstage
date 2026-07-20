@@ -73,6 +73,7 @@ runtime: {
     revealInFolder: boolean,
     updater: boolean,
     serverControl: boolean,
+    developerTools: boolean,
   },
 }
 ```
@@ -87,6 +88,7 @@ Capability values describe working behavior, not platform guesses:
 | `revealInFolder`    | yes            | no                                    | no  |
 | `updater`           | yes            | yes, client-local                     | no  |
 | `serverControl`     | yes            | yes, client-local connection controls | no  |
+| `developerTools`    | yes            | yes, client-local                     | no  |
 
 Browser-local operations:
 
