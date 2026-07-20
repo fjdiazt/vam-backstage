@@ -1,4 +1,4 @@
-import { WebSocketServer } from 'ws'
+import { join } from 'path'
 import { app } from 'electron'
 import { encode, decode } from '@shared/net-codec.js'
 import { DEFAULT_REMOTE_PORT } from '@shared/remote-config.js'
@@ -6,6 +6,7 @@ import { getHandler } from './registry.js'
 import { CLIENT_LOCAL_EVENTS, isRemoteChannelDenied } from './channel-policy.js'
 import { getWindow } from '../notify.js'
 import { getSetting } from '../db.js'
+import { createRemoteHttpServer } from './http-server.js'
 
 // The version gate on the client relaxes when a peer reports `dev` — true for
 // unpackaged runs and for packaged builds where DevTools/developer options have
@@ -27,6 +28,7 @@ function isDevMode() {
  */
 
 let wss = null
+let httpServer = null
 let currentPort = null
 const clients = new Set()
 
@@ -43,47 +45,51 @@ function emitStatus() {
   } catch {}
 }
 
-export function startServer(port = DEFAULT_REMOTE_PORT) {
+export function startServer(port = DEFAULT_REMOTE_PORT, { rendererRoot = join(__dirname, '../renderer') } = {}) {
   return new Promise((resolve) => {
     if (wss) {
       resolve({ ok: true, port: currentPort })
       return
     }
-    const server = new WebSocketServer({ host: '0.0.0.0', port })
+    const { server, wss: socketServer } = createRemoteHttpServer(rendererRoot)
+    socketServer.on('connection', registerClient)
 
     server.on('listening', () => {
-      wss = server
-      currentPort = port
-      console.info(`[remote] serving on ws://0.0.0.0:${port}`)
+      httpServer = server
+      wss = socketServer
+      currentPort = server.address().port
+      console.info(`[remote] serving on http://0.0.0.0:${currentPort}`)
       emitStatus()
-      resolve({ ok: true, port })
+      resolve({ ok: true, port: currentPort })
     })
 
     server.on('error', (err) => {
-      if (!wss) {
+      if (!httpServer) {
         console.warn(`[remote] failed to start on port ${port}: ${err.message}`)
         try {
-          server.close()
+          socketServer.close()
         } catch {}
         resolve({ ok: false, error: err.message })
       }
     })
 
-    server.on('connection', (ws) => {
-      clients.add(ws)
-      emitStatus()
-      ws.on('close', () => {
-        clients.delete(ws)
-        emitStatus()
-      })
-      ws.on('error', () => {
-        clients.delete(ws)
-        emitStatus()
-      })
-      ws.on('message', (raw) => handleMessage(ws, raw))
-      send(ws, { t: 'hello', version: app.getVersion(), dev: isDevMode() })
-    })
+    server.listen(port, '0.0.0.0')
   })
+}
+
+function registerClient(ws) {
+  clients.add(ws)
+  emitStatus()
+  ws.on('close', () => {
+    clients.delete(ws)
+    emitStatus()
+  })
+  ws.on('error', () => {
+    clients.delete(ws)
+    emitStatus()
+  })
+  ws.on('message', (raw) => handleMessage(ws, raw))
+  send(ws, { t: 'hello', version: app.getVersion(), dev: isDevMode() })
 }
 
 export async function stopServer() {
@@ -95,7 +101,9 @@ export async function stopServer() {
   }
   clients.clear()
   await new Promise((resolve) => wss.close(() => resolve()))
+  await new Promise((resolve) => httpServer.close(() => resolve()))
   wss = null
+  httpServer = null
   currentPort = null
   emitStatus()
 }
