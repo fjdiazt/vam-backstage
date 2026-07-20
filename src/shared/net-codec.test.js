@@ -14,4 +14,11 @@ describe('browser codec', () => {
 
     expect(decode(encode({ bytes }))).toEqual({ bytes })
   })
+
+  it('preserves undefined values in RPC arguments and objects', () => {
+    expect(decode(encode({ args: [undefined], value: undefined }))).toEqual({
+      args: [undefined],
+      value: undefined,
+    })
+  })
 })

@@ -41,7 +41,8 @@ function base64ToBytes(value) {
   return Uint8Array.from(binary, (char) => char.charCodeAt(0))
 }
 function encodeVal(v) {
-  if (v === null || v === undefined) return v
+  if (v === null) return v
+  if (v === undefined) return { __t: 'undefined' }
   const t = typeof v
   if (t === 'string' || t === 'number' || t === 'boolean') return v
   if (t === 'bigint') return { __t: 'bigint', value: v.toString() }
@@ -68,6 +69,7 @@ function decodeVal(v) {
   if (Array.isArray(v)) return v.map(decodeVal)
   if (v.__t === 'buffer') return base64ToBytes(v.base64)
   if (v.__t === 'bigint') return BigInt(v.value)
+  if (v.__t === 'undefined') return undefined
   const out = {}
   for (const k of Object.keys(v)) out[k] = decodeVal(v[k])
   return out
