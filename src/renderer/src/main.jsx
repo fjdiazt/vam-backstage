@@ -15,8 +15,19 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import App from './App'
 
-createRoot(document.getElementById('root')).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
+async function start() {
+  if (!window.api) {
+    const { createBrowserApi } = await import('./browser-api.js')
+    window.api = createBrowserApi()
+  }
+  createRoot(document.getElementById('root')).render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  )
+}
+
+start().catch((error) => {
+  console.error(error)
+  document.getElementById('root').textContent = `VaM Backstage failed to start: ${error.message}`
+})
