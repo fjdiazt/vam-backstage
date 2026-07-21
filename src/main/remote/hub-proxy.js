@@ -67,12 +67,92 @@ export function rewriteHubText(text, contentType = '') {
   return rewritten
 }
 
+function rewriteLocation(location) {
+  const target = new URL(location, HUB_ORIGIN)
+  return target.origin === HUB_ORIGIN ? toProxyUrl(target) : location
+}
+
 export function filterHubResponseHeaders(headers = {}) {
   const filtered = {}
   for (const [name, value] of Object.entries(headers)) {
     const lower = name.toLowerCase()
     if (STRIPPED_HEADERS.has(lower)) continue
-    filtered[lower] = lower === 'location' ? (value.map?.(toProxyUrl) ?? toProxyUrl(value)) : value
+    filtered[lower] = lower === 'location' ? (value.map?.(rewriteLocation) ?? rewriteLocation(value)) : value
   }
   return filtered
+}
+
+const REQUEST_HEADER_DENYLIST = new Set([
+  'accept-encoding',
+  'connection',
+  'cookie',
+  'host',
+  'origin',
+  'referer',
+  'transfer-encoding',
+])
+
+function firstHeader(headers, name) {
+  const value = headers[name]
+  return Array.isArray(value) ? value[0] : value || ''
+}
+
+export function createHubProxyHandler({ request, getSession }) {
+  return (incoming, outgoing) => {
+    let url
+    try {
+      url = toHubUrl(incoming.url)
+    } catch {
+      outgoing.writeHead(400).end('Bad Hub proxy request')
+      return
+    }
+
+    const upstream = request({
+      method: incoming.method,
+      url,
+      session: getSession(),
+      useSessionCookies: true,
+      redirect: 'follow',
+    })
+    for (const [name, value] of Object.entries(incoming.headers)) {
+      if (!REQUEST_HEADER_DENYLIST.has(name.toLowerCase()) && value != null) upstream.setHeader(name, value)
+    }
+    upstream.setHeader('Accept-Encoding', 'identity')
+    if (incoming.headers.origin) upstream.setHeader('Origin', HUB_ORIGIN)
+    if (incoming.headers.referer) {
+      try {
+        const referer = new URL(incoming.headers.referer)
+        upstream.setHeader('Referer', toHubUrl(`${referer.pathname}${referer.search}`))
+      } catch {
+        upstream.setHeader('Referer', HUB_ORIGIN)
+      }
+    }
+
+    upstream.on('response', (response) => {
+      const headers = filterHubResponseHeaders(response.headers)
+      const contentType = firstHeader(headers, 'content-type')
+      const transform = /\b(?:text\/html|text\/css|javascript)\b/i.test(contentType)
+      outgoing.writeHead(response.statusCode || 502, headers)
+      if (incoming.method === 'HEAD') {
+        outgoing.end()
+        return
+      }
+      if (!transform) {
+        response.on('data', (chunk) => outgoing.write(chunk))
+        response.on('end', () => outgoing.end())
+        response.on('error', () => outgoing.destroy())
+        return
+      }
+      const chunks = []
+      response.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+      response.on('end', () => outgoing.end(rewriteHubText(Buffer.concat(chunks).toString('utf8'), contentType)))
+      response.on('error', () => outgoing.destroy())
+    })
+    upstream.on('error', (error) => {
+      if (!outgoing.headersSent) outgoing.writeHead(502)
+      outgoing.end(`Hub proxy failed: ${error.message}`)
+    })
+    incoming.on('data', (chunk) => upstream.write(chunk))
+    incoming.on('end', () => upstream.end())
+  }
 }

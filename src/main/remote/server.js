@@ -1,5 +1,5 @@
 import { join } from 'path'
-import { app } from 'electron'
+import { app, net, session } from 'electron'
 import { encode, decode } from '@shared/net-codec.js'
 import { DEFAULT_REMOTE_PORT } from '@shared/remote-config.js'
 import { getHandler } from './registry.js'
@@ -7,6 +7,7 @@ import { CLIENT_LOCAL_EVENTS, isRemoteChannelDenied } from './channel-policy.js'
 import { getWindow } from '../notify.js'
 import { getSetting } from '../db.js'
 import { createRemoteHttpServer } from './http-server.js'
+import { createHubProxyHandler } from './hub-proxy.js'
 
 // The version gate on the client relaxes when a peer reports `dev` — true for
 // unpackaged runs and for packaged builds where DevTools/developer options have
@@ -51,7 +52,11 @@ export function startServer(port = DEFAULT_REMOTE_PORT, { rendererRoot = join(__
       resolve({ ok: true, port: currentPort })
       return
     }
-    const { server, wss: socketServer } = createRemoteHttpServer(rendererRoot)
+    const hubProxy = createHubProxyHandler({
+      request: (options) => net.request(options),
+      getSession: () => session.fromPartition('persist:hub'),
+    })
+    const { server, wss: socketServer } = createRemoteHttpServer(rendererRoot, { hubProxy })
     socketServer.on('connection', registerClient)
 
     server.on('listening', () => {

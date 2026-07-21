@@ -23,19 +23,25 @@ function end(response, status, body, headers) {
   response.writeHead(status, headers).end(body)
 }
 
-export function createRemoteHttpServer(rendererRoot) {
+export function createRemoteHttpServer(rendererRoot, { hubProxy } = {}) {
   const root = resolve(rendererRoot)
   const server = createServer(async (request, response) => {
-    if (request.method !== 'GET' && request.method !== 'HEAD') {
-      end(response, 405, undefined, { Allow: 'GET, HEAD' })
-      return
-    }
-
     let pathname
     try {
       pathname = decodeURIComponent(new URL(request.url, 'http://localhost').pathname)
     } catch {
       end(response, 400, 'Bad request')
+      return
+    }
+
+    if (pathname.startsWith('/__hub/')) {
+      if (hubProxy) hubProxy(request, response)
+      else end(response, 404, 'Not found')
+      return
+    }
+
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      end(response, 405, undefined, { Allow: 'GET, HEAD' })
       return
     }
 

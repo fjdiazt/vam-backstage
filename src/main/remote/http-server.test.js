@@ -2,7 +2,7 @@ import { once } from 'events'
 import { mkdtemp, mkdir, rm, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
 import { createRemoteHttpServer } from './http-server.js'
 
@@ -25,8 +25,8 @@ afterEach(async () => {
   await rm(root, { recursive: true, force: true })
 })
 
-async function start(rendererRoot = root) {
-  created = createRemoteHttpServer(rendererRoot)
+async function start(rendererRoot = root, options) {
+  created = createRemoteHttpServer(rendererRoot, options)
   await new Promise((resolve) => created.server.listen(0, '127.0.0.1', resolve))
   return `http://127.0.0.1:${created.server.address().port}`
 }
@@ -67,5 +67,13 @@ describe('remote HTTP listener', () => {
     expect(created.wss.clients.size).toBe(1)
     socket.close()
     await once(socket, 'close')
+  })
+
+  it('routes every Hub proxy method before static handling', async () => {
+    const hubProxy = vi.fn((_request, response) => response.writeHead(204).end())
+    const base = await start(root, { hubProxy })
+
+    expect((await fetch(`${base}/__hub/login/`, { method: 'POST' })).status).toBe(204)
+    expect(hubProxy).toHaveBeenCalledOnce()
   })
 })

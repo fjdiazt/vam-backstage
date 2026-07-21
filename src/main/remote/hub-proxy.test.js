@@ -1,5 +1,21 @@
-import { describe, expect, it } from 'vitest'
-import { filterHubResponseHeaders, rewriteHubText, toHubUrl, toProxyUrl } from './hub-proxy.js'
+import { once } from 'events'
+import { createServer } from 'http'
+import { Readable } from 'stream'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createHubProxyHandler, filterHubResponseHeaders, rewriteHubText, toHubUrl, toProxyUrl } from './hub-proxy.js'
+
+let server
+
+afterEach(async () => {
+  if (server?.listening) await new Promise((resolve) => server.close(resolve))
+})
+
+async function serve(handler) {
+  server = createServer(handler)
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  return `http://127.0.0.1:${server.address().port}`
+}
 
 describe('Hub proxy boundary', () => {
   it('maps only the fixed Hub origin', () => {
@@ -42,5 +58,52 @@ describe('Hub proxy boundary', () => {
       'content-type': ['text/html; charset=utf-8'],
       'cache-control': ['private'],
     })
+  })
+
+  it('forwards request bodies through the shared Hub session and rewrites responses', async () => {
+    let options
+    let body = ''
+    const setHeader = vi.fn()
+    const request = vi.fn((nextOptions) => {
+      options = nextOptions
+      const listeners = {}
+      return {
+        on: (event, callback) => {
+          listeners[event] = callback
+        },
+        setHeader,
+        write: (chunk) => {
+          body += chunk.toString()
+        },
+        end: () => {
+          const response = Readable.from(['<a href="/resources/42/">Resource</a>'])
+          response.statusCode = 200
+          response.headers = {
+            'content-type': ['text/html; charset=utf-8'],
+            'x-frame-options': ['SAMEORIGIN'],
+          }
+          listeners.response(response)
+        },
+      }
+    })
+    const handler = createHubProxyHandler({ request, getSession: () => 'hub-session' })
+    const base = await serve(handler)
+
+    const response = await fetch(`${base}/__hub/login/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'user=fred',
+    })
+
+    expect(options).toMatchObject({
+      method: 'POST',
+      url: 'https://hub.virtamate.com/login/',
+      session: 'hub-session',
+      useSessionCookies: true,
+      redirect: 'follow',
+    })
+    expect(body).toBe('user=fred')
+    expect(response.headers.get('x-frame-options')).toBeNull()
+    expect(await response.text()).toContain('href="/__hub/resources/42/"')
   })
 })
