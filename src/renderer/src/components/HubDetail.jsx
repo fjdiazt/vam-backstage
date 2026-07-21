@@ -51,6 +51,7 @@ import { getHubResourceLicense } from '@/lib/licenses'
 import { LicenseTag } from '@/components/LicenseTag'
 import { Tag } from '@/components/ui/tag'
 import { toFullHubUrl } from '@/lib/hub-panel-url'
+import { hubProxyUrl, hubUrlFromProxy, isHubUrl } from '@/lib/hub-proxy'
 
 const HUB_INTERACTIONS_ENABLED = true
 
@@ -259,13 +260,15 @@ export default function HubDetail({
   position,
   backLabel,
 }) {
-  const capabilities = window.api.runtime.capabilities
+  const runtime = window.api.runtime
+  const capabilities = runtime.capabilities
   const { detailData, detailLoading } = useHubStore()
   const detail = detailData
   // Hub stays mounted across tabs (<Activity>), so gate the Chromium guest on Hub
   // being active — otherwise it lingers in the background. The rest of the panel
   // stays mounted; returning restores the detail and reloads the guest page.
   const hubActive = useViewStore((s) => s.view === 'hub')
+  const isWebHub = runtime.kind === 'web'
   const [browserTab, setBrowserTab] = useState('overview')
   const webviewRef = useRef(null)
   const [canGoBack, setCanGoBack] = useState(false)
@@ -349,25 +352,34 @@ export default function HubDetail({
     const raw = addressDraft.trim()
     if (!raw) return
     const url = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`
-    try {
-      webviewRef.current?.loadURL(url)
-    } catch {
-      // ignore malformed URL — the webview will surface a load error if reached
+    if (isWebHub) {
+      if (!isHubUrl(url)) {
+        void window.api.shell.openExternal(url)
+        addressInputRef.current?.blur()
+        return
+      }
+      setIsLoading(true)
+      setNavUrl(url)
+    } else {
+      try {
+        webviewRef.current?.loadURL(url)
+      } catch {}
     }
     // Optimistically show the target so blur doesn't briefly restore the old URL
     // before `did-navigate` fires with the real one.
     setDisplayUrl(url)
     addressInputRef.current?.blur()
-  }, [addressDraft])
+  }, [addressDraft, isWebHub])
 
   const selectTab = useCallback(
     (key) => {
       setBrowserTab(key)
       const url = tabUrls[key] || tabUrls.overview
       setNavUrl(url)
+      if (isWebHub) setIsLoading(true)
       setDisplayUrl(url)
     },
-    [tabUrls],
+    [isWebHub, tabUrls],
   )
 
   // Left/Right arrow keys step through results when the pager is active. Ignored
@@ -403,32 +415,30 @@ export default function HubDetail({
     }
   }, [resourceId])
 
+  const syncBrowserNavigation = useCallback(
+    (url) => {
+      setDisplayUrl(url)
+      const tabKey = browserTabMatchingUrl(url, tabUrls, tabs)
+      if (tabKey) setBrowserTab(tabKey)
+      const navId = parseHubResourceId(url)
+      if (!navId) return
+      const store = useHubStore.getState()
+      const shown = String(store.detailData?.resource_id ?? store.detailResource?.resource_id ?? '')
+      if (navId === shown) return
+      const known = store.resources?.find((item) => String(item.resource_id) === navId)
+      store.followDetail(known || { resource_id: navId })
+    },
+    [tabUrls, tabs],
+  )
+
   useEffect(() => {
+    if (isWebHub) return
     const wv = webviewRef.current
     if (!wv) return
     const syncNav = (e) => {
-      setDisplayUrl(e.url)
+      syncBrowserNavigation(e.url)
       setCanGoBack(wv.canGoBack())
       setCanGoForward(wv.canGoForward())
-      const tabKey = browserTabMatchingUrl(e.url, tabUrls, tabs)
-      if (tabKey) setBrowserTab(tabKey)
-      // Follow in-browser navigation: when the guest lands on a different
-      // resource, load it into the details panel in the background and swap once
-      // ready, so the previous resource stays visible (no skeleton flash). Skip
-      // when the target is already shown or already being fetched — this also
-      // covers tab/in-page navigation within the current resource.
-      const navId = parseHubResourceId(e.url)
-      if (navId) {
-        const store = useHubStore.getState()
-        const shown = String(store.detailData?.resource_id ?? store.detailResource?.resource_id ?? '')
-        if (navId !== shown) {
-          // Reuse the gallery row as the stub when the target is already in the
-          // results; otherwise a bare id, filled by hub:detail. followDetail
-          // self-dedupes concurrent calls for the same in-flight resource.
-          const known = store.resources?.find((r) => String(r.resource_id) === navId)
-          store.followDetail(known || { resource_id: navId })
-        }
-      }
     }
     const ignoreAbort = (e) => {
       if (e.errorCode === -3 || e.errorCode === -2) e.preventDefault()
@@ -543,12 +553,51 @@ export default function HubDetail({
       wv.removeEventListener('console-message', onConsoleMessage)
     }
     // `hubActive` dep: reattach to the freshly-mounted <webview> on return to Hub.
-  }, [resourceId, tabUrls, tabs, hubActive, onBack])
+  }, [hubActive, isWebHub, onBack, syncBrowserNavigation])
 
-  const goBack = useCallback(() => webviewRef.current?.goBack(), [])
-  const goForward = useCallback(() => webviewRef.current?.goForward(), [])
-  const reload = useCallback(() => webviewRef.current?.reload(), [])
-  const stop = useCallback(() => webviewRef.current?.stop(), [])
+  useEffect(() => {
+    if (!isWebHub) return
+    const onMessage = (event) => {
+      if (event.source !== webviewRef.current?.contentWindow || !event.data) return
+      if (event.data.type === 'vam-backstage:hub-location') {
+        try {
+          syncBrowserNavigation(hubUrlFromProxy(event.data.url))
+          setCanGoBack(event.data.index > 0)
+          setCanGoForward(event.data.index < event.data.length - 1)
+          setIsLoading(false)
+        } catch {}
+      } else if (event.data.type === 'vam-backstage:hub-external') {
+        void window.api.shell.openExternal(event.data.url)
+      } else if (event.data.type === 'vam-backstage:hub-loading') {
+        setIsLoading(true)
+      } else if (event.data.type === 'vam-backstage:hub-history' && Number(event.data.url) < 0) {
+        onBack()
+      }
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [isWebHub, onBack, syncBrowserNavigation])
+
+  const postWebCommand = useCallback((command) => {
+    webviewRef.current?.contentWindow?.postMessage({ type: 'vam-backstage:hub-command', command }, '*')
+  }, [])
+  const goBack = useCallback(
+    () => (isWebHub ? postWebCommand('back') : webviewRef.current?.goBack()),
+    [isWebHub, postWebCommand],
+  )
+  const goForward = useCallback(
+    () => (isWebHub ? postWebCommand('forward') : webviewRef.current?.goForward()),
+    [isWebHub, postWebCommand],
+  )
+  const reload = useCallback(() => {
+    setIsLoading(true)
+    if (isWebHub) postWebCommand('reload')
+    else webviewRef.current?.reload()
+  }, [isWebHub, postWebCommand])
+  const stop = useCallback(
+    () => (isWebHub ? postWebCommand('stop') : webviewRef.current?.stop()),
+    [isWebHub, postWebCommand],
+  )
   const isDev = useIsDev()
   const openWebviewDevTools = useCallback(() => {
     const wv = webviewRef.current
@@ -1157,7 +1206,7 @@ export default function HubDetail({
                     className={`absolute transition-all duration-200 text-success ${urlCopied ? 'opacity-100 scale-100' : 'opacity-0 scale-50'}`}
                   />
                 </Button>
-                {isDev && (
+                {isDev && !isWebHub && (
                   <Button variant="ghost" size="icon-sm" title="Open webview DevTools" onClick={openWebviewDevTools}>
                     <Bug size={14} />
                   </Button>
@@ -1192,20 +1241,32 @@ export default function HubDetail({
                 ))}
               </div>
 
-              {/* Webview — only mounted while Hub is the active view (see hubActive) */}
+              {/* Browser surface — only mounted while Hub is the active view (see hubActive) */}
               <div className="flex-1 min-h-0">
-                {hubActive && (
-                  <webview
-                    key={browserResourceId}
-                    ref={webviewRef}
-                    src={navUrl}
-                    preload={window.api.app.hubWebviewPreload}
-                    partition="persist:hub"
-                    allowpopups="true"
-                    className="w-full h-full"
-                    style={{ display: 'flex', pointerEvents: hubPanelResizeDrag ? 'none' : 'auto' }}
-                  />
-                )}
+                {hubActive &&
+                  (isWebHub ? (
+                    <iframe
+                      key={browserResourceId}
+                      ref={webviewRef}
+                      src={hubProxyUrl(navUrl)}
+                      title="VaM Hub"
+                      sandbox="allow-downloads allow-forms allow-modals allow-popups allow-same-origin allow-scripts"
+                      className="w-full h-full border-0"
+                      style={{ pointerEvents: hubPanelResizeDrag ? 'none' : 'auto' }}
+                      onLoad={() => setIsLoading(false)}
+                    />
+                  ) : (
+                    <webview
+                      key={browserResourceId}
+                      ref={webviewRef}
+                      src={navUrl}
+                      preload={window.api.app.hubWebviewPreload}
+                      partition="persist:hub"
+                      allowpopups="true"
+                      className="w-full h-full"
+                      style={{ display: 'flex', pointerEvents: hubPanelResizeDrag ? 'none' : 'auto' }}
+                    />
+                  ))}
               </div>
             </div>
           </>

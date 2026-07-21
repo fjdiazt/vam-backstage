@@ -1,4 +1,5 @@
 import { join } from 'path'
+import { createServer } from 'http'
 import { app, net, session } from 'electron'
 import { encode, decode } from '@shared/net-codec.js'
 import { DEFAULT_REMOTE_PORT } from '@shared/remote-config.js'
@@ -31,10 +32,12 @@ function isDevMode() {
 let wss = null
 let httpServer = null
 let currentPort = null
+let hubHttpServer = null
+let currentHubProxyPort = null
 const clients = new Set()
 
 export function getStatus() {
-  return { running: !!wss, port: currentPort, clients: clients.size }
+  return { running: !!wss, port: currentPort, hubProxyPort: currentHubProxyPort, clients: clients.size }
 }
 
 // Push the current status to the local renderer so the Settings tab reflects
@@ -46,40 +49,59 @@ function emitStatus() {
   } catch {}
 }
 
-export function startServer(port = DEFAULT_REMOTE_PORT, { rendererRoot = join(__dirname, '../renderer') } = {}) {
-  return new Promise((resolve) => {
-    if (wss) {
-      resolve({ ok: true, port: currentPort })
-      return
-    }
-    const hubProxy = createHubProxyHandler({
-      request: (options) => net.request(options),
-      getSession: () => session.fromPartition('persist:hub'),
+function listen(server, port) {
+  return new Promise((resolve, reject) => {
+    const onError = (error) => reject(error)
+    server.once('error', onError)
+    server.listen(port, '0.0.0.0', () => {
+      server.off('error', onError)
+      resolve(server.address().port)
     })
-    const { server, wss: socketServer } = createRemoteHttpServer(rendererRoot, { hubProxy })
-    socketServer.on('connection', registerClient)
-
-    server.on('listening', () => {
-      httpServer = server
-      wss = socketServer
-      currentPort = server.address().port
-      console.info(`[remote] serving on http://0.0.0.0:${currentPort}`)
-      emitStatus()
-      resolve({ ok: true, port: currentPort })
-    })
-
-    server.on('error', (err) => {
-      if (!httpServer) {
-        console.warn(`[remote] failed to start on port ${port}: ${err.message}`)
-        try {
-          socketServer.close()
-        } catch {}
-        resolve({ ok: false, error: err.message })
-      }
-    })
-
-    server.listen(port, '0.0.0.0')
   })
+}
+
+function close(server) {
+  return new Promise((resolve) => server.close(() => resolve()))
+}
+
+export async function startServer(port = DEFAULT_REMOTE_PORT, { rendererRoot = join(__dirname, '../renderer') } = {}) {
+  if (wss) return { ok: true, port: currentPort, hubProxyPort: currentHubProxyPort }
+
+  const hubProxy = createHubProxyHandler({
+    request: (options) => net.request(options),
+    getSession: () => session.fromPartition('persist:hub'),
+  })
+  const proxyServer = createServer(hubProxy)
+  let proxyPort
+  try {
+    proxyPort = await listen(proxyServer, port === 0 ? 0 : port + 1)
+  } catch (error) {
+    console.warn(`[remote] failed to start Hub proxy: ${error.message}`)
+    return { ok: false, error: error.message }
+  }
+
+  const { server, wss: socketServer } = createRemoteHttpServer(rendererRoot, { hubProxyPort: proxyPort })
+  socketServer.on('connection', registerClient)
+  let listeningPort
+  try {
+    listeningPort = await listen(server, port)
+  } catch (error) {
+    try {
+      socketServer.close()
+    } catch {}
+    await close(proxyServer)
+    console.warn(`[remote] failed to start on port ${port}: ${error.message}`)
+    return { ok: false, error: error.message }
+  }
+
+  hubHttpServer = proxyServer
+  currentHubProxyPort = proxyPort
+  httpServer = server
+  wss = socketServer
+  currentPort = listeningPort
+  console.info(`[remote] serving on http://0.0.0.0:${currentPort} (Hub proxy ${currentHubProxyPort})`)
+  emitStatus()
+  return { ok: true, port: currentPort, hubProxyPort: currentHubProxyPort }
 }
 
 function registerClient(ws) {
@@ -110,6 +132,9 @@ export async function stopServer() {
   wss = null
   httpServer = null
   currentPort = null
+  await close(hubHttpServer)
+  hubHttpServer = null
+  currentHubProxyPort = null
   emitStatus()
 }
 

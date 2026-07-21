@@ -76,4 +76,13 @@ describe('remote HTTP listener', () => {
     expect((await fetch(`${base}/__hub/login/`, { method: 'POST' })).status).toBe(204)
     expect(hubProxy).toHaveBeenCalledOnce()
   })
+
+  it('redirects Hub pages to the isolated proxy origin', async () => {
+    const base = await start(root, { hubProxyPort: 43210 })
+
+    const response = await fetch(`${base}/__hub/resources/42/?page=2`, { redirect: 'manual' })
+
+    expect(response.status).toBe(307)
+    expect(response.headers.get('location')).toBe('http://127.0.0.1:43210/__hub/resources/42/?page=2')
+  })
 })

@@ -23,7 +23,7 @@ function end(response, status, body, headers) {
   response.writeHead(status, headers).end(body)
 }
 
-export function createRemoteHttpServer(rendererRoot, { hubProxy } = {}) {
+export function createRemoteHttpServer(rendererRoot, { hubProxy, hubProxyPort } = {}) {
   const root = resolve(rendererRoot)
   const server = createServer(async (request, response) => {
     let pathname
@@ -35,6 +35,13 @@ export function createRemoteHttpServer(rendererRoot, { hubProxy } = {}) {
     }
 
     if (pathname.startsWith('/__hub/')) {
+      if (hubProxyPort) {
+        const requestHost = request.headers.host || 'localhost'
+        const hostname = new URL(`http://${requestHost}`).hostname
+        const host = hostname.includes(':') ? `[${hostname}]` : hostname
+        response.writeHead(307, { Location: `http://${host}:${hubProxyPort}${request.url}` }).end()
+        return
+      }
       if (hubProxy) hubProxy(request, response)
       else end(response, 404, 'Not found')
       return

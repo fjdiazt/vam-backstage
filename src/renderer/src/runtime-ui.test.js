@@ -18,6 +18,8 @@ describe('runtime gates', () => {
     expect(hub).toContain('capabilities.embeddedHub')
     expect(hub).toContain('capabilities.hubAccountActions')
     expect(hub).toContain('Open Hub page')
+    expect(hub).toContain("runtime.kind === 'web'")
+    expect(hub).toContain('<iframe')
   })
 
   it('gates updater, settings, developer, and reveal actions', () => {
