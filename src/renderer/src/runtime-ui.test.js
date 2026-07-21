@@ -3,6 +3,7 @@ import { resolve } from 'path'
 import { describe, expect, it } from 'vitest'
 
 const read = (path) => readFileSync(resolve(import.meta.dirname, path), 'utf8')
+const index = read('../index.html')
 const app = read('App.jsx')
 const hub = read('components/HubDetail.jsx')
 const status = read('components/StatusBar.jsx')
@@ -20,6 +21,10 @@ describe('runtime gates', () => {
     expect(hub).toContain('Open Hub page')
     expect(hub).toContain("runtime.kind === 'web'")
     expect(hub).toContain('<iframe')
+  })
+
+  it('allows the isolated Hub proxy iframe', () => {
+    expect(index).toContain("frame-src 'self' http:")
   })
 
   it('gates updater, settings, developer, and reveal actions', () => {
