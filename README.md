@@ -28,7 +28,7 @@ Explore and organize your collection in a fast desktop interface, with powerful 
 
 Enable **Client-server mode** in Settings and start the server. Open `http://<host-ip>:42069` in a desktop browser on the same trusted network. The desktop app may stay open as the host, or the packaged executable may run headlessly with `--serve`.
 
-Browser clients support library and content management, scans, downloads, labels, Hub search and installation, and `.var` upload. Hub pages open in a normal browser tab. Native folder selection, Explorer reveal, updates, server controls, developer tools, and Hub account actions remain in Electron.
+Browser clients support library and content management, scans, downloads, labels, `.var` upload, and the full embedded Hub browser with the host's shared Hub login/account actions. Native folder selection, Explorer reveal, updates, server controls, and developer tools remain in Electron. The Hub proxy uses the adjacent port (`42070` for the default app port), so both ports must be reachable on the trusted network.
 
 Remote Access has no authentication. Every device that can reach the port can modify the library. Use it only on a trusted intranet.
 

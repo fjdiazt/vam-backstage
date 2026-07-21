@@ -4,7 +4,7 @@
 
 Serve VaM Backstage's existing React interface to desktop browsers on a trusted intranet while preserving the current Electron desktop application. The browser and Electron windows must use the same renderer code and the same backend behavior.
 
-Initial web scope provides Library, Content, labels, downloads, scanning, settings that do not require native UI, Hub search/detail data, and Hub installs. Electron-only Hub embedding and Hub account interactions remain desktop-only, but the runtime boundary must allow later browser implementations without forking the renderer.
+Web scope provides Library, Content, labels, downloads, scanning, settings that do not require native UI, Hub search/detail/install, the embedded Hub site, and Hub login/account interactions without forking the renderer.
 
 ## Scope
 
@@ -16,7 +16,7 @@ Initial web scope provides Library, Content, labels, downloads, scanning, settin
 - Support current desktop versions of Chrome, Edge, and Firefox at desktop widths.
 - Reuse `App.jsx`, renderer components, Zustand stores, CSS, IPC handlers, SQLite data, scanner, watcher, downloads, and remote events.
 - Preserve browser `.var` import through the existing chunked-upload handlers.
-- Open Hub pages in a normal browser tab from the web UI.
+- Browse Hub pages in the existing in-app detail browser from the web UI.
 - Expose runtime capabilities so unsupported controls are hidden or replaced deliberately.
 - Keep the existing trusted-intranet, no-authentication model.
 
@@ -24,8 +24,6 @@ Initial web scope provides Library, Content, labels, downloads, scanning, settin
 
 - Phone and tablet responsive redesign.
 - Public-internet exposure, authentication, authorization, TLS termination, or multi-user isolation.
-- Browser-embedded Hub pages.
-- Browser-side Hub favorite, bookmark, rating, like, and Hub-session import behavior.
 - Browser control of native folder pickers, Explorer reveal, app updates, or server lifecycle.
 - REST API or standalone backend rewrite.
 - Separate web frontend or duplicated React components.
@@ -53,7 +51,7 @@ shared React renderer
 
 The WebSocket RPC core becomes Electron-free. Electron remote clients supply local IPC routing for channels that must execute on the client machine. Browser clients supply browser implementations or unavailable results for those channels. Both clients retain the current RPC encoding, version gate, reconnect backoff, event delivery, and reload-after-reconnect behavior.
 
-`src/main/remote/server.js` owns one Node HTTP server. `WebSocketServer` attaches to that server instead of opening a second listener. HTTP serves the sibling `out/renderer` directory; WebSocket upgrades continue carrying the current protocol. Default browser address is `http://<host>:42069`.
+`src/main/remote/server.js` owns the app HTTP/WebSocket listener and a fixed-origin Hub proxy listener. App HTTP and WebSocket share the configured port (`42069` by default). The Hub proxy uses the adjacent port (`42070` by default), giving third-party Hub JavaScript a separate browser origin while still sharing Electron's `persist:hub` session. `/__hub/*` on the app listener redirects into that proxy.
 
 No new runtime dependency is required. HTTP, filesystem reads, path resolution, and streaming use Node standard-library modules; `ws` remains the WebSocket implementation.
 
@@ -80,22 +78,21 @@ runtime: {
 
 Capability values describe working behavior, not platform guesses:
 
-| Capability          | Local Electron | Remote Electron                       | Web |
-| ------------------- | -------------- | ------------------------------------- | --- |
-| `embeddedHub`       | yes            | yes                                   | no  |
-| `hubAccountActions` | yes            | yes, using client Electron session    | no  |
-| `nativeDialogs`     | yes            | no for host paths                     | no  |
-| `revealInFolder`    | yes            | no                                    | no  |
-| `updater`           | yes            | yes, client-local                     | no  |
-| `serverControl`     | yes            | yes, client-local connection controls | no  |
-| `developerTools`    | yes            | yes, client-local                     | no  |
+| Capability          | Local Electron | Remote Electron                       | Web                            |
+| ------------------- | -------------- | ------------------------------------- | ------------------------------ |
+| `embeddedHub`       | yes            | yes                                   | yes                            |
+| `hubAccountActions` | yes            | yes, using client Electron session    | yes, using host shared session |
+| `nativeDialogs`     | yes            | no for host paths                     | no                             |
+| `revealInFolder`    | yes            | no                                    | no                             |
+| `updater`           | yes            | yes, client-local                     | no                             |
+| `serverControl`     | yes            | yes, client-local connection controls | no                             |
+| `developerTools`    | yes            | yes, client-local                     | no                             |
 
 Browser-local operations:
 
 - `shell.openExternal(url)` uses `window.open(url, '_blank', 'noopener,noreferrer')` after existing URL validation.
 - `packages.getPathForFile()` returns an empty string, forcing existing chunked upload.
 - Native browse methods return their current cancelled shapes.
-- Hub login checks return `false`; Hub account mutations return an unavailable result.
 - Developer, updater, reveal-in-folder, and server-control methods return stable unavailable results when invoked defensively.
 - `app.getVersion()` is allowed over remote RPC.
 - `app.hubWebviewPreload` is `null`.
@@ -113,9 +110,11 @@ Same-origin WebSocket URL derives from `window.location`: `http:` becomes `ws:`,
 
 ## HTTP Serving
 
-The server accepts `GET` and `HEAD`. Other methods return `405`.
+The app server accepts `GET` and `HEAD`; other methods return `405`. The isolated Hub proxy forwards the methods needed by Hub navigation, forms, and XHR.
 
 - `/` serves `index.html`.
+- `/__hub/*` redirects to the same path on the isolated adjacent-port proxy.
+- The proxy accepts only `https://hub.virtamate.com`, rewrites Hub URLs, strips frame-blocking headers, and reuses `persist:hub` cookies.
 - Existing files beneath `out/renderer` are streamed with correct MIME types.
 - Hashed files under `/assets/` receive long-lived immutable caching.
 - `index.html` receives `Cache-Control: no-cache`.
@@ -126,14 +125,14 @@ The server accepts `GET` and `HEAD`. Other methods return `405`.
 
 The response MIME map only covers artifacts emitted by the current build: HTML, JavaScript, CSS, JSON, PNG, JPEG, SVG, ICO, WOFF, WOFF2, and source maps. Unknown extensions use `application/octet-stream`.
 
-`startServer()` still resolves only after the shared HTTP/WebSocket listener starts. `stopServer()` closes clients, WebSocket handling, and the HTTP listener without leaving the port occupied. Port `0` records the actual assigned port for tests.
+`startServer()` resolves only after the app and Hub proxy listeners start. `stopServer()` closes clients, WebSocket handling, and both HTTP listeners without leaving either port occupied. Port `0` records actual assigned ports for tests.
 
 ## Browser UI Behavior
 
 Renderer changes use capability checks, not copied web components.
 
-- `HubDetail` replaces Electron `<webview>` and its toolbar with an “Open Hub page” action when `embeddedHub` is false.
-- Hub account controls remain hidden when `hubAccountActions` is false.
+- `HubDetail` keeps Electron `<webview>` locally and uses the isolated Hub proxy iframe in web mode, preserving toolbar, tabs, history, and resource-follow behavior.
+- Hub login and account controls use the shared host `persist:hub` session in web mode.
 - Settings hides native folder-selection, updater, developer, and remote-server lifecycle controls when their capabilities are false. Read-only host settings and safe backend actions remain visible.
 - Reveal-in-folder actions are hidden when `revealInFolder` is false.
 - Update prompts and updater actions are not subscribed or rendered when `updater` is false.
@@ -175,9 +174,10 @@ Focused automated checks cover:
 - Browser runtime capability values and local fallback return shapes.
 - Browser WebSocket URL derivation for HTTP and HTTPS origins.
 - Static asset resolution, MIME types, cache headers, `HEAD`, SPA fallback, missing build, missing asset, malformed path, and traversal rejection.
-- HTTP and WebSocket traffic share one listener.
-- Server stop releases the listener.
-- Renderer gates for Hub embedding, Hub account actions, native settings controls, reveal-in-folder, updater UI, and first-run host setup.
+- HTTP and WebSocket traffic share the app listener; Hub content redirects to a separate origin.
+- Server stop releases both listeners.
+- Hub proxy origin restriction, URL/header rewriting, body forwarding, and session reuse.
+- Renderer adapter coverage for Hub iframe embedding, Hub account actions, native settings controls, reveal-in-folder, updater UI, and first-run host setup.
 - Existing remote channel-policy tests continue passing.
 
 Verification commands:
@@ -200,12 +200,10 @@ Manual smoke matrix:
 | Either host                                | Browser `.var` import        | Chunked upload installs package                      |
 | Either host                                | Browser Hub install          | Download progress and completion events update UI    |
 
-## Future Full Parity
+## Remaining Native Boundaries
 
-Future browser Hub parity adds implementations behind existing capabilities:
+Hub browsing and account interactions now have browser parity. Electron-only operations remain capability-gated:
 
-- `embeddedHub`: browser-safe Hub presentation or approved proxy strategy.
-- `hubAccountActions`: explicit Hub session flow compatible with browser cookie and CORS constraints.
-- Optional native-like operations: separate host-side RPC designs with deliberate path and mutation semantics.
-
-No current task builds speculative proxy, cookie, or account infrastructure. Shared renderer, API factory, and capability contract are the extension points.
+- Native folder pickers and Explorer reveal.
+- App updater and developer tools.
+- Remote server lifecycle controls.

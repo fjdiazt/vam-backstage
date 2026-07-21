@@ -950,7 +950,7 @@ When search results return from the Hub, the client enriches each resource with 
 
 ### Hub account interactions
 
-`hub/interactions.js` manages Hub session cookies and authenticated actions (favorite, bookmark, rate, like). `hub:isLoggedIn` probes cookie presence; `hub:resourceUserState` reads per-resource state. Toggle handlers return `{ ok, reason? }` and emit `hub:auth-changed` when the session is invalid. These channels stay **local-only** in remote client mode (not proxied over WebSocket) because the session lives in the local Electron partition.
+`hub/interactions.js` manages Hub session cookies and authenticated actions (favorite, bookmark, rate, like). `hub:isLoggedIn` probes cookie presence; `hub:resourceUserState` reads per-resource state. Toggle handlers return `{ ok, reason? }` and emit `hub:auth-changed` when the session is invalid. Browser clients call these channels over WebSocket; their proxied Hub iframe and the interaction handlers share the host's `persist:hub` session.
 
 ### Wishlist maintenance
 
@@ -1460,7 +1460,7 @@ Handlers live under `src/main/ipc/` split per domain (`packages.js`, `contents.j
 | `hub:check-availability` | Hub availability for a batch of dep refs                                   |
 | `hub:scan-packages`      | Trigger the packages.json CDN scan                                         |
 | `hub:invalidateCaches`   | Clear in-memory Hub LRU caches                                             |
-| `hub:isLoggedIn`         | Whether Hub session cookies are present (local-only; not proxied remotely) |
+| `hub:isLoggedIn`         | Whether the active Hub session cookies are present                         |
 | `hub:resourceUserState`  | Favorite/bookmark/rate/like state for a resource                           |
 | `hub:toggleFavorite`     | Toggle Hub favorite (auth-guarded)                                         |
 | `hub:toggleBookmark`     | Toggle Hub bookmark (auth-guarded)                                         |
@@ -1605,7 +1605,7 @@ When developer options are unlocked, **F12** (and Ctrl+Shift+I / Cmd+Alt+I) togg
 | `scan:progress`             | `{phase, step, total, message}`                                    | During local library scan                                             |
 | `scan:unreadable`           | `{filename}` per event                                             | Unreadable `.var` detected post-startup                               |
 | `hub-scan:progress`         | `{current, total, found, phase, ...}`                              | During first-run / Hub enrichment                                     |
-| `hub:auth-changed`          | `{ loggedIn }`                                                     | Hub session gained/lost (local only; not broadcast)                   |
+| `hub:auth-changed`          | `{ loggedIn }`                                                     | Hub session gained/lost (broadcast to remote clients)                 |
 | `updater:update-*` / error  | version / message                                                  | Host updater status (local only; not broadcast)                       |
 | `remote:server-status`      | `{ running, port, clients }`                                       | Local server start/stop or client connect/disconnect                  |
 | `auto-hide:progress`        | `{current, total, filename?, items, ...}`                          | During batch `.hide` application                                      |
@@ -1696,13 +1696,13 @@ Scenes and legacy looks share VaM's `{ atoms: [{ type: "Person", storables }] }`
 
 One Electron instance can host the full main-process backend on the LAN. Other Electron instances can connect as thin clients, and desktop browsers can load the same renderer over HTTP.
 
-**Server** (`remote/server.js`, `remote/http-server.js`): one Node HTTP listener binds `0.0.0.0` (default port `42069`, see `shared/remote-config.js`). It serves the production `out/renderer` files, provides SPA fallback, and accepts `ws` upgrades on the same port. `remote/registry.js` captures every `ipcMain.handle` registration into a lookup map; incoming `{ channel, args }` frames invoke the same handlers locally unless denied by `remote/channel-policy.js` (`shell:*`, `remote:*`, `updater:*`, `dev:*`, native browse/detect, Hub session toggles, database-path disclosure). `notify()` events are rebroadcast to all connected clients except machine-local channels (`hub:auth-changed`, `updater:*`). `notifyPeers()` skips the invoking renderer or WebSocket when the actor is already current.
+**Server** (`remote/server.js`, `remote/http-server.js`): the app HTTP listener binds `0.0.0.0` (default port `42069`, see `shared/remote-config.js`), serves `out/renderer`, provides SPA fallback, and accepts `ws` upgrades on that same port. A fixed-origin Hub reverse proxy binds the adjacent port (`42070` by default); `/__hub/*` redirects into that separate browser origin so Hub JavaScript cannot access the app document or `window.api`. `remote/registry.js` captures every `ipcMain.handle` registration into a lookup map; incoming `{ channel, args }` frames invoke the same handlers locally unless denied by `remote/channel-policy.js` (`shell:*`, `remote:*`, `updater:*`, `dev:*`, native browse/detect, wishlist import collection, database-path disclosure). `notify()` events, including `hub:auth-changed`, are rebroadcast to clients except updater events. `notifyPeers()` skips the invoking renderer or WebSocket when the actor is already current.
 
 **Shared client contract** (`shared/api.js`, `shared/remote-transport.js`): Electron preload and browser bootstrap both construct the same `window.api` facade. Electron uses IPC locally or WebSocket RPC under `--connect=`. A browser uses a same-origin WebSocket URL. Runtime capabilities tell React whether embedded Hub, Hub account actions, native dialogs, Explorer reveal, updater, server controls, and developer tools exist.
 
-**Browser behavior** (`renderer/src/browser-api.js`): browser mode reuses the production renderer. Host-backed library, content, label, scan, download, wishlist, and Hub search/install channels use WebSocket RPC. `.var` import uses the existing chunked upload path. Hub pages open in a normal tab. Native-only operations are stubbed safely and their controls are hidden.
+**Browser behavior** (`renderer/src/browser-api.js`): browser mode reuses the production renderer. Host-backed library, content, label, scan, download, wishlist, and Hub channels use WebSocket RPC. `.var` import uses the existing chunked upload path. `HubDetail` swaps Electron's `<webview>` for a cross-origin iframe backed by `remote/hub-proxy.js`; the iframe keeps the same toolbar, tab, resource-follow, login, and favorite/bookmark/rate/like flows. Proxy browsing and Hub interaction handlers share Electron's `persist:hub` session. Native-only operations are stubbed safely and their controls are hidden.
 
-**Settings UX**: Enable client-server mode, optionally serve on launch, choose the port, then open `http://<host-ip>:42069`. Connecting/disconnecting an Electron client relaunches the app with/without `--connect=` because hot-switching transport mid-session is intentionally unsupported. The client autoconnect URL is stored in `remote/autostart.js` because a pure client head may have no DB yet.
+**Settings UX**: Enable client-server mode, optionally serve on launch, choose the port, then open `http://<host-ip>:42069`. The adjacent Hub proxy port must also be reachable. Connecting/disconnecting an Electron client relaunches the app with/without `--connect=` because hot-switching transport mid-session is intentionally unsupported. The client autoconnect URL is stored in `remote/autostart.js` because a pure client head may have no DB yet.
 
 **Trust model**: there is no authentication, TLS, or access control. Every device that can reach the port can view and mutate the library. Bind/use it only on a trusted intranet. Version mismatch is rejected unless the peer runs in dev/unlocked-developer mode.
 
