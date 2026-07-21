@@ -15,12 +15,6 @@ export function createBrowserApi({ location = window.location, createSocket, ope
     'wizard:detect-vam-dir': { path: null, varCount: 0, source: null },
     'shell:showItemInFolder': undefined,
     'settings:getDatabasePath': null,
-    'hub:isLoggedIn': false,
-    'hub:resourceUserState': null,
-    'hub:toggleFavorite': unavailable,
-    'hub:toggleBookmark': unavailable,
-    'hub:toggleRate': unavailable,
-    'hub:toggleLike': unavailable,
     'wishlist:import-collect': unavailable,
     'dev:is-dev': false,
     'dev:nuke-database': unavailable,
@@ -55,8 +49,8 @@ export function createBrowserApi({ location = window.location, createSocket, ope
     runtime: {
       kind: 'web',
       capabilities: {
-        embeddedHub: false,
-        hubAccountActions: false,
+        embeddedHub: true,
+        hubAccountActions: true,
         nativeDialogs: false,
         revealInFolder: false,
         updater: false,

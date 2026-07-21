@@ -14,9 +14,9 @@ describe('browser API', () => {
       open: vi.fn(),
     })
     expect(api.runtime.kind).toBe('web')
-    expect(Object.values(api.runtime.capabilities)).not.toContain(true)
+    expect(api.runtime.capabilities.embeddedHub).toBe(true)
+    expect(api.runtime.capabilities.hubAccountActions).toBe(true)
     await expect(api.wizard.browseVamDir()).resolves.toEqual({ cancelled: true })
-    await expect(api.hub.isLoggedIn()).resolves.toBe(false)
     await expect(api.updater.check()).resolves.toMatchObject({ ok: false })
   })
 })

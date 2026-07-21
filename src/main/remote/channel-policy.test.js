@@ -19,12 +19,6 @@ describe('isRemoteChannelDenied', () => {
     expect(isRemoteChannelDenied('wizard:browse-vam-dir')).toBe(true)
     expect(isRemoteChannelDenied('wizard:detect-vam-dir')).toBe(true)
     expect(isRemoteChannelDenied('settings:getDatabasePath')).toBe(true)
-    expect(isRemoteChannelDenied('hub:isLoggedIn')).toBe(true)
-    expect(isRemoteChannelDenied('hub:resourceUserState')).toBe(true)
-    expect(isRemoteChannelDenied('hub:toggleFavorite')).toBe(true)
-    expect(isRemoteChannelDenied('hub:toggleBookmark')).toBe(true)
-    expect(isRemoteChannelDenied('hub:toggleRate')).toBe(true)
-    expect(isRemoteChannelDenied('hub:toggleLike')).toBe(true)
     expect(isRemoteChannelDenied('wishlist:import-collect')).toBe(true)
   })
 
@@ -45,6 +39,14 @@ describe('isRemoteChannelDenied', () => {
     expect(isRemoteChannelDenied('scan:start')).toBe(false)
   })
 
+  it('allows shared Hub session channels', () => {
+    expect(isRemoteChannelDenied('hub:isLoggedIn')).toBe(false)
+    expect(isRemoteChannelDenied('hub:resourceUserState')).toBe(false)
+    expect(isRemoteChannelDenied('hub:toggleFavorite')).toBe(false)
+    expect(isRemoteChannelDenied('hub:toggleBookmark')).toBe(false)
+    expect(isRemoteChannelDenied('hub:toggleRate')).toBe(false)
+    expect(isRemoteChannelDenied('hub:toggleLike')).toBe(false)
+  })
   it('denies empty / non-string channels', () => {
     expect(isRemoteChannelDenied('')).toBe(true)
     expect(isRemoteChannelDenied(null)).toBe(true)
@@ -54,7 +56,7 @@ describe('isRemoteChannelDenied', () => {
 
 describe('CLIENT_LOCAL_EVENTS', () => {
   it('keeps hub auth and updater status on the host machine', () => {
-    expect(CLIENT_LOCAL_EVENTS.has('hub:auth-changed')).toBe(true)
+    expect(CLIENT_LOCAL_EVENTS.has('hub:auth-changed')).toBe(false)
     expect(CLIENT_LOCAL_EVENTS.has('updater:error')).toBe(true)
     expect(CLIENT_LOCAL_EVENTS.has('updater:update-available')).toBe(true)
     expect(CLIENT_LOCAL_EVENTS.has('updater:update-downloaded')).toBe(true)
