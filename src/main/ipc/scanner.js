@@ -10,6 +10,8 @@ import { startWatcher } from '../watcher.js'
 import { resolvePackageThumbnails } from '../thumb-resolver.js'
 import { notify, getWindow } from '../notify.js'
 import { scanHubDetails } from '../hub/scanner.js'
+import { checkVamStorage, storageUnavailableError } from '../vam-storage.js'
+import { isManualStorageMode } from '../runtime-config.js'
 
 /** Filled after startup `runScan` when unreadable .var files are found; consumed once by the renderer. */
 let pendingStartupUnreadable = null
@@ -29,14 +31,27 @@ export function registerScanHandlers() {
     const vamDir = getSetting('vam_dir')
     if (!vamDir) throw new Error('VaM directory not configured')
 
-    const result = await runScan(vamDir, (progress) => {
-      notify('scan:progress', progress)
-    })
+    const storage = await checkVamStorage(vamDir)
+    if (!storage.available) {
+      notify('storage:changed', storage)
+      throw storageUnavailableError(storage)
+    }
+
+    let result
+    try {
+      result = await runScan(vamDir, (progress) => {
+        notify('scan:progress', progress)
+      })
+    } catch (error) {
+      const storage = await checkVamStorage(vamDir)
+      if (!storage.available) notify('storage:changed', storage)
+      throw error
+    }
 
     notify('packages:updated')
     notify('contents:updated')
 
-    startWatcher(vamDir)
+    if (!isManualStorageMode()) startWatcher(vamDir)
     resolvePackageThumbnails()
 
     return result

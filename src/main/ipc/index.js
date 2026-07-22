@@ -14,6 +14,7 @@ import { registerExtractHandlers } from './extract.js'
 import { registerLabelHandlers } from './labels.js'
 import { registerLibraryDirHandlers } from './library-dirs.js'
 import { registerRemoteHandlers } from './remote.js'
+import { checkVamStorage } from '../vam-storage.js'
 
 // Small, unrelated IPC surfaces that are pure delegations to their backing
 // modules live here rather than each getting its own file.
@@ -26,6 +27,7 @@ function registerMiscHandlers() {
   ipcMain.handle('thumbnails:getGraph', async (_, keys) => getGraphThumbnails(keys || []))
 
   ipcMain.handle('settings:getDatabasePath', () => getDatabasePath())
+  ipcMain.handle('storage:status', async () => checkVamStorage(getSetting('vam_dir')))
   ipcMain.handle('settings:get', (_, key) => getSetting(key))
   ipcMain.handle('settings:set', (_, key, value) => {
     setSetting(key, value)

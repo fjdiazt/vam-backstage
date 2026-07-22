@@ -28,6 +28,7 @@ import { DEFAULT_REMOTE_PORT } from '@shared/remote-config.js'
 import { HUB_HTTP_USER_AGENT } from '@shared/hub-http.js'
 import { loadBrowserAssistDerivedHiddenRules } from './browser-assist.js'
 import { applyVamDirOverride, configureUserDataPath, isManualStorageMode } from './runtime-config.js'
+import { checkVamStorage } from './vam-storage.js'
 import {
   attachMainWindowStatePersistence,
   loadMainWindowState,
@@ -424,6 +425,12 @@ async function startupScan() {
   const scanDone = getSetting('initial_scan_done')
   if (!vamDir || !scanDone) return
 
+  const storage = await checkVamStorage(vamDir)
+  if (!storage.available) {
+    console.warn(`[storage] ${storage.error}`)
+    return
+  }
+
   if (getSetting('needs_rescan')) {
     setSetting('needs_rescan', null)
   }
@@ -477,7 +484,7 @@ async function startupScan() {
     })()
   } finally {
     const branches = []
-    if (vamDir && getSetting('initial_scan_done')) branches.push(startWatcher(vamDir))
+    if (vamDir && getSetting('initial_scan_done') && !isManualStorageMode()) branches.push(startWatcher(vamDir))
     if (hubBackfill) branches.push(hubBackfill)
     if (branches.length) await Promise.allSettled(branches)
   }

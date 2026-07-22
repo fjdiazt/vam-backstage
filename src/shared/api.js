@@ -131,6 +131,9 @@ export function createApi({ transport, runtime, getPathForFile = () => '', hubWe
       set: (key, value) => invoke('settings:set', key, value),
       getDatabasePath: () => invoke('settings:getDatabasePath'),
     },
+    storage: {
+      status: () => invoke('storage:status'),
+    },
     libraryDirs: {
       list: () => invoke('library-dirs:list'),
       browse: () => invoke('library-dirs:browse'),
@@ -199,6 +202,7 @@ export function createApi({ transport, runtime, getPathForFile = () => '', hubWe
     onDownloadFailed: (cb) => transport.on('download:failed', (data) => cb(data)),
     onInstallLookNoPreset: (cb) => transport.on('install:look-no-preset', (data) => cb(data)),
     onScanProgress: (cb) => transport.on('scan:progress', (data) => cb(data)),
+    onStorageChanged: (cb) => transport.on('storage:changed', (data) => cb(data)),
     onIntegrityProgress: (cb) => transport.on('integrity:progress', (data) => cb(data)),
     onScanUnreadable: (cb) => transport.on('scan:unreadable', (data) => cb(data)),
     onToast: (cb) => transport.on('toast', (data) => cb(data)),

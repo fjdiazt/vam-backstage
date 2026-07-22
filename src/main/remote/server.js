@@ -9,6 +9,8 @@ import { getWindow } from '../notify.js'
 import { getSetting } from '../db.js'
 import { createRemoteHttpServer } from './http-server.js'
 import { createHubProxyHandler } from './hub-proxy.js'
+import { checkVamStorage, getVamStorageStatus, storageChannelUsesVam, storageUnavailableError } from '../vam-storage.js'
+import { isManualStorageMode } from '../runtime-config.js'
 
 // The version gate on the client relaxes when a peer reports `dev` — true for
 // unpackaged runs and for packaged builds where DevTools/developer options have
@@ -197,6 +199,13 @@ async function handleMessage(ws, raw) {
     return
   }
 
+  if (isManualStorageMode() && storageChannelUsesVam(channel)) {
+    const storage = getVamStorageStatus()
+    if (!storage.available) {
+      sendError(ws, id, storageUnavailableError(storage))
+      return
+    }
+  }
   // Handlers ignore the Electron IpcMainInvokeEvent; we only attach `remoteWs`
   // so `notifyPeers()` can exclude this socket from the fan-out.
   const event = { sender: null, remoteWs: ws }
@@ -204,7 +213,15 @@ async function handleMessage(ws, raw) {
   try {
     result = await handler(event, ...(args || []))
   } catch (err) {
-    sendError(ws, id, err)
+    let replyError = err
+    if (isManualStorageMode() && storageChannelUsesVam(channel)) {
+      const storage = await checkVamStorage(getSetting('vam_dir'))
+      if (!storage.available) {
+        broadcast('storage:changed', storage)
+        replyError = storageUnavailableError(storage)
+      }
+    }
+    sendError(ws, id, replyError)
     return
   }
 

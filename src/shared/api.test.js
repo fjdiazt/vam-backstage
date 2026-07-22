@@ -20,9 +20,13 @@ describe('createApi', () => {
 
     await api.packages.list({ direct: true })
     api.onPackagesUpdated(vi.fn())
+    await api.storage.status()
+    api.onStorageChanged(vi.fn())
 
     expect(invoke).toHaveBeenCalledWith('packages:list', { direct: true })
     expect(on).toHaveBeenCalledWith('packages:updated', expect.any(Function))
+    expect(invoke).toHaveBeenCalledWith('storage:status')
+    expect(on).toHaveBeenCalledWith('storage:changed', expect.any(Function))
   })
 
   it('exposes runtime and platform adapters', () => {
@@ -52,6 +56,7 @@ describe('createApi', () => {
       'wizard',
       'settings',
       'libraryDirs',
+      'storage',
       'dev',
       'extract',
       'shell',
