@@ -27,6 +27,7 @@ import { initAutostart, readAutostartUrl } from './remote/autostart.js'
 import { DEFAULT_REMOTE_PORT } from '@shared/remote-config.js'
 import { HUB_HTTP_USER_AGENT } from '@shared/hub-http.js'
 import { loadBrowserAssistDerivedHiddenRules } from './browser-assist.js'
+import { applyVamDirOverride, configureUserDataPath, isManualStorageMode } from './runtime-config.js'
 import {
   attachMainWindowStatePersistence,
   loadMainWindowState,
@@ -92,7 +93,8 @@ function attachAppCommandBridge(window) {
 // `npm run dev` sets VAM_DEV_USERDATA to isolate dev in a `-dev` userData;
 // `dev:installed` leaves it unset to attach to the installed data. Must run
 // before initAutostart and the `-client` swap so both inherit the dev root.
-if (process.env.VAM_DEV_USERDATA) {
+const configuredUserData = configureUserDataPath(app)
+if (!configuredUserData && process.env.VAM_DEV_USERDATA) {
   app.setPath('userData', app.getPath('userData') + '-dev')
 }
 
@@ -388,6 +390,7 @@ async function initBackend() {
   if (IS_CLIENT) return
 
   openDatabase()
+  applyVamDirOverride(setSetting)
   runStartupMigrations()
   try {
     const removed = gcOrphanLabels()
@@ -488,7 +491,7 @@ app.whenReady().then(async () => {
   // and window creation, so the real (main-thread) watchers attach without the ~5s
   // Explorer-launch stall. Fire-and-forget; startWatcher awaits it. See watcher-warm.js.
   // Client head has no watcher, so skip it.
-  if (!IS_CLIENT) warmFileWatcherBackend()
+  if (!IS_CLIENT && !isManualStorageMode()) warmFileWatcherBackend()
 
   electronApp.setAppUserModelId('com.cyberpunk2073.vam-backstage')
 
