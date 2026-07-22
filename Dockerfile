@@ -48,4 +48,3 @@ ENV VAM_SERVE=42069 \
 EXPOSE 42069 42070
 
 ENTRYPOINT ["xvfb-run", "-a", "/opt/vam-backstage/vam-backstage", "--no-sandbox"]
-
