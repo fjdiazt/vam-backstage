@@ -32,6 +32,8 @@ Browser clients support library and content management, scans, downloads, labels
 
 Remote Access has no authentication. Every device that can reach the port can modify the library. Use it only on a trusted intranet.
 
+To host Backstage in Docker on Ubuntu while the VaM folder remains on a Windows SMB share, follow the [Docker and SMB hosting guide](docs/docker-smb-hosting.md).
+
 ## Development
 
 Requires Node.js >= 24.
