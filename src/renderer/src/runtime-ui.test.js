@@ -10,6 +10,7 @@ const status = read('components/StatusBar.jsx')
 const settings = read('views/SettingsView.jsx')
 const files = read('components/FileTreeDialog.jsx')
 const content = read('views/ContentView.jsx')
+const storage = read('components/StorageGate.jsx')
 
 describe('runtime gates', () => {
   it('gates setup, escape, and Hub', () => {
@@ -34,5 +35,21 @@ describe('runtime gates', () => {
     expect(settings).toContain('capabilities.developerTools')
     expect(files).toContain('capabilities.revealInFolder')
     expect(content).toContain('capabilities.revealInFolder')
+  })
+
+  it('blocks unavailable manual storage and retries with a scan', () => {
+    expect(app).toContain('<StorageGate>')
+    expect(storage).toContain('api.storage.status()')
+    expect(storage).toContain('api.scan.start()')
+    expect(storage).toContain('window.api.onStorageChanged')
+    expect(storage).toContain('VaM storage unavailable')
+    expect(storage).toContain('Retry')
+  })
+
+  it('shows manual rescan controls only for web manual mode', () => {
+    expect(status).toContain("window.api.runtime.kind === 'web'")
+    expect(status).toContain("storage?.mode === 'manual'")
+    expect(status).toContain('Rescan shared VaM folder')
+    expect(settings).toContain('Manual rescan')
   })
 })

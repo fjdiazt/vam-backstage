@@ -16,6 +16,7 @@ import DownloadsPanel from '@/components/DownloadsPanel'
 import FirstRun from '@/components/FirstRun'
 import DropImport from '@/components/DropImport'
 import ErrorBoundary from '@/components/ErrorBoundary'
+import StorageGate from '@/components/StorageGate'
 import { ToastContainer, toast } from '@/components/Toast'
 import { WhatsNewDialog } from '@/components/WhatsNewDialog'
 import { ThumbnailLightbox } from '@/components/ThumbnailLightbox'
@@ -44,6 +45,17 @@ const NAV_ITEMS = [
   { id: 'graph', icon: Network, label: 'Graph' },
 ]
 export default function App() {
+  return (
+    <>
+      <RemoteGate />
+      <StorageGate>
+        <AppShell />
+      </StorageGate>
+    </>
+  )
+}
+
+function AppShell() {
   const capabilities = window.api.runtime.capabilities
   const view = useViewStore((s) => s.view)
   const setView = useViewStore((s) => s.setView)
@@ -205,15 +217,11 @@ export default function App() {
     [setView],
   )
 
-  // On a client head every `window.api` call (incl. the `initial_scan_done`
-  // lookup that resolves `showWizard`) is a remote invoke queued until the
-  // socket connects — so this loading phase can last the whole first-connect.
-  // RemoteGate must render here too, otherwise the user stares at a black
-  // screen instead of the "Connecting…" modal.
+  // RemoteGate stays mounted outside this shell while host setup state loads.
   if (showWizard === null) {
     return (
-      <div className="h-full bg-base">
-        <RemoteGate />
+      <div className="h-full bg-base flex items-center justify-center">
+        <Loader2 size={22} className="animate-spin text-accent-blue" aria-label="Loading VaM Backstage" />
       </div>
     )
   }
@@ -221,7 +229,6 @@ export default function App() {
   return (
     <TooltipProvider>
       <div className="flex h-full bg-base">
-        <RemoteGate />
         {showWizard &&
           (capabilities.nativeDialogs ? (
             <FirstRun onDone={() => setShowWizard(false)} />

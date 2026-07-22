@@ -147,12 +147,22 @@ export default function StatusBar() {
   const [appVersion, setAppVersion] = useState('')
   const [updateState, setUpdateState] = useState(null)
   const [versionCheckBusy, setVersionCheckBusy] = useState(false)
+  const [storage, setStorage] = useState(null)
+  const [manualScanning, setManualScanning] = useState(false)
 
   useEffect(() => {
     if (capabilities.updater) window.api.dev.isDev().then(setIsDev)
     else setIsDev(false)
     window.api.app.getVersion().then(setAppVersion)
   }, [capabilities.updater])
+
+  useEffect(() => {
+    void window.api.storage
+      .status()
+      .then(setStorage)
+      .catch(() => {})
+    return window.api.onStorageChanged(setStorage)
+  }, [])
 
   useEffect(() => {
     if (!capabilities.updater || isDev) return undefined
@@ -179,6 +189,18 @@ export default function StatusBar() {
   const handleInstallClick = async () => {
     const r = await window.api.updater.install()
     if (r?.ok === false) toast(r.error || 'Could not install update', 'error', 8000)
+  }
+
+  const handleManualRescan = async () => {
+    if (manualScanning || scan) return
+    setManualScanning(true)
+    try {
+      await window.api.scan.start()
+    } catch (error) {
+      toast(`Scan failed: ${error.message}`, 'error', 6000)
+    } finally {
+      setManualScanning(false)
+    }
   }
 
   const handleVersionClick = async () => {
@@ -350,6 +372,24 @@ export default function StatusBar() {
             {sessionCompleted.length}/{sessionItems.length}
           </span>
         </div>
+      )}
+      {window.api.runtime.kind === 'web' && storage?.mode === 'manual' && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              onClick={handleManualRescan}
+              disabled={manualScanning || !!scan}
+              aria-label="Rescan shared VaM folder"
+            >
+              {manualScanning || scan ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+              Rescan
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="top">Rescan shared VaM folder</TooltipContent>
+        </Tooltip>
       )}
       <RemoteStatusIndicator />
       {capabilities.updater ? (

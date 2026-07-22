@@ -59,6 +59,7 @@ export default function SettingsView() {
   const [deletedData, setDeletedData] = useState({ packages: 0, contentLabels: 0 })
   const devUnlockRef = useRef({ count: 0, resetTimer: null })
   const [scanning, setScanning] = useState(false)
+  const [storage, setStorage] = useState(null)
   const [scanResult, setScanResult] = useState(null)
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState(null)
@@ -114,6 +115,14 @@ export default function SettingsView() {
     } catch (err) {
       console.warn('library-dirs:suggest failed:', err.message)
     }
+  }, [])
+
+  useEffect(() => {
+    void window.api.storage
+      .status()
+      .then(setStorage)
+      .catch(() => {})
+    return window.api.onStorageChanged(setStorage)
   }, [])
 
   useEffect(() => {
@@ -789,6 +798,13 @@ export default function SettingsView() {
             </div>
 
             <div className="flex items-center gap-2 flex-wrap">
+              {storage?.mode === 'manual' && (
+                <div className="flex items-center gap-2 text-[11px] text-text-tertiary">
+                  <RefreshCw size={12} />
+                  Filesystem updates: Manual rescan (server configured)
+                </div>
+              )}
+
               <Button
                 variant="gradient"
                 size="lg"
