@@ -1,0 +1,13 @@
+.git
+.github
+.agents
+.codex
+.cursor
+node_modules
+dist
+out
+.eslintcache
+VaM
+*.log*
+*.tar.gz
+

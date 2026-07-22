@@ -1,0 +1,17 @@
+services:
+  backstage:
+    build: .
+    restart: unless-stopped
+    ports:
+      - '42069:42069'
+      - '42070:42070'
+    volumes:
+      - type: bind
+        source: ${VAM_MOUNT:-/mnt/vam}
+        target: /vam
+      - type: volume
+        source: backstage-data
+        target: /data
+
+volumes:
+  backstage-data:
