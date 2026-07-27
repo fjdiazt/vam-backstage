@@ -4,7 +4,7 @@
 
 **Goal:** Deploy VaM Backstage automatically on the existing Gitea Docker runner whenever `develop` is pushed.
 
-**Architecture:** One Gitea Actions workflow follows the existing PML/ERP checkout-and-Compose pattern. The runner supplies only `VAM_MOUNT`; Ubuntu owns the SMB mount and credentials. The same `develop` commit is pushed to Gitea and GitHub.
+**Architecture:** One Gitea Actions workflow follows the existing PML/ERP checkout-and-Compose pattern. Ubuntu owns the three SMB mounts and credentials; the runner supplies only their host paths. The same `develop` commit is pushed to Gitea and GitHub.
 
 **Tech Stack:** Gitea Actions, Docker Compose, YAML, Git, PowerShell
 
@@ -12,7 +12,7 @@
 
 - Trigger deployment only from `develop`.
 - Use the existing `ubuntu-latest` self-hosted runner.
-- Default `VAM_MOUNT` to `/mnt/vam`.
+- Default the root, package, and offload mounts to `/mnt/vam-root`, `/mnt/vam-packages`, and `/mnt/vam-offloaded`.
 - Keep SMB credentials out of Git, Gitea variables, and the container.
 - Do not add a registry, staging environment, authentication, or new application code.
 
@@ -26,7 +26,7 @@
 
 **Interfaces:**
 
-- Consumes: existing `docker-compose.yml` and Gitea repository variable `VAM_MOUNT`
+- Consumes: existing `docker-compose.yml` and optional Gitea mount-path variables
 - Produces: a push-triggered Compose deployment for branch `develop`
 
 - [ ] **Step 1: Confirm the workflow does not exist**
@@ -62,7 +62,9 @@ jobs:
       - name: Deploy via Docker Compose
         run: |
           cat > .env << 'EOF'
-          VAM_MOUNT=${{ vars.VAM_MOUNT || '/mnt/vam' }}
+          VAM_ROOT_MOUNT=${{ vars.VAM_ROOT_MOUNT || '/mnt/vam-root' }}
+          VAM_PACKAGES_MOUNT=${{ vars.VAM_PACKAGES_MOUNT || '/mnt/vam-packages' }}
+          VAM_OFFLOADED_MOUNT=${{ vars.VAM_OFFLOADED_MOUNT || '/mnt/vam-offloaded' }}
           EOF
           docker compose up -d --build
 ```

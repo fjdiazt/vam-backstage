@@ -7,8 +7,14 @@ services:
       - '42070:42070'
     volumes:
       - type: bind
-        source: ${VAM_MOUNT:-/mnt/vam}
+        source: ${VAM_ROOT_MOUNT:-/mnt/vam-root}
         target: /vam
+      - type: bind
+        source: ${VAM_PACKAGES_MOUNT:-/mnt/vam-packages}
+        target: /vam/AddonPackages
+      - type: bind
+        source: ${VAM_OFFLOADED_MOUNT:-/mnt/vam-offloaded}
+        target: /vam/AddonPackagesOffloaded
       - type: volume
         source: backstage-data
         target: /data

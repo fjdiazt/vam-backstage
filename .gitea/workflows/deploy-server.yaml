@@ -18,7 +18,9 @@ jobs:
       - name: Deploy via Docker Compose
         run: |
           cat > .env << 'EOF'
-          VAM_MOUNT=${{ vars.VAM_MOUNT || '/mnt/vam' }}
+          VAM_ROOT_MOUNT=${{ vars.VAM_ROOT_MOUNT || '/mnt/vam-root' }}
+          VAM_PACKAGES_MOUNT=${{ vars.VAM_PACKAGES_MOUNT || '/mnt/vam-packages' }}
+          VAM_OFFLOADED_MOUNT=${{ vars.VAM_OFFLOADED_MOUNT || '/mnt/vam-offloaded' }}
           EOF
           docker compose up -d --build
           sleep 5
@@ -27,6 +29,12 @@ jobs:
           test -n "$container_id"
           test "$(docker inspect --format '{{.State.Status}}' "$container_id")" = running
           test "$(docker inspect --format '{{.RestartCount}}' "$container_id")" = 0
+          docker compose exec -T backstage sh -eu -c '
+            for path in /vam/AddonPackages /vam/AddonPackagesOffloaded; do
+              test -d "$path"
+              test -n "$(find "$path/" -mindepth 1 -maxdepth 1 -print -quit)"
+            done
+          '
           for attempt in $(seq 1 20); do
             docker compose exec -T backstage curl --fail --silent --output /dev/null http://127.0.0.1:42069/ && exit 0
             sleep 1
