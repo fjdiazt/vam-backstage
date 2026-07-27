@@ -4,7 +4,7 @@
 
 **Goal:** Deploy VaM Backstage automatically on the existing Gitea Docker runner whenever `develop` is pushed.
 
-**Architecture:** One Gitea Actions workflow follows the existing PML/ERP checkout-and-Compose pattern. Ubuntu owns the three SMB mounts and credentials; the runner supplies only their host paths. The same `develop` commit is pushed to Gitea and GitHub.
+**Architecture:** One Gitea Actions workflow follows the existing PML/ERP checkout-and-Compose pattern. Ubuntu owns the VaM root and common storage SMB mounts and credentials; the runner supplies their host paths and the storage symlink target. The same `develop` commit is pushed to Gitea and GitHub.
 
 **Tech Stack:** Gitea Actions, Docker Compose, YAML, Git, PowerShell
 
@@ -12,7 +12,8 @@
 
 - Trigger deployment only from `develop`.
 - Use the existing `ubuntu-latest` self-hosted runner.
-- Default the root, package, and offload mounts to `/mnt/vam-root`, `/mnt/vam-packages`, and `/mnt/vam-offloaded`.
+- Default the root and common storage mounts to `/mnt/vam-root` and `/mnt/vam-storage`.
+- Mount common storage once at `/??/D:/games/vam`, matching the Windows symlink target exposed by CIFS.
 - Keep SMB credentials out of Git, Gitea variables, and the container.
 - Do not add a registry, staging environment, authentication, or new application code.
 
@@ -63,8 +64,8 @@ jobs:
         run: |
           cat > .env << 'EOF'
           VAM_ROOT_MOUNT=${{ vars.VAM_ROOT_MOUNT || '/mnt/vam-root' }}
-          VAM_PACKAGES_MOUNT=${{ vars.VAM_PACKAGES_MOUNT || '/mnt/vam-packages' }}
-          VAM_OFFLOADED_MOUNT=${{ vars.VAM_OFFLOADED_MOUNT || '/mnt/vam-offloaded' }}
+          VAM_STORAGE_MOUNT=${{ vars.VAM_STORAGE_MOUNT || '/mnt/vam-storage' }}
+          VAM_STORAGE_TARGET=${{ vars.VAM_STORAGE_TARGET || '/??/D:/games/vam' }}
           EOF
           docker compose up -d --build
 ```

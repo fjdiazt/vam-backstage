@@ -10,11 +10,8 @@ services:
         source: ${VAM_ROOT_MOUNT:-/mnt/vam-root}
         target: /vam
       - type: bind
-        source: ${VAM_PACKAGES_MOUNT:-/mnt/vam-packages}
-        target: /vam/AddonPackages
-      - type: bind
-        source: ${VAM_OFFLOADED_MOUNT:-/mnt/vam-offloaded}
-        target: /vam/AddonPackagesOffloaded
+        source: ${VAM_STORAGE_MOUNT:-/mnt/vam-storage}
+        target: ${VAM_STORAGE_TARGET:-/??/D:/games/vam}
       - type: volume
         source: backstage-data
         target: /data

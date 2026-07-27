@@ -19,8 +19,8 @@ jobs:
         run: |
           cat > .env << 'EOF'
           VAM_ROOT_MOUNT=${{ vars.VAM_ROOT_MOUNT || '/mnt/vam-root' }}
-          VAM_PACKAGES_MOUNT=${{ vars.VAM_PACKAGES_MOUNT || '/mnt/vam-packages' }}
-          VAM_OFFLOADED_MOUNT=${{ vars.VAM_OFFLOADED_MOUNT || '/mnt/vam-offloaded' }}
+          VAM_STORAGE_MOUNT=${{ vars.VAM_STORAGE_MOUNT || '/mnt/vam-storage' }}
+          VAM_STORAGE_TARGET=${{ vars.VAM_STORAGE_TARGET || '/??/D:/games/vam' }}
           EOF
           docker compose up -d --build
           sleep 5
@@ -34,6 +34,24 @@ jobs:
               test -d "$path"
               test -n "$(find "$path/" -mindepth 1 -maxdepth 1 -print -quit)"
             done
+            ELECTRON_RUN_AS_NODE=1 /opt/vam-backstage/vam-backstage -e "
+              const fs = require(\"node:fs\")
+              const source = \"/vam/AddonPackages/.vam-backstage-fs-probe\"
+              const target = \"/vam/AddonPackagesOffloaded/.vam-backstage-fs-probe\"
+              try {
+                fs.writeFileSync(source, \"probe\")
+                fs.renameSync(source, target)
+                fs.unlinkSync(target)
+              } finally {
+                for (const path of [source, target]) {
+                  try {
+                    fs.unlinkSync(path)
+                  } catch (error) {
+                    if (error.code !== \"ENOENT\") throw error
+                  }
+                }
+              }
+            "
           '
           for attempt in $(seq 1 20); do
             docker compose exec -T backstage curl --fail --silent --output /dev/null http://127.0.0.1:42069/ && exit 0
