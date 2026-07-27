@@ -23,8 +23,17 @@ jobs:
           docker compose up -d --build
           sleep 5
           docker compose ps
-          docker compose logs --tail=100 backstage
           container_id=$(docker compose ps -q backstage)
           test -n "$container_id"
           test "$(docker inspect --format '{{.State.Status}}' "$container_id")" = running
           test "$(docker inspect --format '{{.RestartCount}}' "$container_id")" = 0
+          for attempt in $(seq 1 20); do
+            curl --fail --silent --output /dev/null http://127.0.0.1:42069/ && exit 0
+            sleep 1
+          done
+          docker compose logs --tail=100 backstage
+          docker compose exec -T backstage sh -c '
+            for path in /proc/[0-9]*/cmdline; do
+              printf "%s: " "$path"; tr "\0" " " < "$path"; echo
+            done
+            cat /proc/net/tcp /proc/net/tcp6
