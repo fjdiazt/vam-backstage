@@ -4,7 +4,7 @@
 
 **Goal:** Deploy VaM Backstage automatically on the existing Gitea Docker runner whenever `develop` is pushed.
 
-**Architecture:** One Gitea Actions workflow follows the existing PML/ERP checkout-and-Compose pattern. Ubuntu owns the VaM root and common storage SMB mounts and credentials; the runner supplies their host paths and the storage symlink target. The same `develop` commit is pushed to Gitea and GitHub.
+**Architecture:** One Gitea Actions workflow follows the existing PML/ERP checkout-and-Compose pattern. Ubuntu owns the VaM root and common storage SMB mounts and credentials; the runner supplies their host paths and the image's storage symlink target. The same `develop` commit is pushed to Gitea and GitHub.
 
 **Tech Stack:** Gitea Actions, Docker Compose, YAML, Git, PowerShell
 
@@ -13,7 +13,7 @@
 - Trigger deployment only from `develop`.
 - Use the existing `ubuntu-latest` self-hosted runner.
 - Default the root and common storage mounts to `/mnt/vam-root` and `/mnt/vam-storage`.
-- Mount common storage once at `/??/D:/games/vam`, matching the Windows symlink target exposed by CIFS.
+- Mount common storage once at `/vam-storage` and link `/??/D:/games/vam` to it inside the image, matching the Windows symlink target exposed by CIFS.
 - Keep SMB credentials out of Git, Gitea variables, and the container.
 - Do not add a registry, staging environment, authentication, or new application code.
 

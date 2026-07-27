@@ -38,6 +38,10 @@ RUN useradd --create-home --uid 1000 backstage \
     && chmod 1777 /tmp/.X11-unix \
     && chown -R backstage:backstage /data /vam
 
+ARG VAM_STORAGE_TARGET=/??/D:/games/vam
+RUN mkdir -p "$(dirname "$VAM_STORAGE_TARGET")" \
+    && ln -s /vam-storage "$VAM_STORAGE_TARGET"
+
 COPY --from=build /app/dist/linux-unpacked /opt/vam-backstage
 COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 

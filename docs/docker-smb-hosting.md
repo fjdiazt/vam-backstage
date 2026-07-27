@@ -68,7 +68,7 @@ rm /mnt/vam-storage/.vam-backstage-write-test
 
 Do not start Backstage until all commands succeed.
 
-Set `VAM_STORAGE_TARGET` to the common parent of the two absolute symlink targets shown by `readlink /mnt/vam-root/AddonPackages` and `readlink /mnt/vam-root/AddonPackagesOffloaded`. For example, targets below `/??/D:/games/vam` use:
+Set `VAM_STORAGE_TARGET` to the common parent of the two absolute symlink targets shown by `readlink /mnt/vam-root/AddonPackages` and `readlink /mnt/vam-root/AddonPackagesOffloaded`. The image links that path to its single `/vam-storage` mount. For example, targets below `/??/D:/games/vam` use:
 
 ```dotenv
 VAM_ROOT_MOUNT=/mnt/vam-root
@@ -93,7 +93,8 @@ Open `http://UBUNTU_HOST:42069` from a desktop browser. Keep both TCP ports reac
 The default deployment uses:
 
 - `/mnt/vam-root` on Ubuntu -> `/vam` in the container, read/write
-- `/mnt/vam-storage` on Ubuntu -> the configured package-symlink parent in the container, read/write
+- `/mnt/vam-storage` on Ubuntu -> `/vam-storage` in the container, read/write
+- the configured package-symlink parent -> `/vam-storage` inside the image
 - Docker volume `backstage-data` -> `/data` in the container
 - manual storage mode, so the server does not depend on filesystem watcher events from SMB
 

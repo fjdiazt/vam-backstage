@@ -16,7 +16,7 @@ Add one workflow at `.gitea/workflows/deploy-server.yaml`, matching PML and ERP:
 4. Write `.env` with the VaM root mount, shared storage mount, and container storage target. Defaults are `/mnt/vam-root`, `/mnt/vam-storage`, and `/??/D:/games/vam`.
 5. Run `docker compose up -d --build`.
 
-SMB credentials stay in Ubuntu `/etc/fstab` and its root-readable credentials file. They are not Gitea variables or secrets. Compose mounts the common Windows storage parent once at the absolute Linux target used by the package symlinks in the root share. Keeping `AddonPackages` and `OffloadedVARs` on one container mount preserves the atomic rename required by package moves. Ports, data volume, restart policy, image, and application behavior remain unchanged.
+SMB credentials stay in Ubuntu `/etc/fstab` and its root-readable credentials file. They are not Gitea variables or secrets. Compose mounts the common Windows storage parent once at `/vam-storage`; a build-time image symlink connects the absolute Linux target used by the package symlinks in the root share. Keeping `AddonPackages` and `OffloadedVARs` on one container mount preserves the atomic rename required by package moves. Ports, data volume, restart policy, and application behavior remain unchanged.
 
 ## Verification
 

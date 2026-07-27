@@ -1,6 +1,9 @@
 services:
   backstage:
-    build: .
+    build:
+      context: .
+      args:
+        VAM_STORAGE_TARGET: ${VAM_STORAGE_TARGET:-/??/D:/games/vam}
     restart: unless-stopped
     ports:
       - '42069:42069'
@@ -11,7 +14,7 @@ services:
         target: /vam
       - type: bind
         source: ${VAM_STORAGE_MOUNT:-/mnt/vam-storage}
-        target: ${VAM_STORAGE_TARGET:-/??/D:/games/vam}
+        target: /vam-storage
       - type: volume
         source: backstage-data
         target: /data
