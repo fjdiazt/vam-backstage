@@ -21,3 +21,10 @@ jobs:
           VAM_MOUNT=${{ vars.VAM_MOUNT || '/mnt/vam' }}
           EOF
           docker compose up -d --build
+          sleep 5
+          docker compose ps
+          docker compose logs --tail=100 backstage
+          container_id=$(docker compose ps -q backstage)
+          test -n "$container_id"
+          test "$(docker inspect --format '{{.State.Status}}' "$container_id")" = running
+          test "$(docker inspect --format '{{.RestartCount}}' "$container_id")" = 0
