@@ -1,0 +1,23 @@
+name: Deploy VaM Backstage
+
+on:
+  push:
+    branches: ['develop']
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Connecting to Gitea
+        run: git config --global url."http://oboro.local:6080/".insteadOf "http://gitea:3000/"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via Docker Compose
+        run: |
+          cat > .env << 'EOF'
+          VAM_MOUNT=${{ vars.VAM_MOUNT || '/mnt/vam' }}
+          EOF
+          docker compose up -d --build
