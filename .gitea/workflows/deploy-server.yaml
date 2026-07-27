@@ -32,16 +32,4 @@ jobs:
             sleep 1
           done
           docker compose logs --tail=100 backstage
-          if docker compose exec -T -e DISPLAY=:99 backstage \
-            timeout 15 /opt/vam-backstage/vam-backstage --no-sandbox --serve=42069; then
-            echo 'direct probe exited successfully'
-          else
-            echo "direct probe exit=$?"
-          fi
-          docker compose exec -T backstage sh -c '
-            for path in /proc/[0-9]*/cmdline; do
-              printf "%s: " "$path"; tr "\0" " " < "$path"; echo
-            done
-            cat /proc/net/tcp /proc/net/tcp6
-          '
           exit 1

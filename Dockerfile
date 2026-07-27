@@ -28,7 +28,6 @@ RUN apt-get update \
         libxrandr2 \
         libxss1 \
         libxtst6 \
-        xauth \
         xdg-utils \
         xvfb \
     && rm -rf /var/lib/apt/lists/*
@@ -38,6 +37,7 @@ RUN useradd --create-home --uid 1000 backstage \
     && chown -R backstage:backstage /data /vam
 
 COPY --from=build /app/dist/linux-unpacked /opt/vam-backstage
+COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 USER backstage
 ENV VAM_SERVE=42069 \
@@ -47,4 +47,4 @@ ENV VAM_SERVE=42069 \
 
 EXPOSE 42069 42070
 
-ENTRYPOINT ["xvfb-run", "-a", "/opt/vam-backstage/vam-backstage", "--no-sandbox"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
