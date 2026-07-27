@@ -11,6 +11,7 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         libasound2 \
         libatspi2.0-0 \
         libcups2 \
@@ -33,7 +34,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --uid 1000 backstage \
-    && mkdir -p /data /vam \
+    && mkdir -p /data /vam /tmp/.X11-unix \
+    && chmod 1777 /tmp/.X11-unix \
     && chown -R backstage:backstage /data /vam
 
 COPY --from=build /app/dist/linux-unpacked /opt/vam-backstage
