@@ -37,3 +37,5 @@ jobs:
               printf "%s: " "$path"; tr "\0" " " < "$path"; echo
             done
             cat /proc/net/tcp /proc/net/tcp6
+          '
+          exit 1
