@@ -2,6 +2,7 @@
 set -eu
 
 export DISPLAY=:99
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
 Xvfb "$DISPLAY" -screen 0 1280x1024x24 -nolisten tcp &
 
 attempt=0
