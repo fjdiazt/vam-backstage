@@ -69,15 +69,14 @@ describe('HubView infinite page tracking', () => {
     expect(hubView).toContain('title="Last Hub page"')
   })
 
-  it('wires wheel-up loading for earlier infinite pages', () => {
-    expect(hubView).toContain('fetchPreviousPage')
-    expect(hubView).toContain('onWheel={handleGalleryWheel}')
-    expect(hubView).toContain('captureScrollAnchor')
-    expect(hubView).toContain('requestAnimationFrame(() =>')
+  it('loads sparse ranges while infinite scrolling', () => {
+    expect(hubView).toContain("onRangeChange={browseMode === 'infinite' ? onHubRangeChange : undefined}")
+    expect(hubView).toContain("itemCount={browseMode === 'infinite' ? itemCount : undefined}")
+    expect(hubView).toContain("items={browseMode === 'paged' ? visibleResources : undefined}")
   })
 
   it('replaces paged results when detail Next crosses an API page boundary', () => {
-    expect(hubView).toContain("if (browseMode === 'paged') goToPage(targetPage)")
-    expect(hubView).toContain("if (wishlistMode || browseMode !== 'infinite'")
+    expect(hubView).toContain("if (store.browseMode === 'paged')")
+    expect(hubView).toContain('await store.goToPage(targetPage)')
   })
 })

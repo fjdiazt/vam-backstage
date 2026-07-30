@@ -9,32 +9,22 @@ import {
   forgetDeletedData,
 } from '../db.js'
 import { stopWatcher, withBulkWindow } from '../watcher.js'
-import { syncBrowserAssistTags, browserAssistSettingsDirExists } from '../browser-assist.js'
 import { deleteOrphanedExtractedPresetsAndResync } from '../scenes/extracted-reconcile.js'
 import { notify } from '../notify.js'
+import { installPrefs } from '../prefs.js'
 
 export function registerDevHandlers() {
   ipcMain.handle('dev:is-dev', () => is.dev)
 
-  ipcMain.handle('dev:browser-assist-dir-exists', () => {
-    const vamDir = getSetting('vam_dir')
-    return { exists: browserAssistSettingsDirExists(vamDir) }
-  })
+  // The unlock is machine-scoped (see prefs.js): it reveals dev UI on *this*
+  // machine and relaxes *this* host's version gate, so a client head unlocking
+  // itself must not flip the host's flag — which is what routing it through
+  // `settings:*` used to do.
+  ipcMain.handle('dev:get-unlocked', () => installPrefs.get('devUnlocked'))
 
-  ipcMain.handle('dev:sync-browser-assist', async () => {
-    const vamDir = getSetting('vam_dir')
-    if (!vamDir) return { ok: false, error: 'VaM directory not configured' }
-    try {
-      const result = await syncBrowserAssistTags(vamDir)
-      if ((result.labelsImported ?? 0) > 0 || (result.labelsRemoved ?? 0) > 0) {
-        notify('labels:updated')
-      }
-      notify('contents:updated')
-      notify('packages:updated')
-      return { ok: true, ...result }
-    } catch (err) {
-      return { ok: false, error: err.message }
-    }
+  ipcMain.handle('dev:set-unlocked', (_e, unlocked) => {
+    installPrefs.set('devUnlocked', unlocked === true)
+    return { ok: true, unlocked: installPrefs.get('devUnlocked') }
   })
 
   ipcMain.handle('dev:count-deleted-data', () => {
@@ -53,8 +43,7 @@ export function registerDevHandlers() {
   // hid them (removal is reversible until forgotten), so here we finally delete the
   // ones no present package still claims, then rescan + notify if any went.
   ipcMain.handle('dev:forget-deleted-data', async () => {
-    const unlocked = getSetting('developer_options_unlocked') === '1'
-    if (!is.dev && !unlocked) return { ok: false, error: 'forbidden' }
+    if (!is.dev && !installPrefs.get('devUnlocked')) return { ok: false, error: 'forbidden' }
     try {
       const result = forgetDeletedData()
       const vamDir = getSetting('vam_dir')
@@ -72,8 +61,7 @@ export function registerDevHandlers() {
   })
 
   ipcMain.handle('dev:nuke-database', async () => {
-    const unlocked = getSetting('developer_options_unlocked') === '1'
-    if (!is.dev && !unlocked) return { ok: false, error: 'forbidden' }
+    if (!is.dev && !installPrefs.get('devUnlocked')) return { ok: false, error: 'forbidden' }
     try {
       stopWatcher()
       closeDatabase()

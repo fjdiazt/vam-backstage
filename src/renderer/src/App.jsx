@@ -116,11 +116,8 @@ function AppShell() {
       if (useContentStore.getState().contents.length) void useContentStore.getState().fetchContents()
       void useContentStore.getState().refreshSelection()
     })
-    const cleanupUnreadable = window.api.onScanUnreadable(({ filename }) => {
-      toast(`Corrupted package skipped: ${filename}`)
-    })
-    const cleanupToast = window.api.onToast(({ message, type }) => {
-      toast(message, type)
+    const cleanupToast = window.api.onToast(({ message, type, duration }) => {
+      toast(message, type, duration)
     })
     window.api.startup.consumeUnreadable().then((filenames) => {
       if (!filenames?.length) return
@@ -134,7 +131,6 @@ function AppShell() {
       cleanupLabels()
       cleanupPackagesUpdated()
       cleanupContentsUpdated()
-      cleanupUnreadable()
       cleanupToast()
     }
   }, [])
@@ -200,7 +196,11 @@ function AppShell() {
           // action — snap to hub mode so the gallery behind the detail (and
           // prev/next stepping) is the hub, not the wishlist the user last viewed.
           hub.setGalleryMode('hub')
-          hub.openDetail(context.openResource)
+          // Seed Back with the origin tab (still current — setView runs below) so
+          // HubDetail can return there after peeling any dep-drill history.
+          const from = useViewStore.getState().view
+          const origin = from === 'library' || from === 'content' ? { view: from } : undefined
+          hub.openDetail(context.openResource, { origin })
         } else if (useViewStore.getState().view === 'hub' && hub.detailResource) {
           // Re-clicking Hub while details are open is an escape hatch back to the gallery
           // (especially useful after drilling into dependency packages).

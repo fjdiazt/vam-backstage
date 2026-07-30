@@ -12,7 +12,7 @@ vi.mock('electron', () => ({
   session: { fromPartition: electronMock.fromPartition },
 }))
 
-import { concreteDepFilename, isFlexibleFilename } from './manager.js'
+import { concreteDepFilename, isFlexibleFilename, isDepRefPresentLocally } from './manager.js'
 
 const managerSource = readFileSync(resolve(import.meta.dirname, './manager.js'), 'utf8')
 const mainSource = readFileSync(resolve(import.meta.dirname, '../index.js'), 'utf8')
@@ -125,5 +125,57 @@ describe('download pause state wiring', () => {
   it('keeps pause controls visible even when the queue is empty', () => {
     expect(downloadsPanelSource).not.toContain('{hasInFlight && (')
     expect(downloadsPanelSource).toContain("title={paused ? 'Resume downloads' : 'Pause downloads'}")
+  })
+})
+
+// ── isDepRefPresentLocally ─────────────────────────────────────────────────────
+//
+// Install All used to toast Hub-unavailable built-ins as "dependencies unavailable"
+// because it only checked exact filenames then asked findPackages. This helper is
+// the local-presence gate: any version of the package in groupIndex counts, and
+// full dep-refs go through resolveRef (exact / latest / fallback).
+
+function indexes(filenames) {
+  const packageIndex = new Map()
+  const groupIndex = new Map()
+  for (const fn of filenames) {
+    const stem = fn.replace(/\.var$/i, '')
+    const parts = stem.split('.')
+    const version = parts.pop()
+    const packageName = parts.join('.')
+    packageIndex.set(fn, { filename: fn, package_name: packageName, version })
+    if (!groupIndex.has(packageName)) groupIndex.set(packageName, [])
+    groupIndex.get(packageName).push(fn)
+  }
+  return { packageIndex, groupIndex }
+}
+
+describe('isDepRefPresentLocally', () => {
+  it('matches a full exact dep-ref against a local package', () => {
+    const { packageIndex, groupIndex } = indexes(['MeshedVR.3PointLightSetup.1.var'])
+    expect(isDepRefPresentLocally('MeshedVR.3PointLightSetup.1', packageIndex, groupIndex)).toBe(true)
+  })
+
+  it('matches .latest when any local version exists', () => {
+    const { packageIndex, groupIndex } = indexes(['NoStage3.Hair_Long_Upswept_Top_Bun.2.var'])
+    expect(isDepRefPresentLocally('NoStage3.Hair_Long_Upswept_Top_Bun.latest', packageIndex, groupIndex)).toBe(true)
+  })
+
+  it('matches a bare package name (creator.name) when any version is local', () => {
+    // findPackages failures often surface bare names like the toast listed.
+    const { packageIndex, groupIndex } = indexes(['MeshedVR.3PointLightSetup.1.var'])
+    expect(isDepRefPresentLocally('MeshedVR.3PointLightSetup', packageIndex, groupIndex)).toBe(true)
+  })
+
+  it('returns false when the package is absent locally', () => {
+    const { packageIndex, groupIndex } = indexes(['Other.Thing.1.var'])
+    expect(isDepRefPresentLocally('MeshedVR.3PointLightSetup', packageIndex, groupIndex)).toBe(false)
+    expect(isDepRefPresentLocally('MeshedVR.3PointLightSetup.latest', packageIndex, groupIndex)).toBe(false)
+  })
+
+  it('returns false for empty / null input', () => {
+    const { packageIndex, groupIndex } = indexes([])
+    expect(isDepRefPresentLocally('', packageIndex, groupIndex)).toBe(false)
+    expect(isDepRefPresentLocally(null, packageIndex, groupIndex)).toBe(false)
   })
 })

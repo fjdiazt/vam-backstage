@@ -1,10 +1,8 @@
-import { createWriteStream, constants as fsConstants } from 'fs'
-import { stat as fsStat, rename, unlink, mkdir, copyFile } from 'fs/promises'
+import { createWriteStream } from 'fs'
+import { stat as fsStat, rename, unlink, mkdir } from 'fs/promises'
 import { join, dirname } from 'path'
-import { randomUUID } from 'crypto'
 import { net } from 'electron'
 import { verifyZipFile } from '../var-stability.js'
-import { parseVarFilename, canonicalVarFilename } from '../scanner/var-reader.js'
 import {
   insertDownload,
   getDownload,
@@ -28,12 +26,12 @@ import {
   setPackageHubMeta,
 } from '../db.js'
 import { getResourceDetail, getResourceDetailByName, getCachedDetail, findPackages } from '../hub/client.js'
-import { notify } from '../notify.js'
+import { notify, notifyToast } from '../notify.js'
 import { scanAndUpsert } from '../scanner/ingest.js'
 import { computeAutoHidePathsForNewPackage } from '../scanner/index.js'
 import { inheritFromOlderVersion } from '../scanner/inherit.js'
 import { refreshExtractedPresetsForUpdates } from '../scenes/extract-refresh.js'
-import { computeCascadeEnable, parseDepRef, isFlexibleRef } from '../scanner/graph.js'
+import { computeCascadeEnable, parseDepRef, isFlexibleRef, resolveRef } from '../scanner/graph.js'
 import {
   buildFromDb,
   buildGraphOnly,
@@ -41,13 +39,14 @@ import {
   getForwardDeps,
   getReverseDeps,
   getPackageIndex,
+  getGroupIndex,
   getTransitiveMissingRefs,
   findLocalByFilename,
   resolveHubDownloadUrl,
   packageHasNoLookPresetTag,
 } from '../store.js'
 import { readAllPrefs, hidePackageContent } from '../vam-prefs.js'
-import { recordOwnedPath, withBulkWindow } from '../watcher.js'
+import { recordOwnedPath } from '../watcher.js'
 import { resolvePackageThumbnails } from '../thumb-resolver.js'
 import { applyStorageState, computeInstallTarget, parseDisableBehavior } from '../storage-state.js'
 import { getMainLibraryDirPath } from '../library-dirs.js'
@@ -87,6 +86,10 @@ function persistPaused(value) {
 }
 
 export async function initDownloadManager() {
+  // Drop prior-session completions first (before any await) so the UI never
+  // briefly loads them and folds them into a new status-bar download wave.
+  clearCompleted()
+
   const wasPaused = getSetting(PAUSED_SETTING) === '1'
   if (wasPaused) {
     // User left downloads paused — keep the queue and partial .tmp files
@@ -104,7 +107,6 @@ export async function initDownloadManager() {
     }
     failUnfinishedDownloads()
   }
-  clearCompleted()
 }
 
 function emitUpdated() {
@@ -112,18 +114,15 @@ function emitUpdated() {
 }
 
 function emitFailed(entry, error) {
-  notify('download:failed', {
-    packageRef: entry.package_ref,
-    displayName: entry.display_name || null,
-    error: error || null,
-  })
+  const label = (entry.display_name && String(entry.display_name).trim()) || entry.package_ref || 'Download'
+  notifyToast(error ? `Download failed: ${label} — ${error}` : `Download failed: ${label}`)
 }
 
 function emitProgress(id, data) {
   notify('download:progress', { id, ...data })
 }
 
-function ensureVarExt(filename) {
+export function ensureVarExt(filename) {
   if (!filename) return filename
   return /\.var$/i.test(filename) ? filename : filename + '.var'
 }
@@ -158,15 +157,72 @@ export function concreteDepFilename(file) {
   return name + '.' + ver + '.var'
 }
 
+/**
+ * True when a Hub dep ref (or bare package name) is already satisfied by any
+ * local package. Used to suppress "unavailable" toasts for built-ins that ship
+ * with VaM and are intentionally absent from the Hub.
+ *
+ * Accepts either a full dep-ref (`Author.Pkg.latest` / `.minN` / exact) or a
+ * bare package name (`Author.Pkg`) — Hub findPackages failures often surface the
+ * latter, which `resolveRef` alone cannot parse.
+ */
+export function isDepRefPresentLocally(ref, packageIndex, groupIndex) {
+  if (!ref || !packageIndex || !groupIndex) return false
+  const stem = String(ref).replace(/\.var$/i, '')
+  if (!stem) return false
+  const { resolved } = resolveRef(stem, packageIndex, groupIndex)
+  if (resolved) return true
+  // Bare package name (creator.name) — any local version counts.
+  const candidates = groupIndex.get(stem)
+  return !!(candidates && candidates.length > 0)
+}
+
+/** Hub detail dep entry → local satisfaction (same resolveRef path as hub:detail). */
+function isHubDepPresentLocally(file, group, packageIndex, groupIndex) {
+  const ref = file?.filename?.replace(/\.var$/i, '') || ''
+  if (ref && isDepRefPresentLocally(ref, packageIndex, groupIndex)) return true
+  // packageName / group key are bare names when filename is missing or unparseable.
+  const bare = file?.packageName || group
+  return !!(bare && isDepRefPresentLocally(bare, packageIndex, groupIndex))
+}
+
 // --- Public API (called by IPC handlers) ---
 
-export async function enqueueInstall(
+/** The Hub's authoritative "this id is gone", as opposed to a transport failure
+ *  (`Hub API 503`, socket errors) that says nothing about the resource. */
+function isResourceGoneError(err) {
+  return /resource not found/i.test(err?.message || '')
+}
+
+/**
+ * Resolve one concrete `.var` through findPackages, for when the resource detail
+ * can't serve it. The exact-filename guard is load-bearing: findPackages answers
+ * a version it doesn't have with the nearest one it does, so an unguarded result
+ * would happily download some other version under the caller's target name.
+ *
+ * Transport failures propagate rather than reading as "no such file" — the caller
+ * turns a null into a permanent-sounding "no longer available on the Hub".
+ */
+async function findExactFile(filename) {
+  const stem = filename.replace(/\.var$/i, '')
+  const file = (await findPackages([stem]))[stem]
+  if (!file || ensureVarExt(file.filename)?.toLowerCase() !== filename.toLowerCase()) return null
+  return resolveDownloadUrl(file) ? file : null
+}
+
+export async function enqueueInstall({
   resourceId,
-  hubDetailData,
+  hubDetail = null,
   autoQueueDeps = true,
   packageName,
   asDependency = false,
-) {
+  targetFilename = null,
+} = {}) {
+  // A concrete target means the caller wants exactly one file (the update path,
+  // which knows which version it's offering). Without one we install whatever the
+  // resource page lists, as before.
+  const target = targetFilename ? ensureVarExt(targetFilename) : null
+
   // Prefer resourceId. A package can be split across Hub resource pages — e.g.
   // LO.[Hair]PonyTail v1 → res 566, v2 → res 1726 — and getResourceDetailByName
   // (`.latest` lookup) returns whichever single resource the Hub mapped that
@@ -177,13 +233,25 @@ export async function enqueueInstall(
   // (rare); in that case picking up an older resource is acceptable — the
   // next update check will surface the newer version and the update path
   // will route through the correct resource id.
-  const detail =
-    hubDetailData || (resourceId ? await getResourceDetail(resourceId) : await getResourceDetailByName(packageName))
-  if (!detail) throw new Error('Resource not found on Hub')
+  //
+  // packages.json can also point at an id the Hub has since deleted, which is
+  // fatal here but not to the download itself — findPackages reaches the file by
+  // name through a live path. So with a concrete target a dead id is demoted to a
+  // failed detail lookup and handled below; every other error still propagates.
+  let detail = hubDetail
+  if (!detail) {
+    try {
+      detail = resourceId ? await getResourceDetail(resourceId) : await getResourceDetailByName(packageName)
+    } catch (err) {
+      if (!target || !isResourceGoneError(err)) throw err
+      console.warn(`enqueueInstall: resource ${resourceId} is gone, resolving ${target} by name`)
+    }
+  }
+  if (!detail && !target) throw new Error('Resource not found on Hub')
 
   // hub_json auto-persisted by getResourceDetail/getResourceDetailByName
   try {
-    if (detail.user_id) {
+    if (detail?.user_id) {
       upsertHubUser(String(detail.user_id), detail.username, {
         user_id: detail.user_id,
         username: detail.username,
@@ -192,13 +260,24 @@ export async function enqueueInstall(
     }
   } catch {}
 
-  const hubFiles = detail.hubFiles || []
-  if (hubFiles.length === 0) throw new Error('No downloadable files')
+  // Downloadability is decided per file by whether the Hub actually gave us a URL
+  // (`resolveDownloadUrl` below), not inferred from the `category` / `hubDownloadable`
+  // labels on the listing — a Paid resource that does serve a file installs fine.
+  let hubFiles = detail?.hubFiles || []
+  if (target) {
+    // The resource page routinely lacks the version packages.json advertised (a
+    // retracted release), and lists unrelated files the caller never asked for.
+    // Narrowing to the target keeps `alreadyLocal` about the file being installed
+    // — otherwise an older sibling already on disk reads as "nothing to do".
+    let file = hubFiles.find((f) => ensureVarExt(f.filename)?.toLowerCase() === target.toLowerCase())
+    if (!file || !resolveDownloadUrl(file)) file = await findExactFile(target)
+    if (!file) throw new Error(`${target} is no longer available on the Hub`)
+    hubFiles = [file]
+  } else if (hubFiles.length === 0) {
+    throw new Error('No downloadable files')
+  }
 
-  const isPaid = detail.category === 'Paid'
-  if (isPaid) throw new Error('Cannot download paid packages')
-
-  const hubTitle = detail.title || null
+  const hubTitle = detail?.title || null
   let inserted = 0
   let alreadyLocal = 0
   let alreadyQueued = 0
@@ -220,7 +299,9 @@ export async function enqueueInstall(
     }
     insertDownload({
       packageRef: fn,
-      hubResourceId: String(detail.resource_id || ''),
+      // findPackages entries carry their own resource_id; hubFiles entries don't
+      // and inherit the detail's.
+      hubResourceId: String(file.resource_id || detail?.resource_id || ''),
       downloadUrl: url,
       fileSize: parseInt(file.file_size || '0', 10) || null,
       priority: asDependency ? 'dependency' : 'direct',
@@ -236,7 +317,9 @@ export async function enqueueInstall(
   processQueue()
 
   const mainRef = ensureVarExt(hubFiles[0].filename)
-  const unresolvedDeps = await enqueueMissingDeps(detail, mainRef, autoQueueDeps)
+  // No detail means we reached the file by name alone, so there's no dependency
+  // list to walk; postDownloadIntegrate picks up missing deps after the download.
+  const unresolvedDeps = detail ? await enqueueMissingDeps(detail, mainRef, autoQueueDeps) : []
 
   emitUpdated()
   processQueue()
@@ -480,181 +563,22 @@ export async function enqueueInstallRef(hubFileData) {
   return { ok: true }
 }
 
-/** Resolve + validate the import target, returning the addon dir and canonical .var name. */
-function resolveImportTarget(filename) {
-  if (!getSetting('vam_dir')) throw new Error('VaM directory not configured')
-  const addonDir = getMainLibraryDirPath()
-  if (!addonDir) throw new Error('Main library directory not configured')
-
-  const canonical = canonicalVarFilename(String(filename || '').trim())
-  if (!/\.var$/i.test(canonical) || !parseVarFilename(canonical)) {
-    throw new Error(`Not a valid .var filename: ${filename}`)
-  }
-  return { addonDir, canonical }
-}
-
-/** Coerce a Buffer/Uint8Array/array-like into a Buffer over its own byte window. */
-function toBuffer(bytes) {
-  return Buffer.isBuffer(bytes)
-    ? bytes
-    : bytes instanceof Uint8Array
-      ? Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-      : Buffer.from(bytes)
-}
-
-/**
- * Verify a fully-written temp .var, atomically rename it into place, and run the
- * same post-add integration the download path uses (scan + upsert, inherit,
- * auto-hide, graph rebuild, cascade-enable, notify). Imported as a direct
- * install with no Hub linkage and without auto-queuing deps — missing deps
- * surface in the normal Library UI. Unlinks the temp file on verify failure.
- */
-async function finalizeImportedVar(canonical, tempPath, finalPath) {
-  try {
-    await verifyZipFile(tempPath)
-  } catch (err) {
-    try {
-      await unlink(tempPath)
-    } catch {}
-    throw new Error(`Not a valid .var package: ${err.message}`)
-  }
-
-  await withBulkWindow(async () => {
-    recordOwnedPath(finalPath)
-    await rename(tempPath, finalPath)
-  })
-
-  await postDownloadIntegrate(canonical, finalPath, true, null, false)
-
-  return { ok: true, filename: canonical }
-}
-
-/**
- * Import a dragged-in .var that the main process can read directly by path —
- * the local (non-remote) fast path. Copies the source into place instead of
- * streaming its bytes through the renderer/IPC: no read into renderer memory,
- * no structured-clone copy per chunk. `COPYFILE_FICLONE` makes this a
- * copy-on-write reflink on filesystems that support it (e.g. APFS/Btrfs), so a
- * same-volume import is near-instant; elsewhere it falls back to a plain copy.
- * The source file is left untouched. Verify + atomic rename + integrate are
- * shared with the streamed path via `finalizeImportedVar`.
- */
-export async function importLocalFromPath({ filename, sourcePath }) {
-  const { addonDir, canonical } = resolveImportTarget(filename)
-  if (findLocalByFilename(canonical)) return { already: true, filename: canonical }
-
-  const finalPath = join(addonDir, canonical)
-  const tempPath = finalPath + '.import.tmp'
-  await mkdir(dirname(finalPath), { recursive: true })
-
-  try {
-    await copyFile(sourcePath, tempPath, fsConstants.COPYFILE_FICLONE)
-  } catch (err) {
-    try {
-      await unlink(tempPath)
-    } catch {}
-    throw err
-  }
-
-  return finalizeImportedVar(canonical, tempPath, finalPath)
-}
-
-/**
- * Import a dragged-in .var, streamed in bounded chunks: begin → chunk* → finish
- * (or abort). Chunking is required for the remote (client→server) bridge, whose
- * wire codec base64-encodes each buffer into a single JS string — a whole 500MB
- * .var would blow past Node's max string length (and the WS `maxPayload`). The
- * server writes chunks straight to a temp file, so the full payload never has
- * to exist in memory or as one string; the same path runs locally too.
- */
-const activeVarUploads = new Map() // uploadId -> { canonical, tempPath, finalPath, stream, bytesWritten, error }
-
-export async function beginImportLocalVar({ filename }) {
-  const { addonDir, canonical } = resolveImportTarget(filename)
-  // Short-circuit before opening any file so an already-installed package costs
-  // a single round-trip and the client can skip uploading the bytes entirely.
-  if (findLocalByFilename(canonical)) return { already: true, filename: canonical }
-
-  const finalPath = join(addonDir, canonical)
-  const tempPath = finalPath + '.import.tmp'
-  await mkdir(dirname(finalPath), { recursive: true })
-
-  const stream = createWriteStream(tempPath)
-  const session = { canonical, tempPath, finalPath, stream, bytesWritten: 0, error: null }
-  stream.on('error', (err) => (session.error = err))
-
-  const uploadId = randomUUID()
-  activeVarUploads.set(uploadId, session)
-  return { uploadId, filename: canonical }
-}
-
-export async function appendImportLocalVar({ uploadId, chunk }) {
-  const session = activeVarUploads.get(uploadId)
-  if (!session) throw new Error('Unknown or expired import session')
-  if (session.error) throw session.error
-
-  const buf = toBuffer(chunk)
-  if (!session.stream.write(buf)) {
-    await new Promise((resolve, reject) => {
-      session.stream.once('drain', resolve)
-      session.stream.once('error', reject)
-    })
-  }
-  session.bytesWritten += buf.byteLength
-  return { ok: true, bytesWritten: session.bytesWritten }
-}
-
-export async function finishImportLocalVar({ uploadId }) {
-  const session = activeVarUploads.get(uploadId)
-  if (!session) throw new Error('Unknown or expired import session')
-  activeVarUploads.delete(uploadId)
-
-  await new Promise((resolve, reject) => {
-    session.stream.on('error', reject)
-    session.stream.end(resolve)
-  })
-  if (session.error) throw session.error
-
-  if (session.bytesWritten === 0) {
-    try {
-      await unlink(session.tempPath)
-    } catch {}
-    throw new Error('Empty file')
-  }
-  return finalizeImportedVar(session.canonical, session.tempPath, session.finalPath)
-}
-
-export async function abortImportLocalVar({ uploadId }) {
-  const session = activeVarUploads.get(uploadId)
-  if (!session) return { ok: true }
-  activeVarUploads.delete(uploadId)
-  try {
-    session.stream.destroy()
-  } catch {}
-  try {
-    await unlink(session.tempPath)
-  } catch {}
-  return { ok: true }
-}
-
 /** @returns {Promise<string[]>} Dep refs that could not be queued (not on Hub or no download URL). */
 async function enqueueMissingDeps(detail, parentRef, autoQueueDeps = true) {
   if (!detail.dependencies) return []
 
+  const packageIndex = getPackageIndex()
+  const groupIndex = getGroupIndex()
   const needsLookup = new Set()
   for (const [group, files] of Object.entries(detail.dependencies)) {
     for (const file of files) {
       // file.filename is the dep-ref verbatim (e.g. ".latest", ".min5") — not a concrete filename.
       // Always derive the stored filename from packageName + latest_version.
       const depFn = concreteDepFilename(file)
-      if (!depFn) {
-        const depKey = file.packageName || file.filename || group
-        if (depKey) needsLookup.add(depKey)
-        continue
-      }
-      if (findLocalByFilename(depFn)) continue
-      const url = resolveDownloadUrl(file)
-      if (url) {
+      if (depFn && findLocalByFilename(depFn)) continue
+
+      const url = depFn ? resolveDownloadUrl(file) : null
+      if (depFn && url) {
         const existingDep = getDownloadByRef(depFn)
         if (existingDep && (existingDep.status === 'queued' || existingDep.status === 'active')) {
           // already in progress
@@ -671,10 +595,14 @@ async function enqueueMissingDeps(detail, parentRef, autoQueueDeps = true) {
             autoQueueDeps: autoQueueDeps ? 1 : 0,
           })
         }
-      } else {
-        const depKey = file.packageName || file.filename || group
-        if (depKey) needsLookup.add(depKey)
+        continue
       }
+
+      // No downloadable exact target on the detail (typical for Hub-unavailable
+      // built-ins). Skip if any local version already satisfies the dep.
+      if (isHubDepPresentLocally(file, group, packageIndex, groupIndex)) continue
+      const depKey = file.packageName || file.filename || group
+      if (depKey) needsLookup.add(depKey)
     }
   }
 
@@ -686,7 +614,7 @@ async function enqueueMissingDeps(detail, parentRef, autoQueueDeps = true) {
     hubResults = await findPackages(refs)
   } catch (err) {
     console.warn('Failed to resolve some dependency URLs:', err.message)
-    return refs
+    return refs.filter((ref) => !isDepRefPresentLocally(ref, packageIndex, groupIndex))
   }
 
   // find_json auto-persisted by findPackages
@@ -695,14 +623,14 @@ async function enqueueMissingDeps(detail, parentRef, autoQueueDeps = true) {
   for (const ref of refs) {
     const hubFile = hubResults[ref]
     if (!hubFile) {
-      unresolved.push(ref)
+      if (!isDepRefPresentLocally(ref, packageIndex, groupIndex)) unresolved.push(ref)
       continue
     }
     // findPackages returns concrete filenames; reject flexible ones defensively so they
     // can never land in downloads.package_ref.
     const depFn = ensureVarExt(hubFile.filename)
     if (!depFn || isFlexibleFilename(depFn)) {
-      unresolved.push(ref)
+      if (!isDepRefPresentLocally(ref, packageIndex, groupIndex)) unresolved.push(ref)
       continue
     }
     if (findLocalByFilename(depFn)) continue
@@ -710,7 +638,7 @@ async function enqueueMissingDeps(detail, parentRef, autoQueueDeps = true) {
     if (existingDep && (existingDep.status === 'queued' || existingDep.status === 'active')) continue
     const url = resolveDownloadUrl(hubFile)
     if (!url) {
-      unresolved.push(ref)
+      if (!isDepRefPresentLocally(ref, packageIndex, groupIndex)) unresolved.push(ref)
       continue
     }
     if (existingDep) deleteDownload(existingDep.id)
@@ -1098,7 +1026,12 @@ export function onNetworkOnline() {
   }
 }
 
-async function postDownloadIntegrate(filename, fullPath, isDirect, hubResourceId, autoQueueDeps) {
+/**
+ * Per-file scan/upsert + Hub metadata + inherit/auto-hide. Returns an entry for
+ * `integrateGraphPhase`, or null if scan failed. Does not rebuild the graph or
+ * notify — callers batch those via the graph phase.
+ */
+export async function integrateScannedPackage({ filename, fullPath, isDirect, hubResourceId }) {
   try {
     const cached = hubResourceId ? getCachedDetail(hubResourceId) : null
     const hubType = cached?.type?.trim() || null
@@ -1110,7 +1043,7 @@ async function postDownloadIntegrate(filename, fullPath, isDirect, hubResourceId
       libraryDirId: null,
       typeOverride: hubType || undefined,
     })
-    if (!result) return
+    if (!result) return null
     const { contentItems, pkgType, packageName } = result
 
     if (hubDisplayName) setHubDisplayName(filename, hubDisplayName)
@@ -1129,8 +1062,8 @@ async function postDownloadIntegrate(filename, fullPath, isDirect, hubResourceId
     // and returns the union of paths matched by any enabled rule.
     // `hidePackageContent` and the inherit helper both wrap themselves in
     // `withBulkWindow` and `recordOwnedPath` their writes, so the watcher
-    // sees no event flood; we rebuild the prefs map from disk once at the
-    // end as the source of truth.
+    // sees no event flood; we rebuild the prefs map from disk once in the
+    // graph phase as the source of truth.
     const vamDir = getSetting('vam_dir')
     const inherited = await inheritFromOlderVersion({ filename, packageName, contentItems, vamDir })
     let sidecarsTouched = inherited != null
@@ -1141,7 +1074,37 @@ async function postDownloadIntegrate(filename, fullPath, isDirect, hubResourceId
         sidecarsTouched = true
       }
     }
-    if (sidecarsTouched && vamDir) {
+
+    return {
+      filename,
+      fullPath,
+      isDirect,
+      hubResourceId,
+      contentItems,
+      pkgType,
+      packageName,
+      inherited,
+      sidecarsTouched,
+    }
+  } catch (err) {
+    console.warn(`Post-download integration failed for ${filename}:`, err.message)
+    return null
+  }
+}
+
+/**
+ * Once-per-batch (or once-per-download) whole-library work: prefs refresh,
+ * graph rebuild, install-target relocation, cascade-enable, optional dep
+ * auto-queue, aggregates, notify, thumbnails, extract-refresh.
+ */
+export async function integrateGraphPhase(entries, { autoQueueDeps = false } = {}) {
+  if (!entries?.length) return
+
+  try {
+    const vamDir = getSetting('vam_dir')
+    // Prefs must be refreshed before buildGraphOnly so cascade/target lookups
+    // see inherited/auto-hide sidecar state.
+    if (entries.some((e) => e.sidecarsTouched) && vamDir) {
       setPrefsMap(await readAllPrefs(vamDir))
     }
 
@@ -1149,97 +1112,101 @@ async function postDownloadIntegrate(filename, fullPath, isDirect, hubResourceId
     // for cascade-enable, target-state lookup, and auto-queue-deps; full aggregates come at the end.
     buildGraphOnly()
 
-    // Plan §"Dep install target": land at max(storage_state) of installed dependents.
-    // The file is currently 'enabled' in main; relocate iff a less-active state satisfies all dependents.
-    let landingState = 'enabled'
-    try {
-      const dependents = getReverseDeps().get(filename) || null
-      const parsed = parseDisableBehavior(getSetting('disable_behavior'))
-      const target = computeInstallTarget({
-        dependents,
-        packageIndex: getPackageIndex(),
-        disableBehaviorTargetId: parsed.kind === 'move-to' ? parsed.auxDirId : null,
-      })
-      if (target) {
-        await applyStorageState(filename, target)
-        landingState = target.storageState
-      }
-    } catch (err) {
-      console.warn(`Install-target relocation failed for ${filename}:`, err.message)
-    }
+    for (const entry of entries) {
+      const { filename } = entry
 
-    // Cascade-enable forward deps only when the new package itself ends up active.
-    // An offloaded/disabled new package doesn't require its forward deps to be enabled.
-    if (landingState === 'enabled') {
-      const cascadeEnable = computeCascadeEnable(filename, getPackageIndex(), getForwardDeps())
-      for (const depFn of cascadeEnable) {
-        try {
-          await applyStorageState(depFn, { storageState: 'enabled', libraryDirId: null })
-        } catch (err) {
-          console.warn(`Cascade-enable after install failed for ${depFn}:`, err.message)
+      // Plan §"Dep install target": land at max(storage_state) of installed dependents.
+      // The file is currently 'enabled' in main; relocate iff a less-active state satisfies all dependents.
+      let landingState = 'enabled'
+      try {
+        const dependents = getReverseDeps().get(filename) || null
+        const parsed = parseDisableBehavior(getSetting('disable_behavior'))
+        const target = computeInstallTarget({
+          dependents,
+          packageIndex: getPackageIndex(),
+          disableBehaviorTargetId: parsed.kind === 'move-to' ? parsed.auxDirId : null,
+        })
+        if (target) {
+          await applyStorageState(filename, target)
+          landingState = target.storageState
         }
-      }
-    }
-
-    // Discover and queue transitive deps if auto_queue_deps is set
-    if (autoQueueDeps) {
-      const newFwd = getForwardDeps().get(filename) || []
-      const missing = newFwd
-        .filter((d) => !d.resolved)
-        .map((d) => d.ref)
-        .filter(Boolean)
-
-      // Build a set of base package names already queued/active so flexible refs
-      // (.latest, .minN) don't cause redundant lookups when a resolved version is
-      // already downloading.
-      const queuedBaseNames = new Set()
-      for (const d of getAllDownloads()) {
-        if (d.status === 'queued' || d.status === 'active') {
-          const parsed = parseDepRef(d.package_ref.replace(/\.var$/i, ''))
-          if (parsed) queuedBaseNames.add(parsed.packageName)
-        }
+      } catch (err) {
+        console.warn(`Install-target relocation failed for ${filename}:`, err.message)
       }
 
-      const trulyMissing = missing.filter((ref) => {
-        if (pendingDepLookups.has(ref)) return false
-        const fn = ensureVarExt(ref) || ref
-        if (findLocalByFilename(fn) || getDownloadByRef(fn)) return false
-        const parsed = parseDepRef(ref)
-        if (isFlexibleRef(parsed) && queuedBaseNames.has(parsed.packageName)) return false
-        return true
-      })
-      if (trulyMissing.length > 0) {
-        for (const ref of trulyMissing) pendingDepLookups.add(ref)
-        // Propagate root parent so aggregate progress bars count transitive deps
-        const selfEntry = getDownloadByRef(filename)
-        const rootParentRef = selfEntry?.parent_ref || filename
-        try {
-          const hubResults = await findPackages([...new Set(trulyMissing)])
-          for (const hubFile of Object.values(hubResults)) {
-            const depFn = ensureVarExt(hubFile?.filename)
-            if (!depFn || findLocalByFilename(depFn)) continue
-            const existing = getDownloadByRef(depFn)
-            if (existing && (existing.status === 'queued' || existing.status === 'active')) continue
-            const url = resolveDownloadUrl(hubFile)
-            if (!url) continue
-            if (existing) deleteDownload(existing.id)
-            insertDownload({
-              packageRef: depFn,
-              hubResourceId: hubFile.resource_id ? String(hubFile.resource_id) : null,
-              downloadUrl: url,
-              fileSize: parseInt(hubFile.file_size || '0', 10) || null,
-              priority: 'dependency',
-              parentRef: rootParentRef,
-              displayName: null,
-              autoQueueDeps: 1,
-            })
+      // Cascade-enable forward deps only when the new package itself ends up active.
+      // An offloaded/disabled new package doesn't require its forward deps to be enabled.
+      if (landingState === 'enabled') {
+        const cascadeEnable = computeCascadeEnable(filename, getPackageIndex(), getForwardDeps())
+        for (const depFn of cascadeEnable) {
+          try {
+            await applyStorageState(depFn, { storageState: 'enabled', libraryDirId: null })
+          } catch (err) {
+            console.warn(`Cascade-enable after install failed for ${depFn}:`, err.message)
           }
-          emitUpdated()
-          processQueue()
-        } catch (err) {
-          console.warn('Transitive dep discovery failed:', err.message)
-        } finally {
-          for (const ref of trulyMissing) pendingDepLookups.delete(ref)
+        }
+      }
+
+      // Discover and queue transitive deps if auto_queue_deps is set
+      if (autoQueueDeps) {
+        const newFwd = getForwardDeps().get(filename) || []
+        const missing = newFwd
+          .filter((d) => !d.resolved)
+          .map((d) => d.ref)
+          .filter(Boolean)
+
+        // Build a set of base package names already queued/active so flexible refs
+        // (.latest, .minN) don't cause redundant lookups when a resolved version is
+        // already downloading.
+        const queuedBaseNames = new Set()
+        for (const d of getAllDownloads()) {
+          if (d.status === 'queued' || d.status === 'active') {
+            const parsed = parseDepRef(d.package_ref.replace(/\.var$/i, ''))
+            if (parsed) queuedBaseNames.add(parsed.packageName)
+          }
+        }
+
+        const trulyMissing = missing.filter((ref) => {
+          if (pendingDepLookups.has(ref)) return false
+          const fn = ensureVarExt(ref) || ref
+          if (findLocalByFilename(fn) || getDownloadByRef(fn)) return false
+          const parsed = parseDepRef(ref)
+          if (isFlexibleRef(parsed) && queuedBaseNames.has(parsed.packageName)) return false
+          return true
+        })
+        if (trulyMissing.length > 0) {
+          for (const ref of trulyMissing) pendingDepLookups.add(ref)
+          // Propagate root parent so aggregate progress bars count transitive deps
+          const selfEntry = getDownloadByRef(filename)
+          const rootParentRef = selfEntry?.parent_ref || filename
+          try {
+            const hubResults = await findPackages([...new Set(trulyMissing)])
+            for (const hubFile of Object.values(hubResults)) {
+              const depFn = ensureVarExt(hubFile?.filename)
+              if (!depFn || findLocalByFilename(depFn)) continue
+              const existing = getDownloadByRef(depFn)
+              if (existing && (existing.status === 'queued' || existing.status === 'active')) continue
+              const url = resolveDownloadUrl(hubFile)
+              if (!url) continue
+              if (existing) deleteDownload(existing.id)
+              insertDownload({
+                packageRef: depFn,
+                hubResourceId: hubFile.resource_id ? String(hubFile.resource_id) : null,
+                downloadUrl: url,
+                fileSize: parseInt(hubFile.file_size || '0', 10) || null,
+                priority: 'dependency',
+                parentRef: rootParentRef,
+                displayName: null,
+                autoQueueDeps: 1,
+              })
+            }
+            emitUpdated()
+            processQueue()
+          } catch (err) {
+            console.warn('Transitive dep discovery failed:', err.message)
+          } finally {
+            for (const ref of trulyMissing) pendingDepLookups.delete(ref)
+          }
         }
       }
     }
@@ -1249,23 +1216,43 @@ async function postDownloadIntegrate(filename, fullPath, isDirect, hubResourceId
 
     // Top-level Hub installs of Looks packs that have no appearance/skin preset
     // items (same condition as the library "no preset" badge).
-    if (isDirect && packageHasNoLookPresetTag(filename)) {
-      const pkg = getPackageIndex().get(filename)
-      const label = pkg?.hub_display_name || pkg?.title || pkg?.package_name || filename
-      notify('install:look-no-preset', { filename, label })
+    for (const entry of entries) {
+      if (!entry.isDirect) continue
+      if (!packageHasNoLookPresetTag(entry.filename)) continue
+      const pkg = getPackageIndex().get(entry.filename)
+      const label = pkg?.hub_display_name || pkg?.title || pkg?.package_name || entry.filename
+      const name = (label && String(label).trim()) || entry.filename || 'Package'
+      notifyToast(`No appearance preset in "${name}"`, 'info', 6000)
     }
 
     notify('packages:updated')
     notify('contents:updated')
-    resolvePackageThumbnails()
+    // Fire-and-forget; swallow so a missing Electron app path in tests (or a
+    // CDN blip) can't surface as an unhandled rejection after commit returns.
+    Promise.resolve(resolvePackageThumbnails()).catch(() => {})
 
     // Auto-refresh extracted presets when this install is a strictly-newer
     // version of a package the user had extracted from (after the rebuild so
     // readScene resolves the new .var).
-    if (inherited?.donor && vamDir) {
-      await refreshExtractedPresetsForUpdates([{ filename, donorFilename: inherited.donor, contentItems }], vamDir)
+    if (vamDir) {
+      const updates = entries
+        .filter((e) => e.inherited?.donor)
+        .map((e) => ({
+          filename: e.filename,
+          donorFilename: e.inherited.donor,
+          contentItems: e.contentItems,
+        }))
+      if (updates.length > 0) {
+        await refreshExtractedPresetsForUpdates(updates, vamDir)
+      }
     }
   } catch (err) {
-    console.warn(`Post-download integration failed for ${filename}:`, err.message)
+    console.warn(`Graph-phase integration failed:`, err.message)
   }
+}
+
+/** Download-path entry: scan one package then run the graph phase for it alone. */
+async function postDownloadIntegrate(filename, fullPath, isDirect, hubResourceId, autoQueueDeps) {
+  const e = await integrateScannedPackage({ filename, fullPath, isDirect, hubResourceId })
+  if (e) await integrateGraphPhase([e], { autoQueueDeps })
 }

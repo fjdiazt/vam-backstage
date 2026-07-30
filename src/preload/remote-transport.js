@@ -9,6 +9,10 @@ import { createRemoteTransport as createSharedRemoteTransport } from '@shared/re
 const LOCAL_CHANNELS = new Set([
   'app:version',
   'dev:is-dev',
+  // Machine-scoped prefs: the client unlocks its *own* developer options rather
+  // than flipping the host's flag (which also gates the host's version gate).
+  'dev:get-unlocked',
+  'dev:set-unlocked',
   'updater:install',
   'updater:check',
   'updater:getChannel',

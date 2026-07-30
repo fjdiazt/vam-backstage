@@ -77,6 +77,7 @@ export default function SettingsView() {
   const [libDirs, setLibDirs] = useState({ main: '', aux: [] })
   const [libDirsLoading, setLibDirsLoading] = useState(false)
   const [disableBehavior, setDisableBehavior] = useState('suffix')
+  const [moveOnImport, setMoveOnImport] = useState(false)
   const [offloadSuggestions, setOffloadSuggestions] = useState([])
   const [dismissedOffload, setDismissedOffload] = useState(() => new Set())
   const stats = useStatusStore((s) => s.stats)
@@ -96,12 +97,18 @@ export default function SettingsView() {
   const dismissRemoteWarning = useRemoteUiStore((s) => s.dismissWarning)
   const isRemoteClient = !!window.api.remote?.isRemote
   const [remoteStatus, setRemoteStatus] = useState(null)
-  const [serverPort, setServerPort] = useState(String(DEFAULT_REMOTE_PORT))
-  const [serveOnLaunch, setServeOnLaunch] = useState(false)
-  const [remoteEnabled, setRemoteEnabled] = useState(false)
   const [localIps, setLocalIps] = useState({ primary: null, all: [] })
-  const [autoConnectArmed, setAutoConnectArmed] = useState(false)
-  const [connectUrl, setConnectUrl] = useState('')
+  // The machine-scoped remote prefs exactly as main reports them. Every write
+  // returns the resulting config and replaces this wholesale, so the switches
+  // below read persisted truth instead of a local copy that can drift from it.
+  const [remoteConfig, setRemoteConfig] = useState(null)
+  const remoteEnabled = !!remoteConfig?.remoteEnabled
+  const serveOnLaunch = !!remoteConfig?.serveOnLaunch
+  const autoConnectArmed = !!remoteConfig?.autoconnect
+  // The two text fields are genuinely local drafts: they change per keystroke and
+  // only reach the prefs when the user acts on them.
+  const [portDraft, setPortDraft] = useState(String(DEFAULT_REMOTE_PORT))
+  const [urlDraft, setUrlDraft] = useState('')
 
   const refreshLibDirs = useCallback(async () => {
     try {
@@ -117,6 +124,20 @@ export default function SettingsView() {
     }
   }, [])
 
+  // Machine-scoped, so this reads the *local* prefs — `settings:*` would fetch the
+  // host's values on a client head.
+  const loadRemoteConfig = useCallback(async () => {
+    const cfg = await window.api.remote.getConfig()
+    setRemoteConfig(cfg)
+    setPortDraft(String(cfg.servePort))
+    setUrlDraft(cfg.connectUrl)
+  }, [])
+
+  /** The single write path for remote prefs; main echoes back the stored result. */
+  const patchRemoteConfig = useCallback(async (patch) => {
+    setRemoteConfig(await window.api.remote.setConfig(patch))
+  }, [])
+
   useEffect(() => {
     void window.api.storage
       .status()
@@ -129,6 +150,7 @@ export default function SettingsView() {
     window.api.settings.get('vam_dir').then((v) => setVamDir(v || ''))
     window.api.settings.get('hub_debug_requests').then((v) => setHubDebugRequests(v === '1'))
     window.api.settings.get('disable_behavior').then((v) => setDisableBehavior(v || 'suffix'))
+    window.api.settings.get('import_move_files').then((v) => setMoveOnImport(v === '1'))
     window.api.settings.get('offload_suggestions_dismissed').then((v) =>
       setDismissedOffload(
         new Set(
@@ -139,18 +161,9 @@ export default function SettingsView() {
         ),
       ),
     )
-    if (capabilities.serverControl) {
-      window.api.settings.get('remote_serve_port').then((v) => setServerPort(v || String(DEFAULT_REMOTE_PORT)))
-      window.api.settings.get('remote_serve_on_launch').then((v) => setServeOnLaunch(v === '1'))
-      window.api.settings.get('remote_mode_enabled').then((v) => setRemoteEnabled(v === '1'))
-      window.api.settings.get('remote_connect_url').then((v) => setConnectUrl(v || ''))
-      window.api.remote
-        .getAutoconnect()
-        .then((r) => setAutoConnectArmed(!!r?.url))
-        .catch(() => {})
-    }
+    if (capabilities.serverControl) loadRemoteConfig().catch(() => {})
     if (capabilities.developerTools) {
-      window.api.settings.get('developer_options_unlocked').then((v) => setDeveloperUnlocked(v === '1'))
+      window.api.dev.getUnlocked().then((v) => setDeveloperUnlocked(!!v))
       window.api.dev.isDev().then(setIsDev)
       window.api.dev
         .countDeletedData()
@@ -167,7 +180,7 @@ export default function SettingsView() {
     }
     useHubHiddenStore.getState().hydrate()
     refreshLibDirs()
-  }, [capabilities.developerTools, capabilities.serverControl, capabilities.updater, refreshLibDirs])
+  }, [capabilities.developerTools, capabilities.serverControl, capabilities.updater, loadRemoteConfig, refreshLibDirs])
 
   const handleAddAuxDir = useCallback(async () => {
     if (libDirsLoading) return
@@ -267,14 +280,24 @@ export default function SettingsView() {
     await window.api.settings.set('disable_behavior', value)
   }, [])
 
+  const handleToggleMoveOnImport = useCallback(async (checked) => {
+    setMoveOnImport(checked)
+    await window.api.settings.set('import_move_files', checked ? '1' : '0')
+  }, [])
+
   useEffect(() => {
     let cancelled = false
     if (!capabilities.developerTools || !vamDir) {
       setBaDirPresent(false)
     } else {
-      window.api.dev.browserAssistDirExists().then((r) => {
-        if (!cancelled) setBaDirPresent(!!r?.exists)
-      })
+      window.api.browserAssist
+        .dirExists()
+        .then((r) => {
+          if (!cancelled) setBaDirPresent(!!r?.exists)
+        })
+        .catch(() => {
+          if (!cancelled) setBaDirPresent(false)
+        })
     }
     return () => {
       cancelled = true
@@ -429,7 +452,7 @@ export default function SettingsView() {
     setBaSyncing(true)
     setBaSyncResult(null)
     try {
-      const res = await window.api.dev.syncBrowserAssist()
+      const res = await window.api.browserAssist.sync()
       if (!res?.ok) {
         setBaSyncResult({ error: res?.error || 'Sync failed' })
         return
@@ -527,14 +550,14 @@ export default function SettingsView() {
     r.count = 0
     if (r.resetTimer != null) clearTimeout(r.resetTimer)
     r.resetTimer = null
-    window.api.settings.set('developer_options_unlocked', '1').then(() => {
+    window.api.dev.setUnlocked(true).then(() => {
       setDeveloperUnlocked(true)
       toast('Developer options enabled', 'success', 3000)
     })
   }, [capabilities.developerTools, isDev, developerUnlocked])
 
   const handleDisableDeveloperOptions = useCallback(async () => {
-    await window.api.settings.set('developer_options_unlocked', '0')
+    await window.api.dev.setUnlocked(false)
     setDeveloperUnlocked(false)
     toast('Developer options disabled', 'success', 2500)
   }, [])
@@ -545,7 +568,9 @@ export default function SettingsView() {
       .status()
       .then((s) => {
         setRemoteStatus(s)
-        if (s?.port) setServerPort(String(s.port))
+        // A server already running wins over the stored pref — the field should
+        // show the port that's actually in use.
+        if (s?.port) setPortDraft(String(s.port))
       })
       .catch(() => {})
     window.api.remote
@@ -565,17 +590,17 @@ export default function SettingsView() {
   }, [])
 
   const handleStartServer = useCallback(async () => {
-    const portStr = String(parseInt(serverPort, 10) || DEFAULT_REMOTE_PORT)
-    setServerPort(portStr)
-    await window.api.settings.set('remote_serve_port', portStr)
-    const r = await window.api.remote.startServer(parseInt(portStr, 10))
+    const port = parseInt(portDraft, 10) || DEFAULT_REMOTE_PORT
+    setPortDraft(String(port))
+    await patchRemoteConfig({ servePort: port })
+    const r = await window.api.remote.startServer(port)
     if (!r?.ok) {
       toast(`Could not start server: ${r?.error || 'unknown error'}`, 'error', 4500)
       return
     }
     await refreshRemoteStatus()
     toast(`Serving on port ${r.port}`, 'success')
-  }, [serverPort, refreshRemoteStatus])
+  }, [portDraft, patchRemoteConfig, refreshRemoteStatus])
 
   const handleStopServer = useCallback(async () => {
     await window.api.remote.stopServer()
@@ -583,41 +608,36 @@ export default function SettingsView() {
     toast('Server stopped', 'success')
   }, [refreshRemoteStatus])
 
-  const handleToggleServeOnLaunch = useCallback(async (checked) => {
-    setServeOnLaunch(checked)
-    await window.api.settings.set('remote_serve_on_launch', checked ? '1' : '0')
-  }, [])
+  const handleToggleServeOnLaunch = useCallback(
+    async (checked) => {
+      await patchRemoteConfig({ serveOnLaunch: checked })
+    },
+    [patchRemoteConfig],
+  )
 
   const handleToggleRemoteEnabled = useCallback(
     async (checked) => {
-      setRemoteEnabled(checked)
-      await window.api.settings.set('remote_mode_enabled', checked ? '1' : '0')
       // Hiding the section must not leave the feature silently active behind it:
       // clear auto-start and stop any running server so there's nothing the user
       // can't see or reach.
-      if (!checked) {
-        if (serveOnLaunch) {
-          setServeOnLaunch(false)
-          await window.api.settings.set('remote_serve_on_launch', '0')
-        }
-        if (remoteStatus?.running) {
-          await window.api.remote.stopServer()
-          await refreshRemoteStatus()
-        }
+      await patchRemoteConfig(checked ? { remoteEnabled: true } : { remoteEnabled: false, serveOnLaunch: false })
+      if (!checked && remoteStatus?.running) {
+        await window.api.remote.stopServer()
+        await refreshRemoteStatus()
       }
     },
-    [serveOnLaunch, remoteStatus, refreshRemoteStatus],
+    [patchRemoteConfig, remoteStatus, refreshRemoteStatus],
   )
 
   const handleConnect = useCallback(async () => {
-    const trimmed = connectUrl.trim()
+    const trimmed = urlDraft.trim()
     if (!trimmed) return
-    setConnectUrl(trimmed)
-    await window.api.settings.set('remote_connect_url', trimmed)
+    setUrlDraft(trimmed)
+    await patchRemoteConfig({ connectUrl: trimmed })
     const url = normalizeConnectUrl(trimmed)
     if (!url) return
     await window.api.remote.connect(url) // relaunches the app into client mode
-  }, [connectUrl])
+  }, [urlDraft, patchRemoteConfig])
 
   const handleDisconnect = useCallback(async () => {
     await window.api.remote.disconnect() // relaunches back into local mode (also disarms auto-connect)
@@ -625,29 +645,28 @@ export default function SettingsView() {
 
   const handleToggleAutoConnect = useCallback(
     async (checked) => {
-      if (checked) {
-        const trimmed = connectUrl.trim()
-        const url = normalizeConnectUrl(trimmed)
-        if (!url) {
-          toast('Enter a server address first', 'error')
-          return
-        }
-        setConnectUrl(trimmed)
-        await window.api.settings.set('remote_connect_url', trimmed)
-        await window.api.remote.setAutoconnect(url)
-        setAutoConnectArmed(true)
-      } else {
-        await window.api.remote.setAutoconnect(null)
-        setAutoConnectArmed(false)
+      if (!checked) {
+        // Disarming keeps the address, so the field still offers it next time.
+        await patchRemoteConfig({ autoconnect: false })
+        return
       }
+      const trimmed = urlDraft.trim()
+      if (!normalizeConnectUrl(trimmed)) {
+        toast('Enter a server address first', 'error')
+        return
+      }
+      setUrlDraft(trimmed)
+      await patchRemoteConfig({ connectUrl: trimmed, autoconnect: true })
     },
-    [connectUrl],
+    [urlDraft, patchRemoteConfig],
   )
 
-  const handleToggleClientAutoConnect = useCallback(async (checked) => {
-    await window.api.remote.setAutoconnect(checked ? window.api.remote.url : null)
-    setAutoConnectArmed(checked)
-  }, [])
+  const handleToggleClientAutoConnect = useCallback(
+    async (checked) => {
+      await patchRemoteConfig({ connectUrl: window.api.remote.url, autoconnect: checked })
+    },
+    [patchRemoteConfig],
+  )
 
   return (
     <div className="h-full overflow-y-auto">
@@ -783,6 +802,18 @@ export default function SettingsView() {
                 </SelectContent>
               </Select>
             </div>
+          )}
+
+          {!isRemoteClient && (
+            <label className="flex items-center gap-3 cursor-pointer">
+              <div className="flex-1 min-w-0">
+                <div className="text-xs text-text-primary font-medium">Move files when dragging them in</div>
+                <div className="text-[11px] text-text-tertiary mt-0.5">
+                  Drag-and-drop moves packages into your library instead of copying them, so the originals are removed.
+                </div>
+              </div>
+              <Switch checked={moveOnImport} onCheckedChange={handleToggleMoveOnImport} />
+            </label>
           )}
 
           <div className="space-y-3 border-t border-border pt-3">
@@ -1250,8 +1281,8 @@ export default function SettingsView() {
                   <input
                     type="text"
                     inputMode="numeric"
-                    value={serverPort}
-                    onChange={(e) => setServerPort(e.target.value.replace(/[^\d]/g, ''))}
+                    value={portDraft}
+                    onChange={(e) => setPortDraft(e.target.value.replace(/[^\d]/g, ''))}
                     disabled={remoteStatus?.running}
                     placeholder={String(DEFAULT_REMOTE_PORT)}
                     title={`Network port other devices connect to (default ${DEFAULT_REMOTE_PORT}).`}
@@ -1294,8 +1325,8 @@ export default function SettingsView() {
                   </div>
                   <input
                     type="text"
-                    value={connectUrl}
-                    onChange={(e) => setConnectUrl(e.target.value)}
+                    value={urlDraft}
+                    onChange={(e) => setUrlDraft(e.target.value)}
                     placeholder="192.168.1.5"
                     className="w-44 h-9 bg-elevated border border-border rounded-lg px-2.5 text-xs text-text-secondary font-mono"
                   />
@@ -1303,7 +1334,7 @@ export default function SettingsView() {
                     variant="outline"
                     size="lg"
                     onClick={handleConnect}
-                    disabled={!connectUrl.trim()}
+                    disabled={!urlDraft.trim()}
                     className="shrink-0 text-xs"
                   >
                     <Plug size={14} /> Connect
@@ -1388,52 +1419,50 @@ export default function SettingsView() {
                 <Switch checked={hubDebugRequests} onCheckedChange={handleToggleHubDebug} />
               </label>
 
-              <div className="border-t border-border pt-4 space-y-3">
-                <div>
-                  <AlertDialog>
-                    <AlertDialogTrigger asChild>
-                      <Button
-                        variant="outline"
-                        size="lg"
-                        disabled={deletedData.packages === 0 && deletedData.contentLabels === 0}
-                        className="shrink-0 gap-2 text-xs"
-                      >
-                        <Trash2 size={14} className="shrink-0" />
-                        Forget deleted data{deletedData.packages > 0 ? ` (${deletedData.packages})` : ''}
-                      </Button>
-                    </AlertDialogTrigger>
-                    <AlertDialogContent>
-                      <AlertDialogHeader>
-                        <AlertDialogTitle className="select-text cursor-text">Forget deleted data?</AlertDialogTitle>
-                        <AlertDialogDescription asChild>
-                          <div className="text-[11px] text-text-tertiary space-y-2">
-                            <p>
-                              The app keeps the identity and settings (hub link, labels, type override, content
-                              visibility) of {deletedData.packages} package{deletedData.packages === 1 ? '' : 's'} whose
-                              file{deletedData.packages === 1 ? ' is' : 's are'} no longer on disk, so they are restored
-                              if the file reappears (moved back, restored from a backup, or a remounted drive)
-                              {deletedData.contentLabels > 0
-                                ? `, plus ${deletedData.contentLabels} label${deletedData.contentLabels === 1 ? '' : 's'} on content that a package update has since removed`
-                                : ''}
-                              .
-                            </p>
-                            <p>
-                              This permanently discards that remembered data to reclaim database space. Packages and
-                              content still on disk are not affected.
-                            </p>
-                            <p className="font-medium text-warning">This cannot be undone.</p>
-                          </div>
-                        </AlertDialogDescription>
-                      </AlertDialogHeader>
-                      <AlertDialogFooter>
-                        <AlertDialogCancel>Cancel</AlertDialogCancel>
-                        <AlertDialogAction variant="destructive" onClick={handleForgetDeleted}>
-                          Forget
-                        </AlertDialogAction>
-                      </AlertDialogFooter>
-                    </AlertDialogContent>
-                  </AlertDialog>
-                </div>
+              <div className="border-t border-border pt-4 flex flex-wrap items-center gap-3">
+                <AlertDialog>
+                  <AlertDialogTrigger asChild>
+                    <Button
+                      variant="outline"
+                      size="lg"
+                      disabled={deletedData.packages === 0 && deletedData.contentLabels === 0}
+                      className="shrink-0 gap-2 text-xs"
+                    >
+                      <Trash2 size={14} className="shrink-0" />
+                      Forget deleted data{deletedData.packages > 0 ? ` (${deletedData.packages})` : ''}
+                    </Button>
+                  </AlertDialogTrigger>
+                  <AlertDialogContent>
+                    <AlertDialogHeader>
+                      <AlertDialogTitle className="select-text cursor-text">Forget deleted data?</AlertDialogTitle>
+                      <AlertDialogDescription asChild>
+                        <div className="text-[11px] text-text-tertiary space-y-2">
+                          <p>
+                            The app keeps the identity and settings (hub link, labels, type override, content
+                            visibility) of {deletedData.packages} package{deletedData.packages === 1 ? '' : 's'} whose
+                            file{deletedData.packages === 1 ? ' is' : 's are'} no longer on disk, so they are restored
+                            if the file reappears (moved back, restored from a backup, or a remounted drive)
+                            {deletedData.contentLabels > 0
+                              ? `, plus ${deletedData.contentLabels} label${deletedData.contentLabels === 1 ? '' : 's'} on content that a package update has since removed`
+                              : ''}
+                            .
+                          </p>
+                          <p>
+                            This permanently discards that remembered data to reclaim database space. Packages and
+                            content still on disk are not affected.
+                          </p>
+                          <p className="font-medium text-warning">This cannot be undone.</p>
+                        </div>
+                      </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel>Cancel</AlertDialogCancel>
+                      <AlertDialogAction variant="destructive" onClick={handleForgetDeleted}>
+                        Forget
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
 
                 <AlertDialog>
                   <AlertDialogTrigger asChild>

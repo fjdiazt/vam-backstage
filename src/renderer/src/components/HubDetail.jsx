@@ -40,7 +40,6 @@ import { useHubStore } from '@/stores/useHubStore'
 import { useWishlistStore } from '@/stores/useWishlistStore'
 import { useDownloadStore } from '@/stores/useDownloadStore'
 import { useViewStore } from '@/stores/useViewStore'
-import { useInstalledStore } from '@/stores/useInstalledStore'
 import { useHubInstallState } from '@/hooks/useHubInstallState'
 import { useHubInteractions } from '@/hooks/useHubInteractions'
 import { AuthorAvatar, DepRow } from '@/components/PackageCard'
@@ -425,7 +424,7 @@ export default function HubDetail({
       const store = useHubStore.getState()
       const shown = String(store.detailData?.resource_id ?? store.detailResource?.resource_id ?? '')
       if (navId === shown) return
-      const known = store.resources?.find((item) => String(item.resource_id) === navId)
+      const known = store.findResourceById(navId)
       store.followDetail(known || { resource_id: navId })
     },
     [tabUrls, tabs],
@@ -747,7 +746,7 @@ export default function HubDetail({
       const rid = String(targetId)
       if (!rid || rid === String(resourceId)) return
       const store = useHubStore.getState()
-      const known = store.resources?.find((r) => String(r.resource_id) === rid)
+      const known = store.findResourceById(rid)
       store.openDetail(known || { resource_id: rid }, { pushHistory: true })
     },
     [resourceId],
@@ -791,7 +790,7 @@ export default function HubDetail({
             className="text-text-secondary hover:text-text-primary min-w-0 max-w-[min(280px,40vw)]"
           >
             <ArrowLeft size={14} className="shrink-0" />
-            <span className="truncate">{backLabel || 'Back'}</span>
+            <span className="truncate">{backLabel ? `Back to ${backLabel}` : 'Back'}</span>
           </Button>
           {position && (
             <div className="flex items-center gap-0.5 ml-1 pl-1.5 border-l border-border/60">
@@ -835,7 +834,7 @@ export default function HubDetail({
           size="icon-xs"
           onClick={handleClose}
           aria-label="Close detail"
-          className="shrink-0 text-text-tertiary/70 hover:text-text-tertiary hover:bg-muted/35"
+          className="shrink-0 text-text-tertiary hover:text-text-secondary hover:bg-muted/35"
         >
           <X size={12} strokeWidth={1.75} />
         </Button>
@@ -1058,17 +1057,7 @@ export default function HubDetail({
                   size="lg"
                   onClick={() => {
                     if (!installStatus.filename) return
-                    window.api.packages.promote(installStatus.filename, resourceId)
-                    useInstalledStore.getState().update(rid, true, true, installStatus.filename)
-                    useHubStore.setState((s) => ({
-                      resources: s.resources.map((r) =>
-                        String(r.resource_id) === rid ? { ...r, _isDirect: true } : r,
-                      ),
-                      detailData:
-                        s.detailData && String(s.detailData.resource_id) === rid
-                          ? { ...s.detailData, _isDirect: true }
-                          : s.detailData,
-                    }))
+                    useHubStore.getState().promoteResource(installStatus.filename, resourceId)
                   }}
                   className="w-full text-xs"
                 >

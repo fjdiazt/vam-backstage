@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { HUB_PERSISTED_STATE, hubTailCacheKey, useHubStore } from './useHubStore'
+import { HUB_PERSISTED_STATE, hubFilterSignature, hubTailCacheKey, useHubStore } from './useHubStore'
 import { useInstalledStore } from './useInstalledStore'
 import { persistViewState } from './persistViewState'
 
@@ -30,6 +30,9 @@ describe('useHubStore', () => {
     })
     useHubStore.setState({
       resources: [],
+      resourcesByIndex: {},
+      loadedPages: new Set(),
+      itemCount: 0,
       totalFound: 0,
       totalPages: 10,
       page: 3,
@@ -105,9 +108,11 @@ describe('useHubStore', () => {
     expect(useHubStore.getState()).toMatchObject({ hideInstalled: false, showHidden: true })
   })
 
-  it('prepends the previous infinite page without changing the loaded tail page', async () => {
+  it('loads an earlier sparse page without changing the selected page', async () => {
     useHubStore.setState({
-      resources: [resource(3)],
+      resourcesByIndex: { 120: resource(3) },
+      loadedPages: new Set([3]),
+      itemCount: 300,
       page: 3,
       startPage: 3,
       restorePage: 3,
@@ -115,19 +120,13 @@ describe('useHubStore', () => {
       totalPages: 10,
       sort: 'Latest Update',
     })
+    useHubStore.setState({ lastFetchedKey: hubFilterSignature(useHubStore.getState()) })
 
-    const loaded = await useHubStore.getState().fetchPreviousPage()
+    await useHubStore.getState().loadRange(60, 119)
 
-    expect(loaded).toBe(true)
     expect(window.api.hub.search).toHaveBeenCalledWith(expect.objectContaining({ page: 2, perpage: 60 }))
-    expect(useHubStore.getState()).toMatchObject({
-      resources: [resource(2), resource(3)],
-      page: 3,
-      startPage: 2,
-      restorePage: 3,
-      loading: false,
-      loadingPrevious: false,
-    })
+    expect(useHubStore.getState().resourcesByIndex[60]).toEqual(resource(2))
+    expect(useHubStore.getState().page).toBe(3)
   })
 
   it('resizes infinite start page from the restore page without fetching twice', () => {
@@ -185,6 +184,7 @@ describe('useHubStore', () => {
   })
 
   it('keeps non-empty requested pages unchanged', async () => {
+    useHubStore.setState({ browseMode: 'paged' })
     window.api.hub.search.mockResolvedValueOnce({ resources: [resource(3)], totalFound: 90, totalPages: 3 })
 
     await useHubStore.getState().fetchResources(true, { page: 3 })
@@ -197,19 +197,19 @@ describe('useHubStore', () => {
   it('resolves an empty tail page to the last non-empty page', async () => {
     window.api.hub.search.mockImplementation(({ page }) => {
       const resources = page <= 6 ? [resource(page)] : []
-      return Promise.resolve({ resources, totalFound: 300, totalPages: 10 })
+      return Promise.resolve({ resources, totalFound: 600, totalPages: 10 })
     })
 
     await useHubStore.getState().fetchResources(true, { page: 10 })
 
     expect(window.api.hub.search.mock.calls.length).toBeLessThanOrEqual(5)
     expect(useHubStore.getState()).toMatchObject({
-      resources: [resource(6)],
       page: 6,
       startPage: 6,
       restorePage: 6,
       totalPages: 6,
     })
+    expect(useHubStore.getState().resourcesByIndex[300]).toEqual(resource(6))
   })
 
   it('uses a persisted resolved tail page cache', async () => {

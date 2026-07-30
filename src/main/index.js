@@ -23,8 +23,9 @@ import { initAutoUpdater } from './updater.js'
 import { installRegistry } from './remote/registry.js'
 import { startServer, stopServer } from './remote/server.js'
 import { getServePort, getConnectUrl } from './remote/cli.js'
-import { initAutostart, readAutostartUrl } from './remote/autostart.js'
-import { DEFAULT_REMOTE_PORT } from '@shared/remote-config.js'
+import { readAutostartUrl } from './remote/autostart.js'
+import { installPrefs, instancePrefs } from './prefs.js'
+import { foldLegacyClientAutostart } from './prefs-migrate.js'
 import { HUB_HTTP_USER_AGENT } from '@shared/hub-http.js'
 import { loadBrowserAssistDerivedHiddenRules } from './browser-assist.js'
 import { applyVamDirOverride, configureUserDataPath, isManualStorageMode } from './runtime-config.js'
@@ -99,9 +100,14 @@ if (!configuredUserData && process.env.VAM_DEV_USERDATA) {
   app.setPath('userData', app.getPath('userData') + '-dev')
 }
 
-// Bind the client-autostart file to the BASE userData dir now, before the
-// `-client` swap below — both instances must resolve the same path.
-initAutostart(app.getPath('userData'))
+// Installation-scoped prefs (update channel, remote config, developer unlock)
+// bind to the BASE userData dir now, before the `-client` swap below — one
+// installed binary, one set of values, whichever mode it's launched in.
+installPrefs.init(app.getPath('userData'))
+// One-time legacy fold (see prefs-migrate.js). Ordering matters: it has to land
+// before the connect URL is resolved just below, which is why this one step can't
+// live in runStartupMigrations with its DB-backed sibling.
+foldLegacyClientAutostart(app.getPath('userData'))
 
 // Remote-mode switches, resolved once at startup from argv. `CONNECT_URL` set =
 // this instance is a pure client head (backend suppressed, UI points at a
@@ -124,6 +130,10 @@ const HEADLESS_SERVE = SERVE_PORT != null && !IS_CLIENT
 if (IS_CLIENT) {
   app.setPath('userData', app.getPath('userData') + '-client')
 }
+
+// Instance-scoped prefs (window geometry) bind AFTER the swap: a client head and
+// the host each own a window, so they must not share one saved rect.
+instancePrefs.init(app.getPath('userData'))
 
 // Single-instance guard. After the client userData swap on purpose: the lock is
 // keyed on the userData dir, so a client head and the normal/serve backend (which
@@ -171,14 +181,18 @@ function attachNativeTextContextMenu(webContents, popupHostWindow) {
   })
 }
 
-/** DevTools hotkeys are live whenever a dev build is running or the 7-tap unlock is set. */
+/** Cmd+Option+I (macOS) or Ctrl+Shift+I (Win/Linux) — matches electron-toolkit. */
+function isDevToolsInspectorHotkey(input) {
+  if (input.code !== 'KeyI') return false
+  if (input.meta && input.alt) return true
+  if (input.control && input.shift) return true
+  return false
+}
+
+/** DevTools hotkeys are live in dev or after the 7-tap unlock. The unlock is
+ *  machine-scoped, so a client head stores its own (it has no DB). */
 function devHotkeysEnabled() {
-  if (is.dev) return true
-  try {
-    return getSetting('developer_options_unlocked') === '1'
-  } catch {
-    return false
-  }
+  return is.dev || installPrefs.get('devUnlocked')
 }
 
 /**
@@ -200,9 +214,7 @@ function attachWebviewShortcuts(contents) {
       else contents.reload()
       return
     }
-    const isF12 = input.code === 'F12'
-    const isInspector = input.code === 'KeyI' && input.shift && (input.control || input.meta || input.alt)
-    if ((isF12 || isInspector) && devHotkeysEnabled()) {
+    if ((input.code === 'F12' || isDevToolsInspectorHotkey(input)) && devHotkeysEnabled()) {
       event.preventDefault()
       contents.toggleDevTools()
     }
@@ -239,24 +251,17 @@ function registerWebviewWindowOpenHandler() {
  */
 function attachDevToolsHotkeys(window) {
   if (is.dev) return
-  window.webContents.on('before-input-event', (_event, input) => {
+  window.webContents.on('before-input-event', (event, input) => {
     if (input.type !== 'keyDown') return
-    const isF12 = input.code === 'F12'
-    const isInspector = input.code === 'KeyI' && input.shift && (input.control || input.meta || input.alt)
-    if (!isF12 && !isInspector) return
-    let unlocked = false
-    try {
-      unlocked = getSetting('developer_options_unlocked') === '1'
-    } catch {}
-    if (!unlocked) return
+    if (input.code !== 'F12' && !isDevToolsInspectorHotkey(input)) return
+    if (!devHotkeysEnabled()) return
+    event.preventDefault()
     window.webContents.toggleDevTools()
   })
 }
 
 function createWindow() {
-  // Client head has no DB, so window-state read/persist (both go through the
-  // settings table) is skipped — fall back to default geometry.
-  const saved = IS_CLIENT ? null : loadMainWindowState()
+  const saved = loadMainWindowState()
   mainWindow = new BrowserWindow({
     title: 'VaM Backstage',
     width: saved?.width ?? DEFAULT_WIDTH,
@@ -278,9 +283,12 @@ function createWindow() {
       ...(CONNECT_URL ? { additionalArguments: [`--connect=${CONNECT_URL}`] } : {}),
     },
   })
-  if (!IS_CLIENT) attachMainWindowStatePersistence(mainWindow)
+  attachMainWindowStatePersistence(mainWindow)
 
-  mainWindow.on('ready-to-show', () => {
+  // once: ready-to-show re-fires on every navigation/reload first paint. Client
+  // mode reloads the renderer on reconnect (remote-transport.js); a repeated
+  // show() would activate the app on macOS and steal focus from other windows.
+  mainWindow.once('ready-to-show', () => {
     if (saved?.isMaximized) mainWindow.maximize()
     mainWindow.show()
   })
@@ -527,15 +535,13 @@ app.whenReady().then(async () => {
 
   // Auto-start the LAN server when requested via CLI/env (headless, handled
   // above via HEADLESS_SERVE) or via the persisted "start on launch" preference
-  // (windowed). CLI/env wins on port; the setting falls back to the last-used
-  // port. Client heads never host. The setting lives in the local DB, so it is
-  // never read in client mode (no DB there) — another reason client auto-connect
-  // isn't a persisted flag.
+  // (windowed). CLI/env wins on port; the pref falls back to the last-used port.
+  // Client heads never host.
   if (!IS_CLIENT) {
     let servePort = SERVE_PORT
-    const autoStart = getSetting('remote_mode_enabled') === '1' && getSetting('remote_serve_on_launch') === '1'
+    const autoStart = installPrefs.get('remoteEnabled') && installPrefs.get('serveOnLaunch')
     if (servePort == null && autoStart) {
-      servePort = parseInt(getSetting('remote_serve_port'), 10) || DEFAULT_REMOTE_PORT
+      servePort = installPrefs.get('servePort')
     }
     if (servePort != null) {
       const res = await startServer(servePort)

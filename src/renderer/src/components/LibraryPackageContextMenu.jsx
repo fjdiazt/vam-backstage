@@ -11,6 +11,7 @@ import {
   LayoutGrid,
   Link2,
   Plus,
+  Shapes,
   Tag,
   Trash2,
 } from 'lucide-react'
@@ -19,6 +20,7 @@ import {
   ContextMenu,
   ContextMenuContent,
   ContextMenuItem,
+  ContextMenuLabel,
   ContextMenuSeparator,
   ContextMenuSub,
   ContextMenuSubContent,
@@ -35,9 +37,17 @@ import {
 } from '@/components/package-action-dialogs'
 import FileTreeDialog from '@/components/FileTreeDialog'
 import LinkHubDialog from '@/components/LinkHubDialog'
-import { displayName, isPromotionalLink, openExternalLink } from '@/lib/utils'
+import {
+  displayName,
+  isPromotionalLink,
+  libraryTypeBadgeLabel,
+  LIBRARY_FILTER_TYPES,
+  openExternalLink,
+  TYPE_COLORS,
+} from '@/lib/utils'
 import { toastIfBulkToggleFailures, toastIfSingleToggleFailed } from '@/lib/packageStorageToggleResults'
 import { packageNeedsDisableConfirmation } from '@/lib/package-disable-confirm'
+import { isUpdateUnavailable, isUpdateCheckFailed, isUpdateChecking, updateTargetVersion } from '@/lib/hub-availability'
 import { isPackageActive } from '@shared/storage-state-predicates.js'
 import { useDownloadStore } from '@/stores/useDownloadStore'
 import { useLibraryStore } from '@/stores/useLibraryStore'
@@ -155,6 +165,47 @@ async function runLibraryBulkPromoteFromStore() {
   } catch (err) {
     toast(`Failed: ${err.message}`)
   }
+}
+
+async function runSetTypeOverride(filenames, typeOverride) {
+  if (!filenames.length) return
+  try {
+    await window.api.packages.setTypeOverride({ filenames, typeOverride })
+    await useLibraryStore.getState().fetchPackages()
+    await useLibraryStore.getState().refreshDetail()
+  } catch (err) {
+    toast(`Failed to update package type: ${err.message}`)
+  }
+}
+
+function TypeOverrideMenuItems({ filenames, typeOverride, autoBucketLabel, bulk }) {
+  return (
+    <>
+      <ContextMenuLabel>{bulk ? `Type (${filenames.length})` : 'Set type'}</ContextMenuLabel>
+      {bulk && (
+        <>
+          <ContextMenuSeparator />
+          <ContextMenuItem onSelect={() => void runSetTypeOverride(filenames, null)}>
+            Auto (clear override)
+          </ContextMenuItem>
+        </>
+      )}
+      {LIBRARY_FILTER_TYPES.map((t) => (
+        <ContextMenuItem key={t} className="gap-2" onSelect={() => void runSetTypeOverride(filenames, t)}>
+          <span className="inline-block h-2.5 w-2.5 rounded-full shrink-0" style={{ background: TYPE_COLORS[t] }} />
+          {t}
+        </ContextMenuItem>
+      ))}
+      {!bulk && typeOverride != null && (
+        <>
+          <ContextMenuSeparator />
+          <ContextMenuItem onSelect={() => void runSetTypeOverride(filenames, null)}>
+            Auto ({autoBucketLabel})
+          </ContextMenuItem>
+        </>
+      )}
+    </>
+  )
 }
 
 function formatDependentNames(dependents) {
@@ -477,6 +528,15 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
                   <LabelsApplyMenuItems labels={labels} stateById={labelStateMap} onToggle={handleLabelToggle} />
                 </ContextMenuSubContent>
               </ContextMenuSub>
+              <ContextMenuSub>
+                <ContextMenuSubTrigger>
+                  <Shapes size={12} className="shrink-0" />
+                  Type ({bulkSelectedFilenames.length})
+                </ContextMenuSubTrigger>
+                <ContextMenuSubContent className="min-w-40">
+                  <TypeOverrideMenuItems filenames={bulkSelectedFilenames} bulk />
+                </ContextMenuSubContent>
+              </ContextMenuSub>
               <ContextMenuSeparator />
               <ContextMenuItem onSelect={() => void runLibraryBulkToggleEnabledFromStore()}>
                 <Power
@@ -569,11 +629,18 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
                     Go to v{updateInfo.hubVersion}
                   </ContextMenuItem>
                 </>
-              ) : updateInfo && updateInfo.downloadUrl === null ? (
-                <ContextMenuItem disabled title="Listed on the hub but not directly downloadable (paid or external)">
+              ) : isUpdateCheckFailed(updateInfo) ? (
+                <ContextMenuItem disabled title="The hub could not be reached — re-check to try again">
+                  <ArrowUpCircle size={12} className="shrink-0" />v{updateInfo.hubVersion} unchecked
+                </ContextMenuItem>
+              ) : isUpdateUnavailable(updateInfo) ? (
+                <ContextMenuItem
+                  disabled
+                  title="Listed on the hub but not downloadable — paid, externally hosted, or no longer served"
+                >
                   <ArrowUpCircle size={12} className="shrink-0" />v{updateInfo.hubVersion} unavailable
                 </ContextMenuItem>
-              ) : updateInfo && updateInfo.downloadUrl === undefined ? (
+              ) : isUpdateChecking(updateInfo) ? (
                 <ContextMenuItem disabled title="Verifying availability with the hub…">
                   <ArrowUpCircle size={12} className="shrink-0" />
                   Checking v{updateInfo.hubVersion}…
@@ -586,7 +653,7 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
                     }}
                   >
                     <ArrowUpCircle size={12} className="shrink-0 text-accent-blue" />
-                    Update to v{updateInfo.hubVersion}
+                    Update to v{updateTargetVersion(updateInfo)}
                   </ContextMenuItem>
                 )
               )}
@@ -652,7 +719,7 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
                   }}
                 >
                   <LayoutGrid size={12} className="shrink-0" />
-                  View in gallery
+                  Browse content
                 </ContextMenuItem>
               )}
               <ContextMenuItem onSelect={() => setFileTreeOpen(true)}>
@@ -666,6 +733,19 @@ export function LibraryPackageContextMenu({ pkg, updateInfo, onNavigate, childre
                 </ContextMenuSubTrigger>
                 <ContextMenuSubContent>
                   <LabelsApplyMenuItems labels={labels} stateById={labelStateMap} onToggle={handleLabelToggle} />
+                </ContextMenuSubContent>
+              </ContextMenuSub>
+              <ContextMenuSub>
+                <ContextMenuSubTrigger>
+                  <Shapes size={12} className="shrink-0" />
+                  Type
+                </ContextMenuSubTrigger>
+                <ContextMenuSubContent className="min-w-40">
+                  <TypeOverrideMenuItems
+                    filenames={[pkg.filename]}
+                    typeOverride={p.typeOverride}
+                    autoBucketLabel={libraryTypeBadgeLabel(p.derivedType || p.hubType)}
+                  />
                 </ContextMenuSubContent>
               </ContextMenuSub>
               {renderPkgExtractEntries()}

@@ -4,6 +4,7 @@ import { toast } from '@/components/Toast'
 import { typeFilterSlice } from './typeFilterSlice'
 import { useContentStore } from './useContentStore'
 import { persistViewState, oneOf, asArray, asPolarityList, asString, asBool, asCardWidth } from './persistViewState'
+import { applyUpdateEnrichment, applyDepEnrichment } from '@/lib/hub-availability'
 
 let missingDepsNonce = 0
 let updateCheckNonce = 0
@@ -30,26 +31,67 @@ let packagesFetchQueued = false
  * check had definitively marked unavailable. That brief window let the user
  * click an Update button whose install path then failed with hub "Resource not
  * found".
+ *
+ * Only carried forward when the hub target is unchanged: entries are keyed by
+ * *local* filename, which stays the same when the CDN publishes a newer version,
+ * so an unguarded copy would attach the old version's availability to a target
+ * nobody has checked yet.
  */
 function _mergeUpdateEnrichment(prev, next) {
   if (!prev) return
   for (const [filename, entry] of Object.entries(next)) {
     const prevEntry = prev[filename]
-    if (prevEntry?.downloadUrl !== undefined) {
+    if (prevEntry?.downloadUrl !== undefined && prevEntry.hubFilename === entry.hubFilename) {
       entry.downloadUrl = prevEntry.downloadUrl
       entry.fileSize = prevEntry.fileSize
+      entry.availableFilename = prevEntry.availableFilename
+      entry.availableVersion = prevEntry.availableVersion
+      entry.hubCheckFailed = prevEntry.hubCheckFailed
     }
   }
 }
 
-async function _enrichUpdateCheck(nonce, set, get) {
+/** Enrichment passes run one at a time. The `packages:updated` burst at startup
+ *  queues several, and run concurrently they would re-request stems another pass
+ *  is already resolving and race each other's writes. Chained, each pass starts
+ *  from its predecessor's results — so the followers usually find nothing left to
+ *  ask about and exit before touching the network. */
+let enrichQueue = Promise.resolve()
+
+function _queueEnrichUpdateCheck(nonce, set, get, opts) {
+  enrichQueue = enrichQueue.then(() => _enrichUpdateCheck(nonce, set, get, opts)).catch(() => {})
+  return enrichQueue
+}
+
+/**
+ * Resolve hub availability (`downloadUrl` / `fileSize`) for the current update
+ * entries. Runs after *every* check, not just enriching ones: an `enrich: false`
+ * refresh can introduce keys no pass has ever requested (a scan promoting a
+ * package, a finished download surfacing a new dep update), and those would
+ * otherwise sit at `downloadUrl === undefined` forever — rendering as a disabled
+ * "Checking vX…" button with no path out short of a manual re-check.
+ *
+ * `onlyUnresolved` restricts the pass to entries still missing a value, which is
+ * what the event-driven refreshes want; a full pass re-asks the hub about
+ * everything.
+ */
+async function _enrichUpdateCheck(nonce, set, get, { onlyUnresolved = false } = {}) {
+  if (nonce !== updateCheckNonce) return
   const results = get().updateCheckResults
   if (!results) return
   const stems = []
-  for (const entry of Object.values(results)) {
-    if (!entry.localNewerFilename) stems.push(entry.hubFilename.replace(/\.var$/i, ''))
+  const requested = new Set()
+  for (const [filename, entry] of Object.entries(results)) {
+    if (entry.localNewerFilename) continue
+    // A `hubCheckFailed` entry has a value, but it's ours rather than the hub's —
+    // re-ask on the next pass instead of letting one dropped connection stick until
+    // the view remounts.
+    if (onlyUnresolved && entry.downloadUrl !== undefined && !entry.hubCheckFailed) continue
+    stems.push(entry.hubFilename.replace(/\.var$/i, ''))
+    requested.add(filename)
   }
   if (!stems.length) return
+  set({ updateEnrichLoading: true })
   try {
     const details = await window.api.packages.enrichFromHub(stems)
     if (nonce !== updateCheckNonce) return
@@ -59,30 +101,35 @@ async function _enrichUpdateCheck(nonce, set, get) {
     for (const [filename, entry] of Object.entries(current)) {
       const stem = entry.hubFilename.replace(/\.var$/i, '')
       const detail = details[stem]
-      updated[filename] = detail ? { ...entry, downloadUrl: detail.downloadUrl, fileSize: detail.fileSize } : entry
+      updated[filename] = detail ? applyUpdateEnrichment(entry, detail) : entry
     }
     set({ updateCheckResults: updated })
   } catch (err) {
     if (nonce !== updateCheckNonce) return
     console.warn('Update details enrichment failed:', err)
     // Hub round-trip failed wholesale (server outage, network down, etc.).
-    // Mark every still-unknown entry as `downloadUrl: null` so the UI lands on a
-    // definitive "unavailable" state instead of leaving the button stuck in its
-    // "checking" rendering. Entries that already carry a known value (string or
-    // null) from a prior successful enrichment are preserved.
+    // Mark every still-unknown entry this pass asked about as `downloadUrl: null`
+    // so the UI lands on a definitive state instead of leaving the button stuck in
+    // its "checking" rendering. `hubCheckFailed` keeps that distinct from an answer
+    // the Hub actually gave: nothing becomes clickable either way, but the copy says
+    // "couldn't check" rather than claiming the version doesn't exist. Entries that
+    // arrived mid-pass were never asked about, so they stay unknown for the next
+    // pass to retry.
     const current = get().updateCheckResults
     if (!current) return
     const updated = {}
     let dirty = false
     for (const [filename, entry] of Object.entries(current)) {
-      if (entry.downloadUrl === undefined) {
-        updated[filename] = { ...entry, downloadUrl: null }
+      if (entry.downloadUrl === undefined && requested.has(filename)) {
+        updated[filename] = { ...entry, downloadUrl: null, hubCheckFailed: true }
         dirty = true
       } else {
         updated[filename] = entry
       }
     }
     if (dirty) set({ updateCheckResults: updated })
+  } finally {
+    set({ updateEnrichLoading: false })
   }
 }
 
@@ -129,11 +176,16 @@ export const useLibraryStore = create(
       // Missing deps (lazy loaded when missing filter activates)
       missingDeps: null,
       missingDepsLoading: false,
+      missingDepsLastChecked: null,
       hubDetailsLoading: false,
 
       // Update check results
       updateCheckResults: null,
       updateCheckLoading: false,
+      /** True while a hub availability pass is resolving `downloadUrl`s. Separate from
+       *  `updateCheckLoading` (the CDN diff), which finishes first — bulk actions must
+       *  wait for this one or they'd treat unresolved entries as downloadable. */
+      updateEnrichLoading: false,
       updateCheckLastChecked: null,
 
       // Backend-provided counts for fields that can't be computed client-side
@@ -255,7 +307,7 @@ export const useLibraryStore = create(
             }
           }
 
-          set({ missingDeps: data, missingDepsLoading: false })
+          set({ missingDeps: data, missingDepsLoading: false, missingDepsLastChecked: Date.now() })
         } catch (err) {
           if (nonce !== missingDepsNonce) return
           console.error('Failed to fetch missing deps:', err)
@@ -287,7 +339,7 @@ export const useLibraryStore = create(
               const stem = dep.hub.filename.replace(/\.var$/i, '')
               const detail = details[stem]
               if (!detail) return dep
-              return { ...dep, hub: { ...dep.hub, fileSize: detail.fileSize, downloadUrl: detail.downloadUrl } }
+              return { ...dep, hub: applyDepEnrichment(dep.hub, detail) }
             }),
             hubDetailsLoading: false,
           })
@@ -298,7 +350,8 @@ export const useLibraryStore = create(
         }
       },
 
-      checkForUpdates: async ({ enrich = true } = {}) => {
+      /** `forceRefresh` re-downloads the CDN index instead of honoring its etag. */
+      checkForUpdates: async ({ enrich = true, forceRefresh = false } = {}) => {
         // Only bump the nonce when starting a fresh enrichment pass. Background
         // `packages:updated` refreshes pass enrich=false and must not abort an
         // in-flight enrichment (which would leave downloadUrl stuck at null and
@@ -306,13 +359,21 @@ export const useLibraryStore = create(
         const nonce = enrich ? ++updateCheckNonce : updateCheckNonce
         set({ updateCheckLoading: true })
         try {
-          const data = await window.api.packages.checkUpdates()
+          const data = await window.api.packages.checkUpdates({ forceRefresh })
           if (nonce !== updateCheckNonce) return
+          // `null` = the CDN index couldn't be loaded at all, so we know nothing
+          // about updates. Keep whatever we had (or `null`, which the UI renders
+          // as "?") rather than committing to an authoritative empty result.
+          if (!data) {
+            console.warn('Update check unavailable: no CDN package index')
+            set({ updateCheckLoading: false })
+            return
+          }
           // Always carry forward any prior `downloadUrl`/`fileSize` so the UI
           // keeps showing the previously-resolved availability while the
-          // (optional) re-enrichment runs in the background. Without this merge,
-          // every remount-driven recheck would flip entries back to "checking"
-          // and render Update buttons as actionable for the duration of the
+          // re-enrichment runs in the background. Without this merge, every
+          // remount-driven recheck would flip entries back to "checking" and
+          // render Update buttons as actionable for the duration of the
           // in-flight findPackages — even ones a prior check confirmed unavailable.
           _mergeUpdateEnrichment(get().updateCheckResults, data)
           set({
@@ -326,29 +387,14 @@ export const useLibraryStore = create(
           set({ updateCheckLoading: false })
           return
         }
-        if (enrich) _enrichUpdateCheck(nonce, set, get)
+        // Even on the event-driven path: a background refresh can introduce
+        // entries no enrichment pass has ever seen, and nothing else would ever
+        // resolve them.
+        void _queueEnrichUpdateCheck(nonce, set, get, { onlyUnresolved: !enrich })
       },
 
-      refreshUpdateCheck: async () => {
-        const nonce = ++updateCheckNonce
-        set({ updateCheckLoading: true })
-        try {
-          const data = await window.api.packages.checkUpdates({ forceRefresh: true })
-          if (nonce !== updateCheckNonce) return
-          _mergeUpdateEnrichment(get().updateCheckResults, data)
-          set({
-            updateCheckResults: data,
-            updateCheckLoading: false,
-            updateCheckLastChecked: Date.now(),
-          })
-        } catch (err) {
-          if (nonce !== updateCheckNonce) return
-          console.error('Update check failed:', err)
-          set({ updateCheckLoading: false })
-          return
-        }
-        _enrichUpdateCheck(nonce, set, get)
-      },
+      /** Toolbar re-check button: same flow, but bypasses the CDN index cache. */
+      refreshUpdateCheck: () => get().checkForUpdates({ forceRefresh: true }),
 
       selectPackage: async (filename) => {
         if (!filename) {

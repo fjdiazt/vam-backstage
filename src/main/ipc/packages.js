@@ -15,7 +15,7 @@ import {
 } from '../db.js'
 import { scanAndUpsert } from '../scanner/ingest.js'
 import { runLocalScan } from '../scanner/local.js'
-import { readVar } from '../scanner/var-reader.js'
+import { readVar, parseVarFilename } from '../scanner/var-reader.js'
 import { verifyPackageFull } from '../scanner/integrity.js'
 import {
   getFilteredPackages,
@@ -37,6 +37,7 @@ import {
   getFilteredContents,
   isNotDownloadable,
   resolveHubDownloadUrl,
+  findLocalByFilename,
   effectivePackageType,
   recomputeInactiveDeps,
 } from '../store.js'
@@ -56,12 +57,17 @@ import {
   enqueueInstallAllMissing,
   enqueueInstallRef,
   enqueueInstallBatch,
-  importLocalFromPath,
-  beginImportLocalVar,
-  appendImportLocalVar,
-  finishImportLocalVar,
-  abortImportLocalVar,
+  ensureVarExt,
 } from '../downloads/manager.js'
+import {
+  importLocalFromPath,
+  importPrecheck,
+  importChunk,
+  importCommit,
+  importAbort,
+  cleanupOwner,
+} from '../downloads/import.js'
+import { onClientClose } from '../remote/server.js'
 import {
   fetchPackagesJson,
   getPackagesIndex,
@@ -373,9 +379,19 @@ export function registerPackageHandlers() {
     return getAuthorCounts()
   })
 
-  ipcMain.handle('packages:install', async (_, { resourceId, hubDetail, autoQueueDeps, packageName, asDependency }) => {
-    return await enqueueInstall(resourceId, hubDetail, autoQueueDeps !== false, packageName, !!asDependency)
-  })
+  ipcMain.handle(
+    'packages:install',
+    async (_, { resourceId, hubDetail, autoQueueDeps, packageName, asDependency, targetFilename }) => {
+      return await enqueueInstall({
+        resourceId,
+        hubDetail,
+        autoQueueDeps: autoQueueDeps !== false,
+        packageName,
+        asDependency: !!asDependency,
+        targetFilename: targetFilename || null,
+      })
+    },
+  )
 
   ipcMain.handle('packages:install-missing', async (_, { filename, autoQueueDeps }) => {
     return await enqueueInstallMissing(filename, autoQueueDeps !== false)
@@ -386,6 +402,16 @@ export function registerPackageHandlers() {
     if (!vamDir) throw new Error('VaM directory not configured')
 
     const filenames = normalizeFilenameArgs(filenameOrFilenames)
+    // Promoting implies the user wants the package usable — enable disabled/offloaded
+    // targets first (cascade-enables inactive deps, same path as packages:set-enabled).
+    const toEnable = filenames.filter((fn) => {
+      const pkg = getPackageIndex().get(fn)
+      return pkg && !isPackageActive(pkg.storage_state)
+    })
+    if (toEnable.length > 0) {
+      await applyStorageStateChange(toEnable, () => 'enable')
+    }
+
     for (const filename of filenames) {
       setPackageDirect(filename, true)
       touchPackageFirstSeen(filename)
@@ -573,21 +599,40 @@ export function registerPackageHandlers() {
     return getMissingDeps(getPackagesIndex(), getPackagesFilenameIndex())
   })
 
+  // Resolve what the Hub would *actually* serve for each requested `.var` stem.
+  //
+  // `findPackages` does not fail on a version it doesn't have — it silently falls
+  // back to the nearest one it does (asking for `Creator.Pkg.9999` returns
+  // `Creator.Pkg.6.var`, with a working URL for v6). So the requested stem says
+  // nothing about what a download would produce, and callers must reconcile
+  // against the *returned* filename instead: hence `filename` / `version` /
+  // `installedLocally` alongside the URL. Comparing those is the whole of the
+  // caller-side policy — an update is only an update if the resolved version
+  // beats the installed one, and a missing dep is only installable if the
+  // resolved file isn't already on disk.
+  //
+  // Every requested stem is seeded so callers can distinguish "not on Hub / no
+  // URL" (null) from "enrichment hasn't returned yet" (undefined). Without this,
+  // a stem missing from `results` would leave downloadUrl undefined on the caller
+  // side, causing the UI to offer Install for something the Hub can't actually
+  // serve, and the install IPC then fails with "No download URL".
   ipcMain.handle('packages:enrich-from-hub', async (_, packageStems) => {
     if (!packageStems?.length) return {}
     const results = await findPackages(packageStems)
     const enriched = {}
     const isReal = (v) => v && v !== 'null'
-    // Seed a null placeholder for every requested stem so callers can distinguish
-    // "not on Hub / no URL" (null) from "enrichment hasn't returned yet" (undefined).
-    // Without this, a stem missing from `results` would leave downloadUrl undefined
-    // on the caller side, causing the UI to offer Install for something the Hub
-    // can't actually serve, and the install IPC then fails with "No download URL".
-    for (const stem of packageStems) enriched[stem] = { fileSize: null, downloadUrl: null }
+    for (const stem of packageStems) {
+      enriched[stem] = { fileSize: null, downloadUrl: null, filename: null, version: null, installedLocally: false }
+    }
     for (const [stem, hubFile] of Object.entries(results)) {
+      const filename = isReal(hubFile.filename) ? ensureVarExt(hubFile.filename) : null
+      const parsed = filename ? parseVarFilename(filename) : null
       enriched[stem] = {
         fileSize: isReal(hubFile.file_size) ? parseInt(hubFile.file_size, 10) || null : null,
-        downloadUrl: resolveHubDownloadUrl(hubFile),
+        downloadUrl: filename ? resolveHubDownloadUrl(hubFile) : null,
+        filename,
+        version: parsed ? Number(parsed.version) : null,
+        installedLocally: !!(filename && findLocalByFilename(filename)),
       }
     }
     return enriched
@@ -630,29 +675,35 @@ export function registerPackageHandlers() {
   // server writes it into its own AddonPackages.
   // Local fast path: main copies the dropped file straight from its source path
   // (reflink where supported), skipping the renderer/IPC byte streaming. Only
-  // valid when main can see the file — i.e. not a remote head.
-  ipcMain.handle('packages:import-local-copy', async (_, { filename, sourcePath }) => {
-    return await importLocalFromPath({ filename, sourcePath })
+  // valid when main can see the file — i.e. not a remote head. Joins the
+  // owner's import batch so the graph rebuild waits for commit.
+  ipcMain.handle('packages:import-local-copy', async (event, { filename, sourcePath, move }) => {
+    return await importLocalFromPath({ filename, sourcePath, move: !!move }, event.remoteWs || 'local')
   })
 
-  // Chunked import: begin → chunk* → finish (or abort). The file is streamed to
-  // a temp file in bounded pieces — required over the remote bridge, where the
-  // wire codec base64s each buffer into one string and a whole large .var can't
-  // cross in a single frame.
-  ipcMain.handle('packages:import-local-begin', async (_, { filename }) => {
-    return await beginImportLocalVar({ filename })
+  // Batch import protocol: precheck → chunk* → commit (or abort). Chunks are
+  // windowed on the client; the server integrates completed files on a serial
+  // queue and runs one graph rebuild at commit. See docs/Implementation.md.
+  ipcMain.handle('packages:import-local-precheck', async (_, { filenames }) => {
+    return importPrecheck({ filenames })
   })
 
-  ipcMain.handle('packages:import-local-chunk', async (_, { uploadId, chunk }) => {
-    return await appendImportLocalVar({ uploadId, chunk })
+  ipcMain.handle('packages:import-local-chunk', async (event, { uploadId, filename, bytes, first, last }) => {
+    return await importChunk({ uploadId, filename, bytes, first, last }, event.remoteWs || 'local')
   })
 
-  ipcMain.handle('packages:import-local-finish', async (_, { uploadId }) => {
-    return await finishImportLocalVar({ uploadId })
+  ipcMain.handle('packages:import-local-commit', async (event) => {
+    return await importCommit(event.remoteWs || 'local')
   })
 
-  ipcMain.handle('packages:import-local-abort', async (_, { uploadId }) => {
-    return await abortImportLocalVar({ uploadId })
+  ipcMain.handle('packages:import-local-abort', async (event, { uploadId } = {}) => {
+    return await importAbort({ uploadId }, event.remoteWs || 'local')
+  })
+
+  // Remote client disconnect: destroy open upload streams and finish the graph
+  // phase for anything already integrated so the library isn't left stale.
+  onClientClose((ws) => {
+    void cleanupOwner(ws)
   })
 
   ipcMain.handle('packages:file-list', async (_, filename) => {
@@ -665,6 +716,9 @@ export function registerPackageHandlers() {
     return { fileList, varPath }
   })
 
+  // Returns `null` — not `{}` — when the CDN index is unreachable and nothing is
+  // cached. An empty object is an authoritative "nothing to update", which the
+  // Library facet would render as a confident `0`; `null` lets it stay unknown.
   ipcMain.handle('packages:check-updates', async (_, { forceRefresh } = {}) => {
     // Fetch or refresh the CDN packages index
     const STALE_MS = 5 * 60 * 1000
@@ -673,11 +727,11 @@ export function registerPackageHandlers() {
         await fetchPackagesJson({ force: !!forceRefresh })
       } catch (err) {
         console.warn('[check-updates] Failed to fetch packages.json:', err.message)
-        if (!getPackagesIndex()) return {}
+        if (!getPackagesIndex()) return null
       }
     }
 
-    return checkUpdatesFromIndex(getPackageIndex(), getGroupIndex(), getForwardDeps()) ?? {}
+    return checkUpdatesFromIndex(getPackageIndex(), getGroupIndex(), getForwardDeps())
   })
 
   ipcMain.handle('packages:redownload', async (_, filename) => {

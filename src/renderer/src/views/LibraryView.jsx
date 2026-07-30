@@ -44,6 +44,7 @@ import {
   compareLibraryPackageTypes,
   getGradient,
   formatBytes,
+  formatTimeAgo,
   displayName,
   isCoreLibraryCategory,
   libraryTypeBadgeLabel,
@@ -70,6 +71,7 @@ import { useLibraryStore, FILTER_DEFAULTS } from '@/stores/useLibraryStore'
 import { useLabelsStore } from '@/stores/useLabelsStore'
 import { useContentStore } from '@/stores/useContentStore'
 import { useDownloadStore } from '@/stores/useDownloadStore'
+import { useWishlistStore } from '@/stores/useWishlistStore'
 import FilterPanel, { sectionActive } from '@/components/FilterPanel'
 import { SearchOnHubButton } from '@/components/SearchOnHubButton'
 import ResizeHandle from '@/components/ResizeHandle'
@@ -88,7 +90,7 @@ import { useLibraryUpdateState } from '@/hooks/useLibraryUpdateState'
 import { LICENSE_FILTER_OPTIONS } from '@/lib/licenses'
 import { matchesSmartQuery, parseSmartQuery } from '@/lib/smart-search'
 import { matchesPolarityList, matchesAuthorFilter, matchesLicenseFilter, polarityScrollKey } from '@/lib/filter-match'
-import { haystacksMatchAllTerms, packageSearchExtras, searchAndTerms } from '@/lib/search-text'
+import { haystacksMatchAllTerms, LIBRARY_IS_FLAGS, libraryFlags, searchAndTerms } from '@/lib/search-text'
 import { isPackageActive } from '@shared/storage-state-predicates.js'
 import { LicenseTag } from '@/components/LicenseTag'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
@@ -103,6 +105,14 @@ import { useViewStore } from '@/stores/useViewStore'
 import { useMousePageNavigation } from '@/hooks/useMousePageNavigation'
 import { scrollMousePage, shouldIgnoreMousePageTarget } from '@/lib/mouse-page-nav'
 import { resolveLibraryRestoreIndex } from '@/lib/view-scroll-anchor'
+import {
+  isUpdateUnavailable,
+  isUpdateCheckFailed,
+  isUpdateChecking,
+  isUpdateDownloadable,
+  updateTargetVersion,
+  updateTargetFilename,
+} from '@/lib/hub-availability'
 
 const SORT_OPTIONS = ['Recently installed', 'Type', 'Name', 'Size', 'Content', 'Deps', 'Morphs']
 export const LAZY_LABEL_LOADING = false
@@ -145,24 +155,6 @@ export function labelsForPackages(labels, items, selectedLabelIds, selectedTypes
     }
   }
   return labels.filter((label) => available.has(label.id))
-}
-
-/** True when an update entry has been definitively marked as not directly
- *  downloadable — paid/external, or hub couldn't be reached and enrichment
- *  marked it null as the fallback state. `downloadUrl === undefined` means
- *  enrichment hasn't completed yet and is treated as "checking" by the UI
- *  (separate state, not unavailable). */
-function isUpdateUnavailable(updateInfo) {
-  if (!updateInfo || updateInfo.localNewerFilename) return false
-  return updateInfo.downloadUrl === null
-}
-
-/** True when the update entry hasn't been enriched yet — only happens on the
- *  first check before findPackages returns, since later checks merge prior
- *  enrichment forward. */
-function isUpdateChecking(updateInfo) {
-  if (!updateInfo || updateInfo.localNewerFilename) return false
-  return updateInfo.downloadUrl === undefined
 }
 
 /** A package counts as "broken" when it's corrupted, has missing deps, or — while
@@ -227,9 +219,11 @@ export default function LibraryView({ onNavigate, navContext }) {
     compactCards,
     missingDeps,
     missingDepsLoading,
+    missingDepsLastChecked,
     hubDetailsLoading,
     updateCheckResults,
     updateCheckLoading,
+    updateEnrichLoading,
     updateCheckLastChecked,
     backendCounts,
     packagesLoaded,
@@ -279,6 +273,8 @@ export default function LibraryView({ onNavigate, navContext }) {
     const getLibraryStore = () => useLibraryStore.getState()
     getLibraryStore().fetchPackages()
     getLibraryStore().fetchBackendCounts()
+    // Wishlist pin badges on library cards need membership ids even if Hub was never opened.
+    useWishlistStore.getState().loadIds()
     window.api.packages
       .tagCounts()
       .then(setTagCounts)
@@ -309,8 +305,14 @@ export default function LibraryView({ onNavigate, navContext }) {
         .then(setAuthorCounts)
         .catch(() => {})
     })
+    // Keep pin badges in sync when Hub never loaded the full wishlist (peer pin/unpin).
+    const cleanupWishlist = window.api.onWishlistUpdated((data) => {
+      const s = useWishlistStore.getState()
+      if (!s.loaded && data?.membership) s.loadIds()
+    })
     return () => {
       cleanup1()
+      cleanupWishlist()
     }
   }, [])
 
@@ -333,16 +335,27 @@ export default function LibraryView({ onNavigate, navContext }) {
     if (!store.missingDeps && !store.missingDepsLoading) store.fetchMissingDeps()
   }, [statusFilter])
 
+  const wishlistIds = useWishlistStore((s) => s.ids)
+
   const baseFiltered = useMemo(() => {
     let result = packages
     if (search?.trim()) {
       const { tokens } = parseSmartQuery(search)
       result = result.filter((p) =>
         matchesSmartQuery(tokens, {
-          text: () => [p.title, p.packageName, p.filename, ...packageSearchExtras(p)],
+          text: () => [p.title, p.packageName, p.filename],
           author: () => p.creator || '',
           tags: () => packageHubTags(p),
           labels: () => (p.labelIds || []).map((id) => labelNameById.get(id)).filter(Boolean),
+          types: () => [libraryTypeBadgeLabel(p.type)],
+          flags: () => {
+            const rid = p.hubResourceId != null ? String(p.hubResourceId) : ''
+            return libraryFlags({
+              ...p,
+              wishlisted: !!rid && wishlistIds.has(rid),
+              broken: isBrokenPackage(p),
+            })
+          },
         }),
       )
     }
@@ -353,7 +366,7 @@ export default function LibraryView({ onNavigate, navContext }) {
       result = result.filter((p) => matchesLicenseFilter(p.license, license))
     }
     return result
-  }, [packages, search, authorSearch, excludedAuthors, license, labelNameById])
+  }, [packages, search, authorSearch, excludedAuthors, license, labelNameById, wishlistIds])
 
   const statusCounts = useMemo(() => {
     if (!packagesLoaded) return { direct: '…', dependency: '…', broken: '…', orphan: '…', local: '…' }
@@ -552,7 +565,15 @@ export default function LibraryView({ onNavigate, navContext }) {
             count: backendCounts?.missingUnique ?? '…',
             title: 'Dependencies referenced by your packages but not installed locally',
           },
-          { value: 'updates', label: 'Updates', count: updateFacetCount },
+          {
+            value: 'updates',
+            label: 'Updates',
+            count: updateFacetCount,
+            title:
+              updateFacetCount === '?'
+                ? 'Update check unavailable — the hub package index could not be reached'
+                : 'Packages with a newer version listed on the hub',
+          },
         ],
       },
       {
@@ -1024,7 +1045,13 @@ export default function LibraryView({ onNavigate, navContext }) {
       <FilterPanel
         search={search}
         onSearchChange={setSearch}
-        smartSearch={{ authors: authorCounts, tags: tagCounts, labels }}
+        smartSearch={{
+          authors: authorCounts,
+          tags: tagCounts,
+          labels,
+          types: LIBRARY_FILTER_TYPES,
+          flags: LIBRARY_IS_FLAGS,
+        }}
         sections={sections}
       />
 
@@ -1169,9 +1196,11 @@ export default function LibraryView({ onNavigate, navContext }) {
               filtered={filtered}
               updateCheckResults={updateCheckResults}
               updateCheckLoading={updateCheckLoading}
+              updateEnrichLoading={updateEnrichLoading}
               updateCheckLastChecked={updateCheckLastChecked}
               missingDeps={missingDeps}
               missingDepsLoading={missingDepsLoading}
+              missingDepsLastChecked={missingDepsLastChecked}
               hubDetailsLoading={hubDetailsLoading}
               onRefreshMissing={fetchMissingDeps}
               onRefreshUpdates={refreshUpdateCheck}
@@ -1420,9 +1449,11 @@ function ToolbarActions({
   filtered,
   updateCheckResults,
   updateCheckLoading,
+  updateEnrichLoading,
   updateCheckLastChecked,
   missingDeps,
   missingDepsLoading,
+  missingDepsLastChecked,
   hubDetailsLoading,
   onRefreshMissing,
   onRefreshUpdates,
@@ -1461,11 +1492,15 @@ function ToolbarActions({
     let alreadyKnown = 0
     let pausedFlag = false
     for (const update of Object.values(updateCheckResults)) {
-      if (update.localNewerFilename) continue
-      if (isUpdateUnavailable(update)) continue
+      if (!isUpdateDownloadable(update)) continue
       if (!update.hubResourceId && !update.packageName) continue
       try {
-        const r = await store.install(update.hubResourceId, null, true, update.packageName, !!update.isDepUpdate)
+        const r = await store.install({
+          resourceId: update.hubResourceId,
+          packageName: update.packageName,
+          asDependency: update.isDepUpdate,
+          targetFilename: updateTargetFilename(update),
+        })
         const ins = r?.inserted ?? 0
         if (ins > 0) queued += ins
         else if ((r?.alreadyLocal ?? 0) + (r?.alreadyQueued ?? 0) > 0) alreadyKnown++
@@ -1482,13 +1517,14 @@ function ToolbarActions({
     }
   }
 
-  const lastCheckedText = useMemo(() => {
-    if (!updateCheckLastChecked) return null
-    const mins = Math.round((Date.now() - updateCheckLastChecked) / 60000)
-    if (mins < 1) return 'just now'
-    if (mins < 60) return `${mins}m ago`
-    return `${Math.round(mins / 60)}h ago`
-  }, [updateCheckLastChecked])
+  const lastCheckedText = useMemo(
+    () => (updateCheckLastChecked ? formatTimeAgo(updateCheckLastChecked) : null),
+    [updateCheckLastChecked],
+  )
+  const missingLastCheckedText = useMemo(
+    () => (missingDepsLastChecked ? formatTimeAgo(missingDepsLastChecked) : null),
+    [missingDepsLastChecked],
+  )
 
   if (statusFilter === 'broken' && statusCounts.broken > 0) {
     return (
@@ -1516,7 +1552,11 @@ function ToolbarActions({
           type="button"
           onClick={onRefreshMissing}
           disabled={missingDepsLoading}
-          title="Re-check Hub availability"
+          title={
+            missingLastCheckedText
+              ? `Re-check Hub availability (${missingLastCheckedText})`
+              : 'Re-check Hub availability'
+          }
           className="text-text-tertiary hover:text-text-secondary cursor-pointer p-1 transition-colors"
         >
           {anyLoading ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
@@ -1560,16 +1600,16 @@ function ToolbarActions({
 
   if (statusFilter === 'updates') {
     const downloadableCount =
-      updateCheckResults != null
-        ? Object.values(updateCheckResults).filter((u) => !u.localNewerFilename && !isUpdateUnavailable(u)).length
-        : null
+      updateCheckResults != null ? Object.values(updateCheckResults).filter(isUpdateDownloadable).length : null
+    const anyLoading = updateCheckLoading || updateEnrichLoading
     return (
       <>
         <Button
           variant="gradient"
           size="xs"
           onClick={handleUpdateAll}
-          disabled={updateCheckResults == null || updateCheckLoading || downloadableCount === 0}
+          disabled={updateCheckResults == null || anyLoading || downloadableCount === 0}
+          title={updateEnrichLoading ? 'Verifying hub availability…' : undefined}
         >
           <ArrowUpCircle size={12} /> Update All
           {downloadableCount != null && downloadableCount > 0 ? ` (${downloadableCount})` : ''}
@@ -1578,10 +1618,10 @@ function ToolbarActions({
           type="button"
           onClick={onRefreshUpdates}
           disabled={updateCheckLoading}
-          title="Re-check for updates"
+          title={lastCheckedText ? `Re-check for updates (${lastCheckedText})` : 'Re-check for updates'}
           className="text-text-tertiary hover:text-text-secondary cursor-pointer p-1 transition-colors"
         >
-          {updateCheckLoading ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+          {anyLoading ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
         </button>
         {lastCheckedText && <span className="text-[10px] text-text-tertiary">Checked {lastCheckedText}</span>}
       </>
@@ -1921,14 +1961,17 @@ function UpdateActions({ pkg, updateInfo }) {
   }
 
   if (isUpdateUnavailable(updateInfo)) {
+    const checkFailed = isUpdateCheckFailed(updateInfo)
     return (
       <div className="rounded border border-border bg-elevated/40 px-2.5 py-2">
         <div className="flex items-center gap-1.5 text-[11px] font-medium text-text-secondary">
-          <ArrowUpCircle size={11} className="shrink-0" /> v{updateInfo.hubVersion} unavailable
+          <ArrowUpCircle size={11} className="shrink-0" />
+          {checkFailed ? `v${updateInfo.hubVersion} unchecked` : `v${updateInfo.hubVersion} unavailable`}
         </div>
         <p className="text-[10px] text-text-tertiary mt-1 leading-relaxed">
-          A newer version is listed on the hub but is not directly downloadable — typically because it is a paid
-          resource or hosted externally.
+          {checkFailed
+            ? 'The hub could not be reached, so this version’s availability is unknown. Re-check to try again.'
+            : 'A newer version is listed on the hub but can’t be downloaded — it is a paid or externally hosted resource, or the hub no longer serves that version.'}
         </p>
       </div>
     )
@@ -1957,11 +2000,11 @@ function UpdateActions({ pkg, updateInfo }) {
         </>
       ) : updateState.state === 'downloading' ? (
         <>
-          <Loader2 size={11} className="animate-spin" /> Downloading {Math.round((updateState.progress ?? 0) * 100)}%
+          <Loader2 size={11} className="animate-spin" /> Downloading {Math.round(updateState.progress ?? 0)}%
         </>
       ) : (
         <>
-          <ArrowUpCircle size={11} /> Update to v{updateInfo.hubVersion}
+          <ArrowUpCircle size={11} /> Update to v{updateTargetVersion(updateInfo)}
         </>
       )}
     </Button>
@@ -2426,7 +2469,7 @@ function LibraryDetailPanel({ pkg, onNavigate, onFilterAuthor, updateInfo }) {
                   onClick={() => onNavigate?.('content', { filterByPackage: pkg.packageName || pkg.filename })}
                   className="text-[10px] text-accent-blue hover:brightness-125 transition-[filter] cursor-pointer flex items-center gap-1"
                 >
-                  <LayoutGrid size={11} /> View in gallery
+                  <LayoutGrid size={11} /> Browse content
                 </button>
               )}
             </div>

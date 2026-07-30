@@ -137,7 +137,7 @@ App.jsx
 │   ├── HubView
 │   │   ├── FilterPanel (resizable left; includes labels-autocomplete)
 │   │   ├── Toolbar (count + card size toggle + Hub/Wishlist mode)
-│   │   ├── HubCard gallery (infinite scroll in hub mode; wishlist loads all at once)
+│   │   ├── HubCard gallery (windowed list over full result set in hub mode; wishlist loads all at once)
 │   │   └── HubDetail (replaces gallery on card click)
 │   │       ├── BackBar (breadcrumb)
 │   │       ├── PackageInfoPanel (320px left, scrollable)
@@ -512,6 +512,12 @@ CREATE TABLE settings (
 );
 ```
 
+This table is **workspace scope**: it travels with `backstage.db`, and a remote
+client head reads and writes it _on the server_ (`settings:*` is not a
+client-local channel), which is what makes "set the VaM dir from the laptop"
+change it on the host. Settings that describe a machine's installation instead of
+its library live outside the DB — see "Machine-scoped prefs" below.
+
 **Notable settings keys**:
 
 - `vam_dir` — VaM installation root path
@@ -522,10 +528,60 @@ CREATE TABLE settings (
 - `auto_hide_foreign_hair` / `auto_hide_foreign_poses` / `auto_hide_foreign_clothing` — `'1'` to auto-manage `.hide` files for content of that category bundled inside packages whose own effective type is _not_ that category (e.g. hide a stray hair shipped inside a clothing pack). Looks/Scenes intentionally have no equivalent — they're commonly bundled as demos. All four auto-hide settings flow through one declarative rule table (`AUTO_HIDE_RULES` in `src/main/scanner/index.js`); each rule contributes a `matches(pkgCtx, content)` predicate. **Targeted-sweep + deference invariant**: a remove sweep for rule X unhides only items rule X claims that are currently hidden AND that no other active rule still claims; an apply sweep for rule X hides only items in rule X's claim that aren't already hidden. Rules can stack freely — overlapping claims (e.g. a hair in a dep clothing pack with both `auto_hide_deps` and `auto_hide_foreign_hair` on) stay hidden until the _last_ rule claiming them is turned off and swept.
 - `hub_debug_requests` — `'1'` to log all Hub API requests
 - `hub_filters_json` — cached Hub filter metadata (types, tags, sort options)
-- `update_channel` — `'stable'` | `'dev'`; selects updater feed (see §23)
+- `machine_prefs_migrated` — `'1'` once the machine-scoped keys have been folded into the prefs files (see below); the guard that keeps that one-time move idempotent
 - `disable_behavior` — `'suffix'` (VaM-native: drop an empty `.var.disabled` marker beside the bare `.var` in main; default) or `'move-to:<auxDirId>'` (move to the named aux library directory). Removing the referenced aux dir resets this to `'suffix'`.
-- `remote_mode_enabled` — `'1'` when the Settings remote section is enabled (server UI + optional auto-start).
-- `remote_serve_on_launch` — `'1'` to call `remote:start` automatically on startup when remote mode is enabled.
+- `import_move_files` — `'1'` to _move_ (rather than copy) a `.var` added via drag-and-drop into the library, removing the source. Only affects the local fast path (`importLocalFromPath`): a same-filesystem `rename` (instant, no bytes copied — the key win on NTFS where reflinks don't apply), falling back to copy + unlink-source across filesystems (`EXDEV`). The same-fs rename verifies the bytes in place and renames back on failure so an invalid package never destroys the source. A remote client head has no local source and always streams a copy, so the option is hidden client-side and ignored server-side there.
+
+### Machine-scoped prefs (outside the DB)
+
+Some settings describe _this machine's installation_ rather than the library, so
+the `settings` table is the wrong home for them: a client head has no DB at all,
+and a value shared through the host's DB would be read and written by every
+connected head. [`src/main/prefs.js`](../src/main/prefs.js) holds them in two tiny
+JSON files instead, each with a declared key table (default + parser), which is
+what keeps them migration-free — unknown keys are ignored on read and preserved
+on write, and a corrupt value falls back to its default.
+
+| Store        | File                  | Directory                                  | Keys                                                                                                       |
+| ------------ | --------------------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| **install**  | `install-prefs.json`  | base userData, bound before `-client` swap | `updateChannel`, `devUnlocked`, `connectUrl`, `autoconnect`, `remoteEnabled`, `serveOnLaunch`, `servePort` |
+| **instance** | `instance-prefs.json` | post-swap userData                         | `windowState`                                                                                              |
+
+The install store binds to the **base** userData dir (before the `-client` swap in
+`index.js`), so a host and a client head on the same machine agree: one installed
+binary means one update channel, and the host's escape hatch
+(`remote:relaunch-disconnect`) must be able to disarm the client's auto-connect.
+The instance store binds **after** the swap, because host and client each own a
+window and must not share one saved rect.
+
+Admission is deliberately narrow — a key belongs here only when (1) main needs it
+before a window or the DB exists, and (2) sharing it with another head would be
+wrong. Everything else stays library data (`settings`) or renderer view state
+(`localStorage`). Two consequences worth knowing: these values survive
+`dev:nuke-database` (they aren't library data), and they must never be reachable
+through `settings:*` — each is exposed only over channels under an already
+client-local, server-denied prefix (`updater:*`, `remote:*`, `dev:*`), so the
+routing is correct by construction rather than by remembering to add a key to
+`LOCAL_CHANNELS`.
+
+**Concurrent writers.** The install file is shared by two OS processes with no
+lock, so each write goes to a **per-pid** scratch file, is `fsync`ed, and is
+published with `rename` — a reader therefore only ever sees one complete version,
+and a crash leaves at most a stray scratch file. (A shared scratch name would be
+an actual corruption path: both processes truncating and filling the same file,
+then publishing whatever bytes it held.) `patch` also re-reads immediately before
+writing, so keys the other process published first survive. What remains is a
+true interleave losing the earlier writer's key — microseconds wide, on values a
+human changes in one window at a time, so it's accepted rather than paid for with
+a lock file whose stale state would be the worse failure.
+
+**Legacy migration** lives entirely in
+[`prefs-migrate.js`](../src/main/prefs-migrate.js) — one module to delete when it
+retires, rather than legacy branches spread through live code. Two halves, because
+their prerequisites differ:
+
+- `migrateMachinePrefs()` runs from `runStartupMigrations()` on the data-side instance, guarded by the `machine_prefs_migrated` flag like every other startup migration. It copies `update_channel`, `developer_options_unlocked`, `main_window_state`, `remote_connect_url`, `remote_mode_enabled`, `remote_serve_on_launch` and `remote_serve_port` into the prefs (existing pref values win, since a client head may already have written its own) and deletes the rows.
+- `foldLegacyClientAutostart()` cannot use that infrastructure: it must land before `index.js` resolves the connect URL at module scope, and it must run on a **client head** too — the instance that owns an armed URL and has no database to migrate from. So it's a file-to-file step called from `index.js`, self-limiting because it deletes the `client-autostart.json` it reads (after the first launch it costs one `existsSync`).
 
 ### Local content sentinel (`__local__`)
 
@@ -904,7 +960,7 @@ The download manager (`src/main/downloads/manager.js`) handles concurrent packag
 
 ### Download Lifecycle
 
-1. **Enqueue**: `enqueueInstall(resourceId, hubDetailData, autoQueueDeps)` creates a download entry. If `autoQueueDeps`, all missing transitive dependencies are also queued.
+1. **Enqueue**: `enqueueInstall({ resourceId, hubDetail, autoQueueDeps, packageName, asDependency, targetFilename })` creates a download entry. If `autoQueueDeps`, all missing transitive dependencies are also queued. `targetFilename` pins the enqueue to one concrete `.var` instead of everything the resource page lists, and lets a dead `resource_id` fall back to resolving that file through `findPackages` — both required by the update path, which offers a specific version.
 2. **Process queue**: `processQueue()` picks the next queued item (direct priority first) and starts up to `MAX_CONCURRENT` transfers.
 3. **Transfer**: Downloads to a `.var.tmp` file with resume support (HTTP Range headers). Validates the ZIP after completion (size check + integrity verification on mismatch).
 4. **Integration**: `postDownloadIntegrate()` runs on success — scans/classifies the package, stores Hub metadata, optionally hides dep content, rebuilds the graph, cascade-enables disabled deps, queues newly discovered transitive deps, and fires invalidation events. See §16 "Download → Library Cascade" for the full step-by-step.
@@ -933,10 +989,27 @@ If a `.tmp` file exists from a previous attempt, the manager tries a `Range: byt
 The Hub API is a single POST endpoint (`https://hub.virtamate.com/citizenx/api.php`) with an `action` parameter:
 
 - **`getFilters()`**: Returns filter metadata (categories, tags, sort options, etc.)
-- **`searchResources(params)`**: Paginated full-text search with type, pricing, author, tag, license, and sort filters
+- **`searchResources(params)`**: Paginated full-text search with type, pricing, author, tag, license, and sort filters. Default `perpage` is 60 (`HUB_PER_PAGE`).
 - **`getResourceDetail(resourceId)`**: Full resource detail including `hubFiles` array (one entry per `.var` version)
 - **`getResourceDetailByName(packageName)`**: Lookup by package group name
-- **`findPackages(refs)`**: Batch lookup of package references — returns `{ref: hubFileData}` for available packages
+- **`findPackages(refs)`**: Batch lookup of package references — returns `{ref: hubFileData}` for available packages. A version the Hub doesn't have resolves to the nearest one it does (`Creator.Pkg.9999` → `Creator.Pkg.6.var`) rather than failing, so callers that asked about a _specific_ version must compare `hubFileData.filename` against what they requested. Only an unknown package **name** yields the string-`"null"` placeholder.
+
+### Windowed Hub gallery
+
+Hub browse is a **window over the full result set**, not an append-only infinite scroll. After the first `getResources` response, the grid is sized to `total_found`, unloaded slots render as skeletons, and dragging the scrollbar jumps to any depth. Position is the coordinate, so every sort works the same way.
+
+- **`useHubStore`**: sparse `resourcesByIndex` map plus a single `itemCount` (the Hub's `total_found`), and `loadRange(start, end)`. Requests are tagged with the reset-fetch sequence that owns them, so a response outliving its query is dropped; a page already in flight is awaited rather than re-issued (the detail pager depends on that); a failed page backs off for 5s so the range sampler can't turn one failure into a retry storm, and reports via toast rather than the query-level `error` banner. Short/empty API pages fill the rest of that page with `HUB_EMPTY_SLOT` dummies (Hub's `total_found` overcount — no list clipping). `loadedPages` is kept until the next filter reset / refresh and doubles as the "already browsed" record for the scrollbar rail.
+- **`VirtualGrid`**: optional sparse mode (`itemCount` + `getItem`); `onRangeChange` drives loading; whole-row gating draws a row as skeletons until every cell in it is present (empty dummies count as present, same as real cards).
+- **Empty dummies**: muted placeholder cards with a tooltip explaining Hub returned nothing for a claimed slot; detail pager skips them.
+- **Request discipline** (`useHubRangeLoader`). Deliberately no central rate limiter around `hubPost`: every caller already bounds itself (this sampler for the gallery, `pLimit(10)` for the hub scanner, sequential batches for `findPackages`), and a shared limiter can only queue — which turns a burst into the same number of requests arriving too late to be useful, behind which interactive ones wait.
+  - Sample the desired range on a fixed cadence (`SAMPLE_MS`), not per scroll event; stale unissued candidates are simply overwritten when the window moves.
+  - Request a few rows beyond the virtual window; the window itself bounds how much can be queued.
+  - Skip fetches while the viewport crosses more than a page per ~2.5s round trip (thumb drag / fling suppressed; steady scroll continues).
+  - That same velocity judgement is returned as `scrubbing` and holds back CDN thumbnail requests for the cards flying past, releasing them when motion settles. Hysteresis (release at half the threshold) keeps images from flickering when scrolling near it. Deliberately not a per-card dwell timer: the browser's own cache is invisible to us, so anything time-based re-pays the delay on images Chromium would have served instantly.
+  - The gate spares any thumbnail that has already painted (`retainedThumbs` in `PackageCard`, a 400-entry LRU of detached `Image` objects). Withholding one saves no traffic and costs a visible flash back to the card's gradient; holding the `Image` also means a card that scrolls out of the virtual window and back repaints from memory rather than reloading. Hub cards deliberately skip `loading="lazy"` for the same reason — in a virtualised grid it only delays a load that is already needed.
+  - Scrollbar track marks `loadedPages` only while dragging the scroll thumb, and only when the result set is longer than 10 pages. Chromium handles scrollbar presses natively, so the rail arms from window-level pointer tracking: grabbing the thumb arms on `pointerdown` (exact grab offset, measured before the thumb moves), while a press on the track arms on the scroll the resulting jump produces. Marks key off thumb-center scroll position and shift by that grab offset (cursor − thumb center) so the cursor stays over the matching loaded stretch. Positioned against the scroll element's own box at the measured scrollbar width.
+
+Filter changes still reset to the top. Wishlist mode is unchanged (local, fully loaded). Detail prev/next uses the global index against `itemCount`.
 
 ### Caching
 
@@ -1407,35 +1480,67 @@ Handlers live under `src/main/ipc/` split per domain (`packages.js`, `contents.j
 
 #### Packages (`src/main/ipc/packages.js`)
 
-| Channel                        | Purpose                                                                                          |
-| ------------------------------ | ------------------------------------------------------------------------------------------------ |
-| `packages:list`                | All packages (filtering done client-side)                                                        |
-| `packages:detail`              | Single package with deps, dependents, contents                                                   |
-| `packages:stats`               | Aggregate stats (see §8)                                                                         |
-| `packages:status-counts`       | Direct/dependency/broken/orphan counts                                                           |
-| `packages:type-counts`         | Counts grouped by package type                                                                   |
-| `packages:tag-counts`          | Hub tag occurrence counts                                                                        |
-| `packages:author-counts`       | Author occurrence counts                                                                         |
-| `packages:install`             | Install by Hub resource (with optional dep auto-queue)                                           |
-| `packages:install-missing`     | Install a single missing dep of one package                                                      |
-| `packages:install-all-missing` | Install every missing ref across the library                                                     |
-| `packages:install-deps-batch`  | Install a renderer-supplied list of missing refs                                                 |
-| `packages:install-dep`         | Install a single dep by Hub file record                                                          |
-| `packages:promote`             | Promote dep → direct (single filename or array)                                                  |
-| `packages:uninstall`           | Single filename or array; demotes instead of deleting when dependents remain                     |
-| `packages:toggle-enabled`      | Toggle disable/enable/offload via `applyStorageState` (cascade-aware; honors `disable_behavior`) |
-| `packages:set-enabled`         | Set enabled/disabled for an explicit filename list                                               |
-| `packages:force-remove`        | Delete a package regardless of dependents                                                        |
-| `packages:remove-orphans`      | Bulk-remove every package in `orphanSet`                                                         |
-| `packages:set-type-override`   | Override the auto-detected type                                                                  |
-| `packages:setHubResource`      | Manually link a local package to a Hub resource id                                               |
-| `packages:missing-deps`        | Aggregated missing-dep data for Library's "missing" filter                                       |
-| `packages:enrich-from-hub`     | Backfill Hub metadata for a batch of package stems                                               |
-| `packages:file-list`           | Full internal ZIP file list for a `.var`                                                         |
-| `packages:check-updates`       | Run the CDN update check                                                                         |
-| `packages:redownload`          | Re-fetch a `.var` from the Hub to replace a corrupted copy                                       |
+| Channel                          | Purpose                                                                                           |
+| -------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `packages:list`                  | All packages (filtering done client-side)                                                         |
+| `packages:detail`                | Single package with deps, dependents, contents                                                    |
+| `packages:stats`                 | Aggregate stats (see §8)                                                                          |
+| `packages:status-counts`         | Direct/dependency/broken/orphan counts                                                            |
+| `packages:type-counts`           | Counts grouped by package type                                                                    |
+| `packages:tag-counts`            | Hub tag occurrence counts                                                                         |
+| `packages:author-counts`         | Author occurrence counts                                                                          |
+| `packages:install`               | Install by Hub resource (with optional dep auto-queue)                                            |
+| `packages:install-missing`       | Install a single missing dep of one package                                                       |
+| `packages:install-all-missing`   | Install every missing ref across the library                                                      |
+| `packages:install-deps-batch`    | Install a renderer-supplied list of missing refs                                                  |
+| `packages:install-dep`           | Install a single dep by Hub file record                                                           |
+| `packages:promote`               | Promote dep → direct (single filename or array); auto-enables if disabled/offloaded               |
+| `packages:uninstall`             | Single filename or array; demotes instead of deleting when dependents remain                      |
+| `packages:toggle-enabled`        | Toggle disable/enable/offload via `applyStorageState` (cascade-aware; honors `disable_behavior`)  |
+| `packages:set-enabled`           | Set enabled/disabled for an explicit filename list                                                |
+| `packages:force-remove`          | Delete a package regardless of dependents                                                         |
+| `packages:remove-orphans`        | Bulk-remove every package in `orphanSet`                                                          |
+| `packages:set-type-override`     | Override the auto-detected type                                                                   |
+| `packages:setHubResource`        | Manually link a local package to a Hub resource id                                                |
+| `packages:missing-deps`          | Aggregated missing-dep data for Library's "missing" filter                                        |
+| `packages:enrich-from-hub`       | Resolve what the Hub would actually serve for a batch of stems (see below)                        |
+| `packages:file-list`             | Full internal ZIP file list for a `.var`                                                          |
+| `packages:check-updates`         | Run the CDN update check (`null` when the index is unreachable — distinct from `{}` = no updates) |
+| `packages:redownload`            | Re-fetch a `.var` from the Hub to replace a corrupted copy                                        |
+| `packages:import-local-precheck` | Batch import: report already-installed / invalid filenames before streaming                       |
+| `packages:import-local-chunk`    | Batch import: stream one chunk (`{uploadId, filename, bytes, first, last}`)                       |
+| `packages:import-local-commit`   | Batch import: drain integration queue, one graph rebuild + notify, return aggregate               |
+| `packages:import-local-abort`    | Batch import: abort one upload or the whole batch                                                 |
+| `packages:import-local-copy`     | Local-only fast path: copy/move from a host path into the same import batch (remote-denied)       |
 
 `packages:install-missing`, `packages:install-all-missing`, and `packages:install-deps-batch` are three distinct entry points; all three are backed by the Hub client's `findPackages`.
+
+##### Hub availability enrichment
+
+`packages:enrich-from-hub` answers "what would a download of this stem actually produce?" and returns `{ filename, version, fileSize, downloadUrl, installedLocally }` per stem. Because `findPackages` substitutes the nearest version it has for one it doesn't, the returned `filename` is often _not_ the stem that was asked about, and callers reconcile against it rather than against their request:
+
+Both policies live in `src/renderer/src/lib/hub-availability.js`:
+
+- **Updates** (`applyUpdateEnrichment`) require the resolved file to be downloadable, absent from disk, and newer than what's installed; anything else is `downloadUrl: null` and renders as unavailable. A resolved version between the installed one and the CDN-advertised one is still a valid update and becomes the install target (`availableFilename` / `availableVersion`).
+- **Missing deps** (`applyDepEnrichment`) accept any version the Hub can serve — some fallback beats none — and disqualify only on `installedLocally`, which means the dep is already satisfied by a different version on disk.
+
+Without that reconciliation the CDN index advertising a version the Hub has retracted produces an Update button carrying an older version's URL, which then dead-ends in the install path.
+
+##### Drag-drop import batch protocol
+
+Dropping `.var` files (local or remote client) uses a batch protocol in `src/main/downloads/import.js`:
+
+1. **precheck** — one round trip returning `{ existing, invalid }`: names already in the library, and names the server refuses with a reason.
+2. **chunk / copy** — remote (and pathless local) drops stream 4 MiB chunks with up to 4 unacked frames in flight; local drops with a resolvable path use `import-local-copy`. Each completed file is enqueued onto a serial integration chain (`verifyZipFile` → rename → `integrateScannedPackage`) without blocking the wire.
+3. **commit** — awaits the integration chain, runs `integrateGraphPhase` once for the whole batch (prefs refresh, `buildGraphOnly`, install-target + cascade, `buildFromDb`, one `packages:updated` / `contents:updated`), and returns `{ added, already, failed }`.
+
+**Ordering invariant:** `importChunk` writes to the session `WriteStream` synchronously before any `await`. WebSocket message handlers can overlap after the first await (drain), so the sync write is what keeps pipelined chunks in send order. A frame never spans two files.
+
+**Scan / graph split:** `postDownloadIntegrate` in `downloads/manager.js` is composed of `integrateScannedPackage` (per-file) and `integrateGraphPhase` (batch-level). The Hub download path still calls the composition for a single entry; imports defer the graph phase to commit so a multi-package drop pays for one library rebuild instead of N.
+
+**Batch lifetime:** a batch is keyed by owner (`event.remoteWs` or `'local'`) and is also finalized by a client disconnect (`onClientClose`) or a 30s idle timer, so a drop that never commits still ends with one graph rebuild instead of leaving the library stale.
+
+`packages:import-local-copy` remains on the remote deny list — it reads an arbitrary host path.
 
 #### Contents (`src/main/ipc/contents.js`)
 
@@ -1538,15 +1643,15 @@ Handlers live under `src/main/ipc/` split per domain (`packages.js`, `contents.j
 
 #### Remote control (`src/main/ipc/remote.js`)
 
-| Channel                        | Purpose                                                |
-| ------------------------------ | ------------------------------------------------------ |
-| `remote:status`                | `{ running, port, clients }`                           |
-| `remote:local-ips`             | Enumerated LAN IPv4 addresses (+ primary egress guess) |
-| `remote:start` / `remote:stop` | Hot-toggle the WebSocket server                        |
-| `remote:relaunch-connect`      | Relaunch as client with `--connect=<url>`              |
-| `remote:relaunch-disconnect`   | Relaunch as local instance; clear autoconnect file     |
-| `remote:get-autoconnect`       | Read persisted client autoconnect URL                  |
-| `remote:set-autoconnect`       | Arm/disarm client autoconnect (file-backed; no DB)     |
+| Channel                        | Purpose                                                  |
+| ------------------------------ | -------------------------------------------------------- |
+| `remote:status`                | `{ running, port, clients }`                             |
+| `remote:local-ips`             | Enumerated LAN IPv4 addresses (+ primary egress guess)   |
+| `remote:start` / `remote:stop` | Hot-toggle the WebSocket server                          |
+| `remote:relaunch-connect`      | Relaunch as client with `--connect=<url>`                |
+| `remote:relaunch-disconnect`   | Relaunch as local instance; disarm autoconnect           |
+| `remote:get-config`            | Machine-scoped remote config (`autoconnect` = effective) |
+| `remote:set-config`            | Patch that config (address, arm, serve port/on-launch)   |
 
 #### Settings / App / Shell
 
@@ -1577,16 +1682,25 @@ Handlers live under `src/main/ipc/` split per domain (`packages.js`, `contents.j
 
 #### Dev (`src/main/ipc/dev.js`)
 
-Always registered, but destructive handlers (`dev:nuke-database`) are gated behind either `is.dev` or the `developer_options_unlocked` setting (toggled by seven taps on the version string).
+Always registered, but destructive handlers (`dev:nuke-database`) are gated behind either `is.dev` or the machine-scoped `devUnlocked` pref (toggled by seven taps on the version string). Machine-scoped, so a client head unlocks _itself_ — while the flag lived in the DB, a client's seven taps flipped the host's flag, which also relaxes the host's WS version gate.
 
 When developer options are unlocked, **F12** (and Ctrl+Shift+I / Cmd+Alt+I) toggle Chromium DevTools on the main window — the hotkeys are gated in `attachDevToolsHotkeys` (`src/main/index.js`) so they work in packaged builds, not just `npm run dev`. All main-process `console.*` output is also mirrored into the renderer DevTools console with a `[main]` prefix via `src/main/log-forward.js` and a preload-side `main:log` listener; messages emitted before the renderer finishes loading are buffered (last 500) and flushed on `did-finish-load`.
 
-| Channel                         | Purpose                                    |
-| ------------------------------- | ------------------------------------------ |
-| `dev:is-dev`                    | Whether the app is running in dev mode     |
-| `dev:browser-assist-dir-exists` | Probe for the browser-assist resources dir |
-| `dev:sync-browser-assist`       | Copy browser-assist resources              |
-| `dev:nuke-database`             | Delete `backstage.db` and restart          |
+| Channel             | Purpose                                     |
+| ------------------- | ------------------------------------------- |
+| `dev:is-dev`        | Whether the app is running in dev mode      |
+| `dev:get-unlocked`  | Read the machine's developer-options unlock |
+| `dev:set-unlocked`  | Set it (seven-tap unlock / the off switch)  |
+| `dev:nuke-database` | Delete `backstage.db` and restart           |
+
+#### BrowserAssist (`src/main/ipc/browser-assist.js`)
+
+Allowed over the remote bridge (unlike `dev:*`) so a client can probe/sync the host's JayJayWon BrowserAssist settings.
+
+| Channel                     | Purpose                                    |
+| --------------------------- | ------------------------------------------ |
+| `browser-assist:dir-exists` | Probe for the browser-assist resources dir |
+| `browser-assist:sync`       | Write labels/tags into BrowserAssist       |
 
 ### Event channels (Main → Renderer)
 
@@ -1702,7 +1816,7 @@ One Electron instance can host the full main-process backend on the LAN. Other E
 
 **Browser behavior** (`renderer/src/browser-api.js`): browser mode reuses the production renderer. Host-backed library, content, label, scan, download, wishlist, and Hub channels use WebSocket RPC. `.var` import uses the existing chunked upload path. `HubDetail` swaps Electron's `<webview>` for a cross-origin iframe backed by `remote/hub-proxy.js`; the iframe keeps the same toolbar, tab, resource-follow, login, and favorite/bookmark/rate/like flows. Proxy browsing and Hub interaction handlers share Electron's `persist:hub` session. Native-only operations are stubbed safely and their controls are hidden.
 
-**Settings UX**: Enable client-server mode, optionally serve on launch, choose the port, then open `http://<host-ip>:42069`. The adjacent Hub proxy port must also be reachable. Connecting/disconnecting an Electron client relaunches the app with/without `--connect=` because hot-switching transport mid-session is intentionally unsupported. The client autoconnect URL is stored in `remote/autostart.js` because a pure client head may have no DB yet.
+**Settings UX**: Enable client-server mode, optionally serve on launch, choose the port, then open `http://<host-ip>:42069`. The adjacent Hub proxy port must also be reachable. Connecting/disconnecting an Electron client relaunches the app with/without `--connect=` because hot-switching transport mid-session is intentionally unsupported. The server address, armed auto-connect, serve port/on-launch, and section visibility are machine-scoped prefs read and written over `remote:get-config` / `remote:set-config`; they cannot use host-routed `settings:*`. Arming is `autoconnect` plus a parseable `connectUrl`; disconnecting disarms while retaining the address.
 
 **Trust model**: there is no authentication, TLS, or access control. Every device that can reach the port can view and mutate the library. Bind/use it only on a trusted intranet. Version mismatch is rejected unless the peer runs in dev/unlocked-developer mode.
 
@@ -1710,7 +1824,7 @@ One Electron instance can host the full main-process backend on the LAN. Other E
 
 ## 23. Release Channels
 
-Two GitHub Actions workflows publish to separate channels. The in-app setting `update_channel` (`stable` | `dev`, default `stable`) picks which feed `electron-updater` uses via [`src/main/updater.js`](../src/main/updater.js).
+Two GitHub Actions workflows publish to separate channels. The machine-scoped `updateChannel` pref (`stable` | `dev`, default `stable`, see §7) picks which feed `electron-updater` uses via [`src/main/updater.js`](../src/main/updater.js). It lives outside the DB because it governs which build replaces _this installed binary_: a client head has no database yet still updates itself, and switching channel has to work while the version gate has the socket shut — which is exactly when a client needs to follow a dev-build host.
 
 | Aspect       | Stable                                                           | Dev (`dev-latest`)                                                                                       |
 | ------------ | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
@@ -1731,7 +1845,7 @@ Dev builds use `X.Y.(Z+1)-dev.<run_number>` so they sort strictly ahead of the c
 
 ### Channel switching at runtime
 
-`updater:setChannel` persists the new value, reconfigures `setFeedURL`, and kicks off a background `checkForUpdates()` without awaiting it — the IPC returns immediately and no app restart is needed.
+`updater:setChannel` persists the new value, reconfigures `setFeedURL`, and kicks off a background `checkForUpdates()` without awaiting it — the IPC returns immediately and no app restart is needed. `updater:*` is client-local in the transport and denied at the server, so a client always switches its own channel, never the host's.
 
 ### macOS: custom install path (no Apple certificate)
 

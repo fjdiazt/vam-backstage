@@ -13,6 +13,7 @@ import {
   asClamped,
   asCardWidth,
 } from './persistViewState'
+import { HUB_PER_PAGE } from '@shared/hub-http.js'
 
 /** Gallery data sources. Extend this (and the toolbar segmented control) to add future modes. */
 export const GALLERY_MODES = ['hub', 'wishlist']
@@ -62,6 +63,29 @@ export const WISHLIST_FILTER_DEFAULTS = {
 
 let fetchSeq = 0
 let tailResolveSeq = 0
+
+/** The only sort that reads as a feed you scan for new things, so the only one where flagging
+ *  "updated since your last look" helps: the ranking sorts hardly move page 1, and the trending
+ *  ones surface *old* resources having a moment. Label comes from `getInfo`'s sort list. */
+const LATEST_UPDATE_SORT = 'Latest Update'
+
+/** Outlives `card-new-flash` in main.css, after which `flashSince` is cleared so cards
+ *  recycled by the virtual grid don't replay the animation. */
+const FLASH_MS = 3200
+let flashTimer = null
+
+/** In-flight page fetches keyed by `${fetchSeq}\0${page}` — dedupes concurrent loadRange calls
+ *  and lets a caller that needs the data (detail pager) await a request someone else issued. */
+const inFlightPages = new Map()
+
+/** Earliest retry time per failed page key. Without it the range sampler would re-issue
+ *  a failing page on every tick for as long as the viewport sits on it. */
+const pageRetryAt = new Map()
+const PAGE_RETRY_MS = 5000
+
+/** One toast per streak of range failures — a bad connection fails every page in the window. */
+let lastRangeErrorAt = 0
+const RANGE_ERROR_TOAST_MS = 5000
 
 function syncInstalledFromResources(resources) {
   useInstalledStore.getState().applyBatch(
@@ -207,6 +231,60 @@ export const HUB_PERSISTED_STATE = {
   cardWidth: asCardWidth,
 }
 
+function buildSearchParams(q, page) {
+  const params = { page, perpage: q.perPage }
+  if (q.sort) params.sort = q.sort
+  if (q.search) params.search = q.search
+  if (q.selectedType !== 'All') params.type = q.selectedType
+  if (q.paidFilter === 'free') params.category = 'Free'
+  else if (q.paidFilter === 'paid') params.category = 'Paid'
+  if (q.authorSearch) params.username = q.authorSearch
+  if (q.selectedHubTags?.length) params.tags = q.selectedHubTags.join(',')
+  if (q.license && q.license !== 'Any') params.license = q.license
+  return params
+}
+
+/** Sentinel for a page slot the Hub claimed (via total_found) but did not return.
+ *  Kept in the sparse map so the slot counts as loaded for whole-row gating. */
+export const HUB_EMPTY_SLOT = Object.freeze({ _hubEmpty: true })
+
+export function isHubEmptySlot(item) {
+  return item != null && item._hubEmpty === true
+}
+
+/**
+ * Write one API page into the sparse map. Resources fill the leading indices;
+ * any remaining slots in the page (up to itemCount) become `HUB_EMPTY_SLOT`
+ * so overcount / short tails render as confirmed-empty cards instead of skeletons.
+ */
+export function applyPageToIndex(byIndex, page, resources, itemCount, perPage = HUB_PER_PAGE) {
+  const base = (page - 1) * perPage
+  const pageEnd = Math.min(base + perPage, itemCount)
+  for (let i = base; i < pageEnd; i++) {
+    const j = i - base
+    byIndex[i] = j < resources.length ? resources[j] : HUB_EMPTY_SLOT
+  }
+  return byIndex
+}
+
+/** Patch every sparse-map entry matching `rid`. Returns the same object if nothing matched. */
+function patchResourcesByIndex(byIndex, rid, patch) {
+  let changed = false
+  const next = { ...byIndex }
+  for (const [k, r] of Object.entries(next)) {
+    if (isHubEmptySlot(r)) continue
+    if (String(r.resource_id) === rid) {
+      next[k] = { ...r, ...patch }
+      changed = true
+    }
+  }
+  return changed ? next : byIndex
+}
+
+function patchResourcesById(resources, rid, patch) {
+  return resources.map((r) => (String(r.resource_id) === rid ? { ...r, ...patch } : r))
+}
+
 export const useHubStore = create(
   persist(
     (set, get) => ({
@@ -220,6 +298,14 @@ export const useHubStore = create(
       browseMode: 'infinite',
       showInfinitePagerControls: true,
       trackInfiniteRestorePage: true,
+      // Sparse index → resource. Keys are numeric indices into the full result set.
+      resourcesByIndex: {},
+      /** Page numbers present in `resourcesByIndex`. Doubles as the scrollbar rail's
+       *  "already browsed" record, since nothing is evicted before the next reset. */
+      loadedPages: new Set(),
+      /** Window size: the Hub's `total_found`. It overcounts, and the surplus tail is
+       *  shown as confirmed-empty cards rather than clipped (see docs/API.md). */
+      itemCount: 0,
       loading: false,
       loadingPrevious: false,
       tailResolving: false,
@@ -230,6 +316,13 @@ export const useHubStore = create(
       // Hub filter signature at the last reset-fetch; lets HubView skip a redundant
       // reset+fetch on reveal. Not persisted (nor are resources), so launch refetches.
       lastFetchedKey: null,
+      // Wall-clock of the last successful page-1 fetch (for the refresh-button tooltip).
+      lastFetchedAt: null,
+      // Cards with a `last_update` newer than this hub timestamp flash briefly after a
+      // refresh; Infinity = nothing flashes. Transient hint, so never persisted.
+      flashSince: Infinity,
+      // Global index of the open detail in hub mode (null when unknown / wishlist).
+      detailIndex: null,
 
       ...HUB_FILTER_DEFAULTS,
       sort: '',
@@ -249,9 +342,12 @@ export const useHubStore = create(
       // NOT changed by followDetail, which must keep the webview mounted while the user
       // browses inside the guest page.
       detailNonce: 0,
-      // Stack of prior packages when drilling via Hub-available deps. Each entry is
-      // `{ resource, title }` — Back pops this instead of closing to the gallery.
-      // Cleared on gallery/pager opens and on closeDetail.
+      // Stack for HubDetail Back. Two entry kinds:
+      //   `{ kind: 'resource', resource, title }` — prior package (dep drill); pop reopens it
+      //   `{ kind: 'view', view, title }` — origin tab (library/content); pop closes detail
+      //     and returns `{ navigateTo: view }` so the caller can switch tabs
+      // Resource entries may omit `kind` (treated as resource). Cleared on gallery/pager
+      // opens and on closeDetail. Not persisted.
       detailHistory: [],
       // Resource id whose detail followDetail is fetching in the background; dedupes
       // concurrent follows and lets stale responses be discarded after a newer
@@ -266,6 +362,33 @@ export const useHubStore = create(
       galleryMode: 'hub',
 
       filterOptions: null,
+
+      getItem: (index) => get().resourcesByIndex[index] ?? null,
+
+      /**
+       * Walk the sparse map from `index` in direction `dir` (±1) to the first slot that
+       * isn't a confirmed-empty dummy — the pager and its prefetchers all step over those.
+       * Returns `{ index, item }` with a null `item` for a slot that isn't loaded yet,
+       * or null once the walk runs off the end of the list.
+       */
+      findNeighbor: (index, dir) => {
+        const { resourcesByIndex, itemCount } = get()
+        for (let i = index; dir > 0 ? i < itemCount : i >= 0; i += dir) {
+          const item = resourcesByIndex[i] ?? null
+          if (!isHubEmptySlot(item)) return { index: i, item }
+        }
+        return null
+      },
+
+      /** Look up a loaded gallery row by resource id (follow/dep navigation stubs). */
+      findResourceById: (resourceId) => {
+        const rid = String(resourceId)
+        for (const r of Object.values(get().resourcesByIndex)) {
+          if (isHubEmptySlot(r)) continue
+          if (String(r.resource_id) === rid) return r
+        }
+        return get().resources.find((r) => String(r.resource_id) === rid) ?? null
+      },
 
       setSearch: (search) => set({ search }),
       setSelectedType: (selectedType) => set({ selectedType }),
@@ -318,10 +441,10 @@ export const useHubStore = create(
         if (get().resolvedTotalPages && target >= get().resolvedTotalPages) {
           const resolved = Math.max(1, Number(await get().resolveTailPages({ force: true })) || target)
           set({ startPage: resolved, restorePage: resolved })
-          return get().fetchResources(true, { page: resolved })
+          return get().fetchResources({ page: resolved })
         }
         set({ startPage: target, restorePage: target })
-        return get().fetchResources(true, { page: target })
+        return get().fetchResources({ page: target })
       },
       clearCurrentTailCache: () => {
         const key = hubTailCacheKey(get())
@@ -368,7 +491,7 @@ export const useHubStore = create(
 
       fetchFilters: async (force) => {
         if (!force && get().filterOptions) return
-        if (!get().resources.length) set({ loading: true })
+        if (!get().itemCount) set({ loading: true })
         try {
           const options = await window.api.hub.filters()
           const list = options?.sort || []
@@ -383,24 +506,55 @@ export const useHubStore = create(
         }
       },
 
-      fetchResources: async (resetPage, opts) => {
+      /**
+       * Reset the sparse window and fetch page 1 for the current filters.
+       * Filter changes and the refresh button call this; scrolling uses `loadRange`.
+       */
+      fetchResources: async (resetOrOpts, maybeOpts) => {
+        const opts = typeof resetOrOpts === 'boolean' ? maybeOpts || {} : resetOrOpts || {}
+        const resetPage = typeof resetOrOpts === 'boolean' ? resetOrOpts : true
         const seq = ++fetchSeq
+        pageRetryAt.clear()
         const state = get()
-        let requestedPage = Math.max(1, Number(opts?.page ?? (resetPage ? 1 : state.page)) || 1)
-        const append = opts?.append === true
-        set({ loading: true, loadingPrevious: false, error: null, ...(append ? {} : { resources: [] }) })
+        const sparse = state.browseMode === 'infinite'
+        let requestedPage = Math.max(1, Number(opts.page ?? (resetPage ? 1 : state.page)) || 1)
+        const append = !sparse && opts.append === true
+        // Cutoff is the top row's `last_update` (hub server time) — Latest Update is DESC, so
+        // index 0 is the newest. Do not use `lastFetchedAt` (local `Date.now()`; clock skew
+        // makes new cards never flash). Cold start / filter change / empty page: no flash.
+        const sameQuery = hubFilterSignature(state) === state.lastFetchedKey
+        const top = state.resourcesByIndex[0]
+        const baseline = sameQuery && !isHubEmptySlot(top) ? parseInt(top?.last_update, 10) || 0 : 0
+        const flashSince = opts.forceRefresh && state.sort === LATEST_UPDATE_SORT && baseline > 0 ? baseline : Infinity
+        clearTimeout(flashTimer)
+        set(
+          sparse
+            ? {
+                loading: true,
+                error: null,
+                flashSince: Infinity,
+                resourcesByIndex: {},
+                loadedPages: new Set(),
+                itemCount: 0,
+              }
+            : {
+                loading: true,
+                loadingPrevious: false,
+                error: null,
+                ...(append ? {} : { resources: [] }),
+              },
+        )
         try {
-          if (opts?.forceRefresh) {
+          if (opts.forceRefresh) {
             get().clearCurrentTailCache()
             await window.api.hub.invalidateCaches()
             await get().fetchFilters(true)
           }
-          const key = hubTailCacheKey(get())
-          const cachedTotalPages = cachedTailPage(get().tailCache, key)
-          if (cachedTotalPages && requestedPage > cachedTotalPages) requestedPage = cachedTotalPages
-          if (seq !== fetchSeq) return
           const q = get()
-          const result = await window.api.hub.search(hubSearchParams(q, requestedPage))
+          const key = hubTailCacheKey(q)
+          const cachedTotalPages = cachedTailPage(q.tailCache, key)
+          if (cachedTotalPages && requestedPage > cachedTotalPages) requestedPage = cachedTotalPages
+          let result = await window.api.hub.search(buildSearchParams(q, requestedPage))
           if (seq !== fetchSeq) return
           let incoming = hubResources(result)
           let totalFound = result.totalFound || 0
@@ -408,83 +562,172 @@ export const useHubStore = create(
           let page = requestedPage
           if (!append && requestedPage > 1 && incoming.length === 0 && totalPages >= requestedPage) {
             const resolved = await resolveEmptyTailPage(
-              hubSearchParams(q, requestedPage),
+              buildSearchParams(q, requestedPage),
               requestedPage,
               () => seq === fetchSeq,
             )
             if (!resolved || seq !== fetchSeq) return
-            incoming = hubResources(resolved.result)
-            totalFound = resolved.result.totalFound || totalFound
-            totalPages = incoming.length ? resolved.page : resolved.result.totalPages || 0
+            result = resolved.result
+            incoming = hubResources(result)
+            totalFound = result.totalFound || totalFound
+            totalPages = incoming.length ? resolved.page : result.totalPages || 0
             page = resolved.page
-            const tailCache = { ...get().tailCache, [key]: { totalPages, resolvedAt: Date.now() } }
-            set({ tailCache, resolvedTotalPages: totalPages })
+            set({
+              tailCache: { ...get().tailCache, [key]: { totalPages, resolvedAt: Date.now() } },
+              resolvedTotalPages: totalPages,
+            })
           }
           syncInstalledFromResources(incoming)
-          const patch = {
-            resources: append ? [...get().resources, ...incoming] : incoming,
+          if (!sparse) {
+            set({
+              resources: append ? [...get().resources, ...incoming] : incoming,
+              totalFound,
+              totalPages,
+              page,
+              loading: false,
+              tailCacheKey: key,
+              resolvedTotalPages: cachedTotalPages || get().resolvedTotalPages,
+              ...(append ? {} : { lastFetchedKey: hubFilterSignature(q), lastFetchedAt: Date.now() }),
+            })
+            return
+          }
+
+          const itemCount = totalFound
+          const byIndex = {}
+          applyPageToIndex(byIndex, page, incoming, itemCount, q.perPage)
+
+          if (Number.isFinite(flashSince)) flashTimer = setTimeout(() => set({ flashSince: Infinity }), FLASH_MS)
+          set({
+            resourcesByIndex: byIndex,
+            loadedPages: new Set([page]),
+            itemCount,
             totalFound,
             totalPages,
-            page,
-            loading: false,
-            tailCacheKey: key,
             resolvedTotalPages: cachedTotalPages || get().resolvedTotalPages,
-            ...(append ? {} : { lastFetchedKey: hubFilterSignature(q) }),
-          }
-          if (!append && q.browseMode === 'infinite') {
-            patch.startPage = page
-            patch.restorePage = page
-          }
-          set(patch)
+            page,
+            startPage: page,
+            restorePage: page,
+            loading: false,
+            flashSince,
+            lastFetchedKey: hubFilterSignature(q),
+            lastFetchedAt: Date.now(),
+          })
         } catch (err) {
           if (seq !== fetchSeq) return
-          set({ error: err.message, loading: false, loadingPrevious: false, ...(append ? {} : { resources: [] }) })
+          set(
+            sparse
+              ? { error: err.message, loading: false, resourcesByIndex: {}, loadedPages: new Set(), itemCount: 0 }
+              : { error: err.message, loading: false, loadingPrevious: false, ...(append ? {} : { resources: [] }) },
+          )
         }
       },
 
       fetchNextPage: async () => {
-        const { page, totalPages, loading, resolvedTotalPages } = get()
-        if (loading) return
+        const { page, totalPages, loading, resolvedTotalPages, browseMode } = get()
+        if (loading || browseMode !== 'paged') return
         if (resolvedTotalPages && page >= resolvedTotalPages) {
           const resolved = await get().resolveTailPages({ force: true })
           if (!resolved || page >= resolved) return
         } else if (page >= totalPages) {
           return
         }
-        return get().fetchResources(false, { page: get().page + 1, append: true })
+        return get().fetchResources(false, { page: page + 1, append: true })
       },
 
-      fetchPreviousPage: async () => {
+      /**
+       * Ensure indices `[start, end]` (inclusive) are loaded. Page-aligns to the API,
+       * dedupes in-flight requests, backs a failed page off for `PAGE_RETRY_MS`, and fills
+       * short/empty page tails with `HUB_EMPTY_SLOT`. Resolves once every page covering the
+       * range has settled, whether this call issued it or joined one already in flight.
+       * Loaded pages stay until the next filter reset / refresh.
+       * @param opts.anchor Index to fetch outwards from when the range spans several pages.
+       * @param opts.force  Ignore the failure backoff (user-initiated, e.g. the detail pager).
+       */
+      loadRange: async (start, end, opts) => {
         const state = get()
-        if (state.loading || state.browseMode !== 'infinite' || state.startPage <= 1) return false
-        const seq = ++fetchSeq
-        const requestedPage = state.startPage - 1
-        set({ loading: true, loadingPrevious: true, error: null })
-        try {
-          const result = await window.api.hub.search(hubSearchParams(get(), requestedPage))
-          if (seq !== fetchSeq) return false
-          const incoming = hubResources(result)
-          syncInstalledFromResources(incoming)
-          set({
-            resources: [...incoming, ...get().resources],
-            totalFound: result.totalFound || get().totalFound,
-            totalPages: get().resolvedTotalPages || result.totalPages || get().totalPages,
-            startPage: requestedPage,
-            loading: false,
-            loadingPrevious: false,
-          })
-          return incoming.length > 0
-        } catch (err) {
-          if (seq !== fetchSeq) return false
-          set({ error: err.message, loading: false, loadingPrevious: false })
-          return false
+        if (state.browseMode !== 'infinite') return
+        // Filters have moved on but the reset fetch hasn't run yet — it owns the new query.
+        if (hubFilterSignature(state) !== state.lastFetchedKey) return
+        const count = state.itemCount
+        if (count <= 0) return
+
+        const lo = Math.max(0, Math.floor(start))
+        const hi = Math.min(count - 1, Math.floor(end))
+        if (hi < lo) return
+
+        // Every request is tagged with the reset-fetch sequence it belongs to, so a
+        // response that outlives its query is dropped and its key can never collide
+        // with the same page under a later query.
+        const epoch = fetchSeq
+        const now = Date.now()
+        const anchor = opts?.anchor != null ? opts.anchor : Math.floor((lo + hi) / 2)
+        const anchorPage = Math.floor(anchor / state.perPage) + 1
+        const firstPage = Math.floor(lo / state.perPage) + 1
+        const lastPage = Math.floor(hi / state.perPage) + 1
+
+        const pages = []
+        // Someone else's in-flight requests for pages we were asked about: awaited but
+        // not re-issued, so a caller that needs the data (the detail pager) still waits
+        // for it instead of returning to an empty slot.
+        const pending = []
+        for (let p = firstPage; p <= lastPage; p++) {
+          if (state.loadedPages.has(p)) continue
+          const key = `${epoch}\0${p}`
+          const inFlight = inFlightPages.get(key)
+          if (inFlight) {
+            pending.push(inFlight)
+            continue
+          }
+          if (!opts?.force && (pageRetryAt.get(key) ?? 0) > now) continue
+          pages.push(p)
         }
+        // Nearest pages first so the viewport is served before the prefetch /
+        // off-screen edges when several pages are needed at once.
+        pages.sort((a, b) => Math.abs(a - anchorPage) - Math.abs(b - anchorPage))
+
+        // Kick off all pages without serializing on each other so the first page
+        // to arrive can paint immediately; still return a Promise for callers
+        // (detail pager) that need to wait for this range.
+        const promises = pages.map((page) => {
+          const key = `${epoch}\0${page}`
+          const promise = window.api.hub
+            .search(buildSearchParams(state, page))
+            .then((result) => {
+              if (fetchSeq !== epoch) return
+              const incoming = result.resources || []
+              syncInstalledFromResources(incoming)
+              set((s) => {
+                const itemCount = result.totalFound || s.itemCount
+                const byIndex = applyPageToIndex({ ...s.resourcesByIndex }, page, incoming, itemCount, s.perPage)
+                return { resourcesByIndex: byIndex, loadedPages: new Set(s.loadedPages).add(page), itemCount }
+              })
+            })
+            .catch((err) => {
+              if (fetchSeq !== epoch) return
+              pageRetryAt.set(key, Date.now() + PAGE_RETRY_MS)
+              // A toast, not the `error` banner: the banner belongs to the query as a
+              // whole, and one deep page failing shouldn't paint the gallery as broken.
+              if (Date.now() - lastRangeErrorAt > RANGE_ERROR_TOAST_MS) {
+                lastRangeErrorAt = Date.now()
+                toast(`Failed to load hub results: ${err.message}`)
+              }
+            })
+            .finally(() => {
+              inFlightPages.delete(key)
+            })
+          inFlightPages.set(key, promise)
+          return promise
+        })
+        await Promise.all([...promises, ...pending])
       },
 
       /**
        * Open a package detail overlay.
        * @param opts.pushHistory  Push the current package onto `detailHistory` (dep drill).
        * @param opts.history      Replace the stack (used by popDetailHistory). Cleared when neither is set.
+       * @param opts.origin       Seed a view-root entry (`{ view: 'library'|'content' }`) so Back
+       *                          returns to that tab. Ignored when history/pushHistory is set.
+       * @param opts.index        Global hub-list index (hub mode pager).
        */
       openDetail: async (resource, opts) => {
         const rid = String(resource.resource_id)
@@ -498,11 +741,23 @@ export const useHubStore = create(
             if (cur?.resource_id != null && String(cur.resource_id) !== rid) {
               detailHistory = [
                 ...s.detailHistory,
-                { resource: cur, title: s.detailData?.title || cur.title || 'Package' },
+                {
+                  kind: 'resource',
+                  resource: cur,
+                  title: s.detailData?.title || cur.title || 'Package',
+                },
               ]
             } else {
               detailHistory = s.detailHistory
             }
+          } else if (opts?.origin?.view === 'library' || opts?.origin?.view === 'content') {
+            detailHistory = [
+              {
+                kind: 'view',
+                view: opts.origin.view,
+                title: opts.origin.view === 'library' ? 'Library' : 'Content',
+              },
+            ]
           }
           return {
             detailResource: resource,
@@ -511,6 +766,9 @@ export const useHubStore = create(
             followingDetailId: null,
             detailNonce: s.detailNonce + 1,
             detailHistory,
+            // A dep drill / Back keeps the gallery index of the package it started from,
+            // so popping back to it restores a correct pager position.
+            detailIndex: opts?.index ?? (opts?.history || opts?.pushHistory ? s.detailIndex : null),
           }
         })
         if (cached) syncInstalledFromDetail(cached)
@@ -525,10 +783,12 @@ export const useHubStore = create(
             detailLoading: false,
             resources:
               detail._installSizeBytes != null
-                ? s.resources.map((r) =>
-                    String(r.resource_id) === rid ? { ...r, _installSizeBytes: detail._installSizeBytes } : r,
-                  )
+                ? patchResourcesById(s.resources, rid, { _installSizeBytes: detail._installSizeBytes })
                 : s.resources,
+            resourcesByIndex:
+              detail._installSizeBytes != null
+                ? patchResourcesByIndex(s.resourcesByIndex, rid, { _installSizeBytes: detail._installSizeBytes })
+                : s.resourcesByIndex,
           }))
         } catch (err) {
           if (String(get().detailResource?.resource_id) !== rid) return
@@ -537,7 +797,10 @@ export const useHubStore = create(
         }
       },
 
-      /** Pop the dep-drill stack and reopen the previous package, or close if empty. */
+      /**
+       * Pop the detail back-stack. Resource entry → reopen that package. View entry →
+       * close detail and return `{ navigateTo }` for the caller. Empty → close to gallery.
+       */
       popDetailHistory: () => {
         const { detailHistory } = get()
         if (!detailHistory.length) {
@@ -545,7 +808,31 @@ export const useHubStore = create(
           return
         }
         const prev = detailHistory[detailHistory.length - 1]
-        return get().openDetail(prev.resource, { history: detailHistory.slice(0, -1) })
+        const rest = detailHistory.slice(0, -1)
+        if (prev.kind === 'view') {
+          get().closeDetail()
+          return { navigateTo: prev.view }
+        }
+        return get().openDetail(prev.resource, { history: rest })
+      },
+
+      /**
+       * Promote a dependency-installed package to a direct one, and reflect the new flag
+       * in all three places it shows: the installed-state store, the gallery row, and the
+       * open detail. Lives here because the gallery card and the detail panel both do it.
+       */
+      promoteResource: (filename, resourceId) => {
+        window.api.packages.promote(filename, resourceId)
+        const rid = String(resourceId)
+        useInstalledStore.getState().update(rid, true, true, filename)
+        set((s) => ({
+          resources: patchResourcesById(s.resources, rid, { _isDirect: true }),
+          resourcesByIndex: patchResourcesByIndex(s.resourcesByIndex, rid, { _isDirect: true }),
+          detailData:
+            s.detailData && String(s.detailData.resource_id) === rid
+              ? { ...s.detailData, _isDirect: true }
+              : s.detailData,
+        }))
       },
 
       /** Warm the detail cache for a resource without touching visible state. */
@@ -577,12 +864,17 @@ export const useHubStore = create(
             detailData: detail,
             detailLoading: false,
             followingDetailId: null,
+            // Followed from inside the webview, so it's some other package — the gallery
+            // index no longer describes it, and a stale one would mis-position the pager.
+            detailIndex: null,
             resources:
               detail._installSizeBytes != null
-                ? s.resources.map((r) =>
-                    String(r.resource_id) === rid ? { ...r, _installSizeBytes: detail._installSizeBytes } : r,
-                  )
+                ? patchResourcesById(s.resources, rid, { _installSizeBytes: detail._installSizeBytes })
                 : s.resources,
+            resourcesByIndex:
+              detail._installSizeBytes != null
+                ? patchResourcesByIndex(s.resourcesByIndex, rid, { _installSizeBytes: detail._installSizeBytes })
+                : s.resourcesByIndex,
           }))
         } catch (err) {
           if (get().followingDetailId !== rid) return
@@ -591,7 +883,8 @@ export const useHubStore = create(
         }
       },
 
-      closeDetail: () => set({ detailResource: null, detailData: null, followingDetailId: null, detailHistory: [] }),
+      closeDetail: () =>
+        set({ detailResource: null, detailData: null, followingDetailId: null, detailHistory: [], detailIndex: null }),
 
       refreshDetail: async () => {
         const { detailResource } = get()
@@ -605,10 +898,12 @@ export const useHubStore = create(
             detailData: detail,
             resources:
               detail._installSizeBytes != null
-                ? s.resources.map((r) =>
-                    String(r.resource_id) === rid ? { ...r, _installSizeBytes: detail._installSizeBytes } : r,
-                  )
+                ? patchResourcesById(s.resources, rid, { _installSizeBytes: detail._installSizeBytes })
                 : s.resources,
+            resourcesByIndex:
+              detail._installSizeBytes != null
+                ? patchResourcesByIndex(s.resourcesByIndex, rid, { _installSizeBytes: detail._installSizeBytes })
+                : s.resourcesByIndex,
           }))
         } catch (err) {
           toast(`Failed to refresh hub detail: ${err.message}`)
@@ -641,7 +936,7 @@ export const useHubStore = create(
       // authorSearch change drives HubView's fetch effect.
       searchHubForAuthor: (author) => {
         if (!author) return
-        set({ authorSearch: author, page: 1, galleryMode: 'hub' })
+        set({ authorSearch: author, galleryMode: 'hub' })
       },
     }),
     persistViewState('hub-view', HUB_PERSISTED_STATE),

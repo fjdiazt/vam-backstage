@@ -19,11 +19,12 @@ export function createApi({ transport, runtime, getPathForFile = () => '', hubWe
       // is gone). Empty string when there's no backing path — caller falls back to
       // the streamed upload. Local only; a remote head's paths mean nothing here.
       getPathForFile: (file) => getPathForFile(file),
-      importLocalCopy: (filename, sourcePath) => invoke('packages:import-local-copy', { filename, sourcePath }),
-      importLocalBegin: (filename) => invoke('packages:import-local-begin', { filename }),
-      importLocalChunk: (uploadId, chunk) => invoke('packages:import-local-chunk', { uploadId, chunk }),
-      importLocalFinish: (uploadId) => invoke('packages:import-local-finish', { uploadId }),
-      importLocalAbort: (uploadId) => invoke('packages:import-local-abort', { uploadId }),
+      importLocalCopy: (filename, sourcePath, move) =>
+        invoke('packages:import-local-copy', { filename, sourcePath, move }),
+      importLocalPrecheck: (filenames) => invoke('packages:import-local-precheck', { filenames }),
+      importLocalChunk: (frame) => invoke('packages:import-local-chunk', frame),
+      importLocalCommit: () => invoke('packages:import-local-commit'),
+      importLocalAbort: (uploadId) => invoke('packages:import-local-abort', uploadId ? { uploadId } : {}),
       missingDeps: () => invoke('packages:missing-deps'),
       enrichFromHub: (stems) => invoke('packages:enrich-from-hub', stems),
       removeOrphans: () => invoke('packages:remove-orphans'),
@@ -145,11 +146,15 @@ export function createApi({ transport, runtime, getPathForFile = () => '', hubWe
     },
     dev: {
       isDev: () => invoke('dev:is-dev'),
+      getUnlocked: () => invoke('dev:get-unlocked'),
+      setUnlocked: (value) => invoke('dev:set-unlocked', value),
       nukeDatabase: () => invoke('dev:nuke-database'),
       countDeletedData: () => invoke('dev:count-deleted-data'),
       forgetDeletedData: () => invoke('dev:forget-deleted-data'),
-      browserAssistDirExists: () => invoke('dev:browser-assist-dir-exists'),
-      syncBrowserAssist: () => invoke('dev:sync-browser-assist'),
+    },
+    browserAssist: {
+      dirExists: () => invoke('browser-assist:dir-exists'),
+      sync: () => invoke('browser-assist:sync'),
     },
     extract: {
       probeScene: (p) => invoke('extract:probe-scene', p),
@@ -177,8 +182,8 @@ export function createApi({ transport, runtime, getPathForFile = () => '', hubWe
       url: transport.remote.url ?? null,
       status: () => invoke('remote:status'),
       localIps: () => invoke('remote:local-ips'),
-      getAutoconnect: () => invoke('remote:get-autoconnect'),
-      setAutoconnect: (url) => invoke('remote:set-autoconnect', url),
+      getConfig: () => invoke('remote:get-config'),
+      setConfig: (patch) => invoke('remote:set-config', patch),
       startServer: (port) => invoke('remote:start', port),
       stopServer: () => invoke('remote:stop'),
       connect: (url) => invoke('remote:relaunch-connect', url),

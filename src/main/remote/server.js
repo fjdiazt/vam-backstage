@@ -11,17 +11,13 @@ import { createRemoteHttpServer } from './http-server.js'
 import { createHubProxyHandler } from './hub-proxy.js'
 import { checkVamStorage, getVamStorageStatus, storageChannelUsesVam, storageUnavailableError } from '../vam-storage.js'
 import { isManualStorageMode } from '../runtime-config.js'
+import { installPrefs } from '../prefs.js'
 
 // The version gate on the client relaxes when a peer reports `dev` — true for
 // unpackaged runs and for packaged builds where DevTools/developer options have
 // been unlocked (both signal a user who knowingly runs mixed versions).
 function isDevMode() {
-  if (!app.isPackaged) return true
-  try {
-    return getSetting('developer_options_unlocked') === '1'
-  } catch {
-    return false
-  }
+  return !app.isPackaged || installPrefs.get('devUnlocked')
 }
 
 /**
@@ -36,10 +32,33 @@ let httpServer = null
 let currentPort = null
 let hubHttpServer = null
 let currentHubProxyPort = null
+let heartbeatTimer = null
 const clients = new Set()
+const clientCloseListeners = new Set()
 
 export function getStatus() {
   return { running: !!wss, port: currentPort, hubProxyPort: currentHubProxyPort, clients: clients.size }
+}
+
+/**
+ * Register a callback for remote client disconnects. Used by the import batch
+ * cleanup path so open upload streams are destroyed when a client drops.
+ * @param {(ws: import('ws').WebSocket) => void} cb
+ * @returns {() => void} unsubscribe
+ */
+export function onClientClose(cb) {
+  clientCloseListeners.add(cb)
+  return () => clientCloseListeners.delete(cb)
+}
+
+function emitClientClose(ws) {
+  for (const cb of clientCloseListeners) {
+    try {
+      cb(ws)
+    } catch (err) {
+      console.warn('[remote] onClientClose listener failed:', err?.message || err)
+    }
+  }
 }
 
 // Push the current status to the local renderer so the Settings tab reflects
@@ -101,6 +120,16 @@ export async function startServer(port = DEFAULT_REMOTE_PORT, { rendererRoot = j
   httpServer = server
   wss = socketServer
   currentPort = listeningPort
+  heartbeatTimer = setInterval(() => {
+    for (const ws of clients) {
+      if (ws.readyState === ws.OPEN) {
+        try {
+          ws.ping()
+        } catch {}
+      }
+    }
+  }, 30_000)
+  heartbeatTimer.unref?.()
   console.info(`[remote] serving on http://0.0.0.0:${currentPort} (Hub proxy ${currentHubProxyPort})`)
   emitStatus()
   return { ok: true, port: currentPort, hubProxyPort: currentHubProxyPort }
@@ -112,6 +141,7 @@ function registerClient(ws) {
   ws.on('close', () => {
     clients.delete(ws)
     emitStatus()
+    emitClientClose(ws)
   })
   ws.on('error', () => {
     clients.delete(ws)
@@ -123,6 +153,8 @@ function registerClient(ws) {
 
 export async function stopServer() {
   if (!wss) return
+  clearInterval(heartbeatTimer)
+  heartbeatTimer = null
   for (const ws of clients) {
     try {
       ws.close()

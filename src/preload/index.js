@@ -41,6 +41,7 @@ const api = createApi({
   getPathForFile: (file) => webUtils.getPathForFile(file),
   hubWebviewPreload: pathToFileURL(join(__dirname, 'hub-webview.js')).toString(),
 })
+
 // Mirror main-process logs into the renderer DevTools console. Errors sent
 // from the main process arrive as { __mainLogError, name, message, stack };
 // rehydrate to a real Error so DevTools renders them with a clickable stack.
